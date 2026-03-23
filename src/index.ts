@@ -331,8 +331,20 @@ async function handleCommand(
 			const targetNote = notes[index - 1];
 			if (!targetNote) return "找不到該筆記";
 
+			//await env.MO_NOTES.delete(targetNote.key);
+			//return `已刪除：${targetNote.content}`;
+			// 刪 KV（保留）
 			await env.MO_NOTES.delete(targetNote.key);
-			return `已刪除：${targetNote.content}`;
+
+			// 刪 D1（新增）
+			try {
+			await env.MO_DB
+				.prepare(`DELETE FROM notes WHERE id = ?`)
+				.bind(targetNote.key.includes("note:") ? key.split(":").pop() : key)
+				.run();
+			} catch (err) {
+			console.error("D1 delete error:", err);
+			}
 		}
 
 		if (isNoteSearch) {
