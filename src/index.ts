@@ -12,11 +12,35 @@ interface KVNamespace {
 	list(options: { prefix?: string; limit?: number }): Promise<KVListResult>;
 }
 
+interface NoteRecord {
+	id: string;
+	userId: string;
+	content: string;
+	createdAt: string;
+}
+
 export interface Env {
 	LINE_CHANNEL_ACCESS_TOKEN: string;
 	LINE_CHANNEL_SECRET: string;
 	MO_NOTES: KVNamespace;
   }
+
+function extractNoteContent(storedValue: string): string {
+	try {
+		const parsed: unknown = JSON.parse(storedValue);
+		if (
+			typeof parsed === "object" &&
+			parsed !== null &&
+			"content" in parsed &&
+			typeof parsed.content === "string"
+		) {
+			return parsed.content;
+		}
+		return storedValue;
+	} catch {
+		return storedValue;
+	}
+}
 
 function extractCommand(messageText: string): string | null {
 	// 目前只把「整句就是指令」當作 command（避免改變既有行為，如 `/ping ` 仍會走 echo）
@@ -43,8 +67,15 @@ async function handleCommand(
 		const noteContent = messageText.slice("/note".length).trim();
 		if (!noteContent) return "請輸入內容，例如：/note 今天買牛奶";
 	  
-		const key = `note:${userId}:${Date.now()}`;
-		await env.MO_NOTES.put(key, noteContent);
+		const timestamp = Date.now();
+		const key = `note:${userId}:${timestamp}`;
+		const noteRecord: NoteRecord = {
+			id: String(timestamp),
+			userId,
+			content: noteContent,
+			createdAt: new Date(timestamp).toISOString(),
+		};
+		await env.MO_NOTES.put(key, JSON.stringify(noteRecord));
 	  
 		return `已記錄：${noteContent}`;
 	  }
@@ -57,7 +88,9 @@ async function handleCommand(
 		const noteValues = await Promise.all(
 			latestKeys.map((key) => env.MO_NOTES.get(key.name, "text"))
 		);
-		const notes = noteValues.filter((value): value is string => value !== null);
+		const notes = noteValues
+			.filter((value): value is string => value !== null)
+			.map((value) => extractNoteContent(value));
 
 		if (notes.length === 0) return "目前沒有已記錄的筆記";
 
