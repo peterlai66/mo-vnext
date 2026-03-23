@@ -340,7 +340,8 @@ async function handleCommand(
 			try {
 			await env.MO_DB
 				.prepare(`DELETE FROM notes WHERE id = ?`)
-				.bind(targetNote.key.includes("note:") ? key.split(":").pop() : key)
+				.bind
+				//(targetNote.key.includes("note:") ? key.split(":").pop() : key)
 				.run();
 			} catch (err) {
 			console.error("D1 delete error:", err);
