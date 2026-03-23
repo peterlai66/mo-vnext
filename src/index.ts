@@ -126,6 +126,21 @@ async function handleCommand(
 /ping - 測試
 /help - 指令列表`;
 	  case "/note": {
+		if (messageText.startsWith("/note search")) {
+			const match = messageText.match(/^\/note\s+search\s+(.+)$/);
+			const keyword = match?.[1]?.trim() ?? "";
+			if (!keyword) return "請輸入關鍵字，例如 /note search 牛奶";
+
+			const matchedNotes = (await listUserNotes(env, userId, 1000)).filter(
+				(note) => note.content.includes(keyword)
+			);
+
+			if (matchedNotes.length === 0) return "找不到相關筆記";
+
+			return `搜尋結果：
+${matchedNotes.map((note, index) => `${index + 1}. ${note.content}`).join("\n")}`;
+		}
+
 		if (messageText.startsWith("/note del")) {
 			const match = messageText.match(/^\/note\s+del\s+(\d+)$/);
 			if (!match) return "請提供正確的編號，例如 /note del 1";
