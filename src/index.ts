@@ -4,13 +4,19 @@ interface KVListKey {
 
 interface KVListResult {
 	keys: KVListKey[];
+	list_complete?: boolean;
+	cursor?: string;
 }
 
 interface KVNamespace {
 	put(key: string, value: string): Promise<void>;
 	get(key: string, type: "text"): Promise<string | null>;
 	delete(key: string): Promise<void>;
-	list(options: { prefix?: string; limit?: number }): Promise<KVListResult>;
+	list(options: {
+		prefix?: string;
+		limit?: number;
+		cursor?: string;
+	}): Promise<KVListResult>;
 }
 
 interface NoteRecord {
@@ -86,12 +92,26 @@ function parseListedNote(keyName: string, storedValue: string): ListedNote {
 async function listUserNotes(
 	env: Env,
 	userId: string,
-	limit: number
+	limit: number,
+	readAll = false
 ): Promise<ListedNote[]> {
 	const prefix = `note:${userId}:`;
-	const listResult = await env.MO_NOTES.list({ prefix, limit });
+	const allKeys: KVListKey[] = [];
+	let cursor: string | undefined = undefined;
+
+	do {
+		const listResult = await env.MO_NOTES.list({
+			prefix,
+			limit: readAll ? 1000 : limit,
+			cursor,
+		});
+		allKeys.push(...listResult.keys);
+		cursor = listResult.cursor;
+		if (!readAll || listResult.list_complete !== false) break;
+	} while (cursor);
+
 	const noteEntries = await Promise.all(
-		listResult.keys.map(async (key) => {
+		allKeys.map(async (key) => {
 			const value = await env.MO_NOTES.get(key.name, "text");
 			if (value === null) return null;
 			return parseListedNote(key.name, value);
@@ -126,6 +146,14 @@ async function handleCommand(
 /ping - 測試
 /help - 指令列表`;
 	  case "/note": {
+		if (messageText === "/note clear") {
+			const notes = await listUserNotes(env, userId, Number.MAX_SAFE_INTEGER, true);
+			if (notes.length === 0) return "目前沒有可清除的筆記";
+
+			await Promise.all(notes.map((note) => env.MO_NOTES.delete(note.key)));
+			return `已清除 ${notes.length} 筆筆記`;
+		}
+
 		if (messageText.startsWith("/note search")) {
 			const match = messageText.match(/^\/note\s+search\s+(.+)$/);
 			const keyword = match?.[1]?.trim() ?? "";
