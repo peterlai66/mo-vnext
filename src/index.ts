@@ -19,6 +19,11 @@ interface NoteRecord {
 	createdAt: string;
 }
 
+interface ListedNote {
+	content: string;
+	sortTimestamp: number;
+}
+
 export interface Env {
 	LINE_CHANNEL_ACCESS_TOKEN: string;
 	LINE_CHANNEL_SECRET: string;
@@ -40,6 +45,40 @@ function extractNoteContent(storedValue: string): string {
 	} catch {
 		return storedValue;
 	}
+}
+
+function parseTimestampFromKey(keyName: string): number {
+	const parts = keyName.split(":");
+	const tail = parts[parts.length - 1];
+	const timestamp = Number(tail);
+	return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function parseListedNote(keyName: string, storedValue: string): ListedNote {
+	const fallbackTimestamp = parseTimestampFromKey(keyName);
+
+	try {
+		const parsed: unknown = JSON.parse(storedValue);
+		if (
+			typeof parsed === "object" &&
+			parsed !== null &&
+			"content" in parsed &&
+			typeof parsed.content === "string"
+		) {
+			let sortTimestamp = fallbackTimestamp;
+			if ("createdAt" in parsed && typeof parsed.createdAt === "string") {
+				const createdAtTs = Date.parse(parsed.createdAt);
+				if (Number.isFinite(createdAtTs)) {
+					sortTimestamp = createdAtTs;
+				}
+			}
+			return { content: parsed.content, sortTimestamp };
+		}
+	} catch {
+		// Fallback to legacy plain-text value
+	}
+
+	return { content: storedValue, sortTimestamp: fallbackTimestamp };
 }
 
 function extractCommand(messageText: string): string | null {
@@ -82,15 +121,18 @@ async function handleCommand(
 	  case "/notes": {
 		const prefix = `note:${userId}:`;
 		const listResult = await env.MO_NOTES.list({ prefix, limit: 10 });
-		const latestKeys = [...listResult.keys]
-		  .sort((a, b) => b.name.localeCompare(a.name))
-		  .slice(0, 10);
-		const noteValues = await Promise.all(
-			latestKeys.map((key) => env.MO_NOTES.get(key.name, "text"))
+		const noteEntries = await Promise.all(
+			listResult.keys.map(async (key) => {
+				const value = await env.MO_NOTES.get(key.name, "text");
+				if (value === null) return null;
+				return parseListedNote(key.name, value);
+			})
 		);
-		const notes = noteValues
-			.filter((value): value is string => value !== null)
-			.map((value) => extractNoteContent(value));
+		const notes = noteEntries
+			.filter((entry): entry is ListedNote => entry !== null)
+			.sort((a, b) => b.sortTimestamp - a.sortTimestamp)
+			.slice(0, 10)
+			.map((entry) => entry.content);
 
 		if (notes.length === 0) return "目前沒有已記錄的筆記";
 
