@@ -26,10 +26,10 @@ interface NoteRecord {
 	createdAt: string;
 }
 
-interface ListedNote {
+interface UserNote {
 	key: string;
 	content: string;
-	sortTimestamp: number;
+	createdAt: number;
 }
 
 export interface Env {
@@ -63,7 +63,7 @@ function parseTimestampFromKey(keyName: string): number {
 	return Number.isFinite(timestamp) ? timestamp : 0;
 }
 
-function parseListedNote(keyName: string, storedValue: string): ListedNote {
+function parseUserNote(keyName: string, storedValue: string): UserNote {
 	const fallbackTimestamp = parseTimestampFromKey(keyName);
 
 	try {
@@ -74,28 +74,23 @@ function parseListedNote(keyName: string, storedValue: string): ListedNote {
 			"content" in parsed &&
 			typeof parsed.content === "string"
 		) {
-			let sortTimestamp = fallbackTimestamp;
+			let createdAt = fallbackTimestamp;
 			if ("createdAt" in parsed && typeof parsed.createdAt === "string") {
 				const createdAtTs = Date.parse(parsed.createdAt);
 				if (Number.isFinite(createdAtTs)) {
-					sortTimestamp = createdAtTs;
+					createdAt = createdAtTs;
 				}
 			}
-			return { key: keyName, content: parsed.content, sortTimestamp };
+			return { key: keyName, content: parsed.content, createdAt };
 		}
 	} catch {
 		// Fallback to legacy plain-text value
 	}
 
-	return { key: keyName, content: storedValue, sortTimestamp: fallbackTimestamp };
+	return { key: keyName, content: storedValue, createdAt: fallbackTimestamp };
 }
 
-async function listUserNotes(
-	env: Env,
-	userId: string,
-	limit: number,
-	readAll = false
-): Promise<ListedNote[]> {
+async function getUserNotes(env: Env, userId: string): Promise<UserNote[]> {
 	const prefix = `note:${userId}:`;
 	const allKeys: KVListKey[] = [];
 	let cursor: string | undefined = undefined;
@@ -103,26 +98,25 @@ async function listUserNotes(
 	do {
 		const listResult = await env.MO_NOTES.list({
 			prefix,
-			limit: readAll ? 1000 : limit,
+			limit: 1000,
 			cursor,
 		});
 		allKeys.push(...listResult.keys);
 		cursor = listResult.cursor;
-		if (!readAll || listResult.list_complete !== false) break;
+		if (listResult.list_complete !== false) break;
 	} while (cursor);
 
 	const noteEntries = await Promise.all(
 		allKeys.map(async (key) => {
 			const value = await env.MO_NOTES.get(key.name, "text");
 			if (value === null) return null;
-			return parseListedNote(key.name, value);
+			return parseUserNote(key.name, value);
 		})
 	);
 
 	return noteEntries
-		.filter((entry): entry is ListedNote => entry !== null)
-		.sort((a, b) => b.sortTimestamp - a.sortTimestamp)
-		.slice(0, limit);
+		.filter((entry): entry is UserNote => entry !== null)
+		.sort((a, b) => b.createdAt - a.createdAt);
 }
 
 function extractTopKeywords(contents: string[], topN: number): string[] {
@@ -228,7 +222,7 @@ async function handleCommand(
 /help - 指令列表`;
 	  case "/note": {
 		if (messageText === "/note ai-summary") {
-			const notes = await listUserNotes(env, userId, Number.MAX_SAFE_INTEGER, true);
+			const notes = await getUserNotes(env, userId);
 			if (notes.length === 0) return "目前沒有筆記可供分析";
 
 			const mergedNotes = notes
@@ -243,7 +237,7 @@ ${aiSummary}`;
 		}
 
 		if (messageText === "/note summary") {
-			const notes = await listUserNotes(env, userId, Number.MAX_SAFE_INTEGER, true);
+			const notes = await getUserNotes(env, userId);
 			if (notes.length === 0) return "目前沒有筆記可供分析";
 
 			const topKeywords = extractTopKeywords(
@@ -258,7 +252,7 @@ ${aiSummary}`;
 		}
 
 		if (messageText === "/note clear") {
-			const notes = await listUserNotes(env, userId, Number.MAX_SAFE_INTEGER, true);
+			const notes = await getUserNotes(env, userId);
 			if (notes.length === 0) return "目前沒有可清除的筆記";
 
 			await Promise.all(notes.map((note) => env.MO_NOTES.delete(note.key)));
@@ -270,7 +264,7 @@ ${aiSummary}`;
 			const keyword = match?.[1]?.trim() ?? "";
 			if (!keyword) return "請輸入關鍵字，例如 /note search 牛奶";
 
-			const matchedNotes = (await listUserNotes(env, userId, 1000)).filter(
+			const matchedNotes = (await getUserNotes(env, userId)).filter(
 				(note) => note.content.includes(keyword)
 			);
 
@@ -289,7 +283,7 @@ ${matchedNotes.map((note, index) => `${index + 1}. ${note.content}`).join("\n")}
 				return "請提供正確的編號，例如 /note del 1";
 			}
 
-			const notes = await listUserNotes(env, userId, 1000);
+			const notes = await getUserNotes(env, userId);
 			const targetNote = notes[index - 1];
 			if (!targetNote) return "找不到該筆記";
 
@@ -313,7 +307,7 @@ ${matchedNotes.map((note, index) => `${index + 1}. ${note.content}`).join("\n")}
 		return `已記錄：${noteContent}`;
 	  }
 	  case "/notes": {
-		const notes = (await listUserNotes(env, userId, 10)).map(
+		const notes = (await getUserNotes(env, userId)).slice(0, 10).map(
 			(entry) => entry.content
 		);
 
