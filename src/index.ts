@@ -9,6 +9,7 @@ interface KVListResult {
 interface KVNamespace {
 	put(key: string, value: string): Promise<void>;
 	get(key: string, type: "text"): Promise<string | null>;
+	delete(key: string): Promise<void>;
 	list(options: { prefix?: string; limit?: number }): Promise<KVListResult>;
 }
 
@@ -20,6 +21,7 @@ interface NoteRecord {
 }
 
 interface ListedNote {
+	key: string;
 	content: string;
 	sortTimestamp: number;
 }
@@ -72,13 +74,34 @@ function parseListedNote(keyName: string, storedValue: string): ListedNote {
 					sortTimestamp = createdAtTs;
 				}
 			}
-			return { content: parsed.content, sortTimestamp };
+			return { key: keyName, content: parsed.content, sortTimestamp };
 		}
 	} catch {
 		// Fallback to legacy plain-text value
 	}
 
-	return { content: storedValue, sortTimestamp: fallbackTimestamp };
+	return { key: keyName, content: storedValue, sortTimestamp: fallbackTimestamp };
+}
+
+async function listUserNotes(
+	env: Env,
+	userId: string,
+	limit: number
+): Promise<ListedNote[]> {
+	const prefix = `note:${userId}:`;
+	const listResult = await env.MO_NOTES.list({ prefix, limit });
+	const noteEntries = await Promise.all(
+		listResult.keys.map(async (key) => {
+			const value = await env.MO_NOTES.get(key.name, "text");
+			if (value === null) return null;
+			return parseListedNote(key.name, value);
+		})
+	);
+
+	return noteEntries
+		.filter((entry): entry is ListedNote => entry !== null)
+		.sort((a, b) => b.sortTimestamp - a.sortTimestamp)
+		.slice(0, limit);
 }
 
 function extractCommand(messageText: string): string | null {
@@ -103,6 +126,23 @@ async function handleCommand(
 /ping - 測試
 /help - 指令列表`;
 	  case "/note": {
+		if (messageText.startsWith("/note del")) {
+			const match = messageText.match(/^\/note\s+del\s+(\d+)$/);
+			if (!match) return "請提供正確的編號，例如 /note del 1";
+
+			const index = Number(match[1]);
+			if (!Number.isInteger(index) || index < 1) {
+				return "請提供正確的編號，例如 /note del 1";
+			}
+
+			const notes = await listUserNotes(env, userId, 1000);
+			const targetNote = notes[index - 1];
+			if (!targetNote) return "找不到該筆記";
+
+			await env.MO_NOTES.delete(targetNote.key);
+			return `已刪除：${targetNote.content}`;
+		}
+
 		const noteContent = messageText.slice("/note".length).trim();
 		if (!noteContent) return "請輸入內容，例如：/note 今天買牛奶";
 	  
@@ -119,20 +159,9 @@ async function handleCommand(
 		return `已記錄：${noteContent}`;
 	  }
 	  case "/notes": {
-		const prefix = `note:${userId}:`;
-		const listResult = await env.MO_NOTES.list({ prefix, limit: 10 });
-		const noteEntries = await Promise.all(
-			listResult.keys.map(async (key) => {
-				const value = await env.MO_NOTES.get(key.name, "text");
-				if (value === null) return null;
-				return parseListedNote(key.name, value);
-			})
+		const notes = (await listUserNotes(env, userId, 10)).map(
+			(entry) => entry.content
 		);
-		const notes = noteEntries
-			.filter((entry): entry is ListedNote => entry !== null)
-			.sort((a, b) => b.sortTimestamp - a.sortTimestamp)
-			.slice(0, 10)
-			.map((entry) => entry.content);
 
 		if (notes.length === 0) return "目前沒有已記錄的筆記";
 
