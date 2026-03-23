@@ -225,8 +225,19 @@ async function handleCommand(
 		return "pong";
 	  case "/help":
 		return `可用指令：
-/ping - 測試
-/help - 指令列表`;
+
+【筆記功能】
+/note 內容 -> 新增筆記
+/note del 編號 -> 刪除筆記
+/note search 關鍵字 -> 搜尋筆記
+/note clear -> 清空所有筆記
+
+【查看】
+/notes -> 查看最近筆記
+
+【分析】
+/note summary -> 簡易摘要
+/note ai-summary -> AI 智慧摘要`;
 	  case "/note": {
 		if (messageText === "/note ai-summary") {
 			const notes = await getUserNotes(env, userId);
