@@ -175,7 +175,9 @@ function extractAiSummaryText(responseJson: unknown): string | null {
 
 async function generateAiSummary(notesText: string, env: Env): Promise<string | null> {
 	try {
-		const prompt = `請幫我摘要以下使用者筆記，重點整理使用者近期在做的事情與主題：
+		const systemPrompt =
+			"你是筆記整理助手。請用繁體中文回覆，精簡整理且最多 5 行，聚焦：1) 最近在做的事 2) 主要主題 3) 若有明顯待辦可順帶列出。";
+		const userPrompt = `請幫我摘要以下使用者筆記，重點整理使用者近期在做的事情與主題：
 
 ${notesText}`;
 
@@ -187,7 +189,12 @@ ${notesText}`;
 			},
 			body: JSON.stringify({
 				model: "gpt-4o-mini",
-				messages: [{ role: "user", content: prompt }],
+				temperature: 0.2,
+				max_completion_tokens: 220,
+				messages: [
+					{ role: "system", content: systemPrompt },
+					{ role: "user", content: userPrompt },
+				],
 			}),
 		});
 
@@ -226,9 +233,10 @@ async function handleCommand(
 			if (notes.length === 0) return "目前沒有筆記可供分析";
 
 			const mergedNotes = notes
+				.slice(0, 20)
 				.map((note) => note.content)
 				.join("\n")
-				.slice(0, 2000);
+				.slice(0, 1500);
 			const aiSummary = await generateAiSummary(mergedNotes, env);
 			if (!aiSummary) return "AI 摘要暫時無法使用，請稍後再試";
 
