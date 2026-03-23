@@ -36,6 +36,7 @@ export interface Env {
 	LINE_CHANNEL_ACCESS_TOKEN: string;
 	LINE_CHANNEL_SECRET: string;
 	MO_NOTES: KVNamespace;
+	OPENAI_API_KEY: string;
   }
 
 function extractNoteContent(storedValue: string): string {
@@ -145,6 +146,65 @@ function extractTopKeywords(contents: string[], topN: number): string[] {
 		.map(([word]) => word);
 }
 
+function extractAiSummaryText(responseJson: unknown): string | null {
+	if (
+		typeof responseJson !== "object" ||
+		responseJson === null ||
+		!("choices" in responseJson) ||
+		!Array.isArray(responseJson.choices) ||
+		responseJson.choices.length === 0
+	) {
+		return null;
+	}
+
+	const firstChoice = responseJson.choices[0];
+	if (
+		typeof firstChoice !== "object" ||
+		firstChoice === null ||
+		!("message" in firstChoice)
+	) {
+		return null;
+	}
+
+	const message = firstChoice.message;
+	if (
+		typeof message !== "object" ||
+		message === null ||
+		!("content" in message) ||
+		typeof message.content !== "string"
+	) {
+		return null;
+	}
+
+	return message.content.trim() || null;
+}
+
+async function generateAiSummary(notesText: string, env: Env): Promise<string | null> {
+	try {
+		const prompt = `請幫我摘要以下使用者筆記，重點整理使用者近期在做的事情與主題：
+
+${notesText}`;
+
+		const response = await fetch("https://api.openai.com/v1/chat/completions", {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+			},
+			body: JSON.stringify({
+				model: "gpt-4o-mini",
+				messages: [{ role: "user", content: prompt }],
+			}),
+		});
+
+		if (!response.ok) return null;
+		const responseJson = (await response.json()) as unknown;
+		return extractAiSummaryText(responseJson);
+	} catch {
+		return null;
+	}
+}
+
 function extractCommand(messageText: string): string | null {
 	// 目前只把「整句就是指令」當作 command（避免改變既有行為，如 `/ping ` 仍會走 echo）
 	// 後續若要支援 `/command arg`，可在這裡擴充解析。
@@ -167,6 +227,21 @@ async function handleCommand(
 /ping - 測試
 /help - 指令列表`;
 	  case "/note": {
+		if (messageText === "/note ai-summary") {
+			const notes = await listUserNotes(env, userId, Number.MAX_SAFE_INTEGER, true);
+			if (notes.length === 0) return "目前沒有筆記可供分析";
+
+			const mergedNotes = notes
+				.map((note) => note.content)
+				.join("\n")
+				.slice(0, 2000);
+			const aiSummary = await generateAiSummary(mergedNotes, env);
+			if (!aiSummary) return "AI 摘要暫時無法使用，請稍後再試";
+
+			return `你的筆記摘要：
+${aiSummary}`;
+		}
+
 		if (messageText === "/note summary") {
 			const notes = await listUserNotes(env, userId, Number.MAX_SAFE_INTEGER, true);
 			if (notes.length === 0) return "目前沒有筆記可供分析";
