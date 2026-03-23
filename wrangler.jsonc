@@ -5,4 +5,11 @@
 	"observability": {
 		"enabled": true,
 	},
+	"kv_namespaces": [
+		{
+			"binding": "MO_NOTES",
+			"id": "a1f4ae17f798435f92a7e8f4a4e3218a",
+			"remote": true
+		}
+	],
 }

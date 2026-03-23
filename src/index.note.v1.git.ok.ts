@@ -1,37 +1,16 @@
-interface KVListKey {
-	name: string;
-}
-
-interface KVListResult {
-	keys: KVListKey[];
-}
-
-interface KVNamespace {
-	put(key: string, value: string): Promise<void>;
-	get(key: string, type: "text"): Promise<string | null>;
-	list(options: { prefix?: string; limit?: number }): Promise<KVListResult>;
-}
-
 export interface Env {
 	LINE_CHANNEL_ACCESS_TOKEN: string;
 	LINE_CHANNEL_SECRET: string;
-	MO_NOTES: KVNamespace;
   }
 
 function extractCommand(messageText: string): string | null {
 	// 目前只把「整句就是指令」當作 command（避免改變既有行為，如 `/ping ` 仍會走 echo）
 	// 後續若要支援 `/command arg`，可在這裡擴充解析。
-	if (messageText === "/notes") return "/notes";
 	if (/^\/note(?:\s+|$)/.test(messageText)) return "/note";
 	return /^\/[A-Za-z0-9_]+$/.test(messageText) ? messageText : null;
 }
 
-async function handleCommand(
-	command: string | null,
-	messageText: string,
-	env: Env,
-	userId: string
-): Promise<string> {
+function handleCommand(command: string | null, messageText: string): string {
 	switch (command) {
 	  case "/ping":
 		return "pong";
@@ -42,27 +21,7 @@ async function handleCommand(
 	  case "/note": {
 		const noteContent = messageText.slice("/note".length).trim();
 		if (!noteContent) return "請輸入內容，例如：/note 今天買牛奶";
-	  
-		const key = `note:${userId}:${Date.now()}`;
-		await env.MO_NOTES.put(key, noteContent);
-	  
-		return `已記錄：${noteContent}`;
-	  }
-	  case "/notes": {
-		const prefix = `note:${userId}:`;
-		const listResult = await env.MO_NOTES.list({ prefix, limit: 10 });
-		const latestKeys = [...listResult.keys]
-		  .sort((a, b) => b.name.localeCompare(a.name))
-		  .slice(0, 10);
-		const noteValues = await Promise.all(
-			latestKeys.map((key) => env.MO_NOTES.get(key.name, "text"))
-		);
-		const notes = noteValues.filter((value): value is string => value !== null);
-
-		if (notes.length === 0) return "目前沒有已記錄的筆記";
-
-		return `你的最近筆記：
-${notes.map((note, index) => `${index + 1}. ${note}`).join("\n")}`;
+		return `已收到筆記：${noteContent}`;
 	  }
 	  // TODO: later commands
 	  // case "/help":
@@ -77,23 +36,16 @@ ${notes.map((note, index) => `${index + 1}. ${note}`).join("\n")}`;
 	}
 }
 
-async function getReplyText(
-	messageText: string | undefined,
-	env: Env,
-	userId: string
-): Promise<string> {
+function getReplyText(messageText: string | undefined): string {
 	const text = messageText ?? "";
 	const command = extractCommand(text);
-	return await handleCommand(command, text, env, userId);
+	return handleCommand(command, text);
 }
   
   type LineWebhookBody = {
 	events?: Array<{
 	  type: string;
 	  replyToken?: string;
-	  source?: {
-		userId?: string;
-	  };
 	  message?: {
 		type?: string;
 		text?: string;
@@ -115,8 +67,7 @@ async function getReplyText(
 			event.message?.type === "text" &&
 			event.replyToken
 		  ) {
-			const userId = event.source?.userId ?? "unknown-user";
-			const replyText = await getReplyText(event.message.text, env, userId);
+			const replyText = getReplyText(event.message.text);
 			await fetch("https://api.line.me/v2/bot/message/reply", {
 			  method: "POST",
 			  headers: {
