@@ -280,6 +280,7 @@ async function handleCommand(
 		const isNoteClear = messageText === "/note clear";
 		const isNoteSummary = messageText === "/note summary";
 		const isNoteAiSummary = messageText === "/note ai-summary";
+		const isNoteExport = messageText === "/note export";
 
 		if (isNoteDel) {
 			const match = messageText.match(/^\/note\s+del\s+(\d+)$/);
@@ -350,6 +351,15 @@ ${matchedNotes.map((note, index) => `${index + 1}. ${note.content}`).join("\n")}
 
 			return `你的筆記摘要：
 ${aiSummary}`;
+		}
+
+		if (isNoteExport) {
+			const notes = await getUserNotes(env, userId);
+			if (notes.length === 0) return "目前沒有筆記可匯出";
+
+			return `你的所有筆記：
+
+${notes.map((note, index) => `${index + 1}. ${note.content}`).join("\n")}`;
 		}
 
 		if (isNoteEdit) {
