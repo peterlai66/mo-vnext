@@ -124,6 +124,27 @@ async function listUserNotes(
 		.slice(0, limit);
 }
 
+function extractTopKeywords(contents: string[], topN: number): string[] {
+	const wordCount = new Map<string, number>();
+
+	for (const content of contents) {
+		const words = content
+			.toLowerCase()
+			.split(/[\s,，。！？!?.、;；:：()（）\[\]{}"']/)
+			.map((word) => word.trim())
+			.filter((word) => word.length > 0);
+
+		for (const word of words) {
+			wordCount.set(word, (wordCount.get(word) ?? 0) + 1);
+		}
+	}
+
+	return [...wordCount.entries()]
+		.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+		.slice(0, topN)
+		.map(([word]) => word);
+}
+
 function extractCommand(messageText: string): string | null {
 	// 目前只把「整句就是指令」當作 command（避免改變既有行為，如 `/ping ` 仍會走 echo）
 	// 後續若要支援 `/command arg`，可在這裡擴充解析。
@@ -146,6 +167,21 @@ async function handleCommand(
 /ping - 測試
 /help - 指令列表`;
 	  case "/note": {
+		if (messageText === "/note summary") {
+			const notes = await listUserNotes(env, userId, Number.MAX_SAFE_INTEGER, true);
+			if (notes.length === 0) return "目前沒有筆記可供分析";
+
+			const topKeywords = extractTopKeywords(
+				notes.map((note) => note.content),
+				3
+			);
+			const keywordText = topKeywords.length > 0 ? topKeywords.join(", ") : "無";
+
+			return `你的筆記摘要：
+- 常出現：${keywordText}
+- 筆記數量：${notes.length} 筆`;
+		}
+
 		if (messageText === "/note clear") {
 			const notes = await listUserNotes(env, userId, Number.MAX_SAFE_INTEGER, true);
 			if (notes.length === 0) return "目前沒有可清除的筆記";
