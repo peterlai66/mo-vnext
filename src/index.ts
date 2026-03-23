@@ -132,34 +132,60 @@ function buildEditedNoteValue(
 	return JSON.stringify(normalizedRecord);
 }
 
-async function getUserNotes(env: Env, userId: string): Promise<UserNote[]> {
+async function getUserNotes(env: Env, userId: string) {
+	try {
+	  const { results } = await env.MO_DB
+		.prepare(
+		  `SELECT id, content, created_at
+		   FROM notes
+		   WHERE user_id = ?
+		   ORDER BY created_at DESC
+		   LIMIT 50`
+		)
+		.bind(userId)
+		.all();
+  
+	  if (results && results.length > 0) {
+		return results.map((row: any) => ({
+		  key: row.id,
+		  content: row.content,
+		  createdAt: row.created_at,
+		}));
+	  }
+	} catch (err) {
+	  console.error("D1 read error:", err);
+	}
+  
+	// fallback KV
 	const prefix = `note:${userId}:`;
-	const allKeys: KVListKey[] = [];
-	let cursor: string | undefined = undefined;
-
-	do {
-		const listResult = await env.MO_NOTES.list({
-			prefix,
-			limit: 1000,
-			cursor,
-		});
-		allKeys.push(...listResult.keys);
-		cursor = listResult.cursor;
-		if (listResult.list_complete !== false) break;
-	} while (cursor);
-
-	const noteEntries = await Promise.all(
-		allKeys.map(async (key) => {
-			const value = await env.MO_NOTES.get(key.name, "text");
-			if (value === null) return null;
-			return parseUserNote(key.name, value);
-		})
+	const list = await env.MO_NOTES.list({ prefix });
+  
+	const notes = await Promise.all(
+	  list.keys.map(async (k) => {
+		const v = await env.MO_NOTES.get(k.name);
+		if (!v) return null;
+  
+		try {
+		  const parsed = JSON.parse(v);
+		  return {
+			key: k.name,
+			content: parsed.content ?? v,
+			createdAt: Number(parsed.createdAt ?? k.name.split(":").pop()),
+		  };
+		} catch {
+		  return {
+			key: k.name,
+			content: v,
+			createdAt: Number(k.name.split(":").pop()),
+		  };
+		}
+	  })
 	);
-
-	return noteEntries
-		.filter((entry): entry is UserNote => entry !== null)
-		.sort((a, b) => b.createdAt - a.createdAt);
-}
+  
+	return notes
+	  .filter((n) => n !== null)
+	  .sort((a, b) => b!.createdAt - a!.createdAt);
+  }
 
 function extractTopKeywords(contents: string[], topN: number): string[] {
 	const wordCount = new Map<string, number>();
