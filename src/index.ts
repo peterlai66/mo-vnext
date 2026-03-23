@@ -90,6 +90,38 @@ function parseUserNote(keyName: string, storedValue: string): UserNote {
 	return { key: keyName, content: storedValue, createdAt: fallbackTimestamp };
 }
 
+function buildEditedNoteValue(
+	key: string,
+	existingValue: string,
+	newContent: string,
+	userId: string,
+	createdAt: number
+): string {
+	try {
+		const parsed: unknown = JSON.parse(existingValue);
+		if (typeof parsed === "object" && parsed !== null) {
+			const updatedRecord = {
+				...(parsed as Record<string, unknown>),
+				content: newContent,
+			};
+			return JSON.stringify(updatedRecord);
+		}
+	} catch {
+		// Fallback to creating normalized JSON record
+	}
+
+	const fallbackTimestamp = parseTimestampFromKey(key) || Date.now();
+	const normalizedCreatedAt =
+		createdAt > 0 ? new Date(createdAt).toISOString() : new Date(fallbackTimestamp).toISOString();
+	const normalizedRecord: NoteRecord = {
+		id: String(fallbackTimestamp),
+		userId,
+		content: newContent,
+		createdAt: normalizedCreatedAt,
+	};
+	return JSON.stringify(normalizedRecord);
+}
+
 async function getUserNotes(env: Env, userId: string): Promise<UserNote[]> {
 	const prefix = `note:${userId}:`;
 	const allKeys: KVListKey[] = [];
@@ -242,6 +274,34 @@ async function handleCommand(
 【其他】
 /ping → 測試系統狀態`;
 	  case "/note": {
+		if (messageText.startsWith("/note edit")) {
+			const match = messageText.match(/^\/note\s+edit\s+(\d+)\s+(.+)$/);
+			const indexText = match?.[1] ?? "";
+			const newContent = match?.[2]?.trim() ?? "";
+			const index = Number(indexText);
+
+			if (!Number.isInteger(index) || index < 1 || !newContent) {
+				return "請輸入正確格式，例如 /note edit 1 新內容";
+			}
+
+			const notes = await getUserNotes(env, userId);
+			const targetNote = notes[index - 1];
+			if (!targetNote) return "找不到該筆記";
+
+			const existingValue = await env.MO_NOTES.get(targetNote.key, "text");
+			if (existingValue === null) return "找不到該筆記";
+
+			const updatedValue = buildEditedNoteValue(
+				targetNote.key,
+				existingValue,
+				newContent,
+				userId,
+				targetNote.createdAt
+			);
+			await env.MO_NOTES.put(targetNote.key, updatedValue);
+			return `已更新：${newContent}`;
+		}
+
 		if (messageText === "/note ai-summary") {
 			const notes = await getUserNotes(env, userId);
 			if (notes.length === 0) return "目前沒有筆記可供分析";
