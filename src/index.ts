@@ -19,6 +19,15 @@ interface KVNamespace {
 	}): Promise<KVListResult>;
 }
 
+interface D1PreparedStatement {
+	bind(...values: Array<string | number>): D1PreparedStatement;
+	run(): Promise<unknown>;
+}
+
+interface D1Database {
+	prepare(query: string): D1PreparedStatement;
+}
+
 interface NoteRecord {
 	id: string;
 	userId: string;
@@ -36,6 +45,7 @@ export interface Env {
 	LINE_CHANNEL_ACCESS_TOKEN: string;
 	LINE_CHANNEL_SECRET: string;
 	MO_NOTES: KVNamespace;
+	MO_DB: D1Database;
 	OPENAI_API_KEY: string;
   }
 
@@ -402,6 +412,16 @@ ${notes.map((note, index) => `${index + 1}. ${note.content}`).join("\n")}`;
 			createdAt: new Date(timestamp).toISOString(),
 		};
 		await env.MO_NOTES.put(key, JSON.stringify(noteRecord));
+		try {
+			await env.MO_DB
+				.prepare(
+					"INSERT INTO notes (id, user_id, content, created_at) VALUES (?, ?, ?, ?)"
+				)
+				.bind(noteRecord.id, userId, noteContent, timestamp)
+				.run();
+		} catch (error) {
+			console.error("D1 dual write failed", error);
+		}
 	  
 		return `已記錄：${noteContent}`;
 	  }

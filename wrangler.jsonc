@@ -12,4 +12,12 @@
 			"remote": true
 		}
 	],
+	"d1_databases": [
+		{
+			"binding": "MO_DB",
+			"database_name": "MO_DB",
+			"database_id": "6a749446-3ed2-4d99-b48a-ff9b7e2f3de8",
+			"remote": true
+		}
+	]
 }
