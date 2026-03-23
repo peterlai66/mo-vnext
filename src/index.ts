@@ -274,7 +274,85 @@ async function handleCommand(
 【其他】
 /ping → 測試系統狀態`;
 	  case "/note": {
-		if (messageText.startsWith("/note edit")) {
+		const isNoteEdit = messageText.startsWith("/note edit");
+		const isNoteDel = messageText.startsWith("/note del");
+		const isNoteSearch = messageText.startsWith("/note search");
+		const isNoteClear = messageText === "/note clear";
+		const isNoteSummary = messageText === "/note summary";
+		const isNoteAiSummary = messageText === "/note ai-summary";
+
+		if (isNoteDel) {
+			const match = messageText.match(/^\/note\s+del\s+(\d+)$/);
+			if (!match) return "請提供正確的編號，例如 /note del 1";
+
+			const index = Number(match[1]);
+			if (!Number.isInteger(index) || index < 1) {
+				return "請提供正確的編號，例如 /note del 1";
+			}
+
+			const notes = await getUserNotes(env, userId);
+			const targetNote = notes[index - 1];
+			if (!targetNote) return "找不到該筆記";
+
+			await env.MO_NOTES.delete(targetNote.key);
+			return `已刪除：${targetNote.content}`;
+		}
+
+		if (isNoteSearch) {
+			const match = messageText.match(/^\/note\s+search\s+(.+)$/);
+			const keyword = match?.[1]?.trim() ?? "";
+			if (!keyword) return "請輸入關鍵字，例如 /note search 牛奶";
+
+			const matchedNotes = (await getUserNotes(env, userId)).filter((note) =>
+				note.content.includes(keyword)
+			);
+
+			if (matchedNotes.length === 0) return "找不到相關筆記";
+
+			return `搜尋結果：
+${matchedNotes.map((note, index) => `${index + 1}. ${note.content}`).join("\n")}`;
+		}
+
+		if (isNoteClear) {
+			const notes = await getUserNotes(env, userId);
+			if (notes.length === 0) return "目前沒有可清除的筆記";
+
+			await Promise.all(notes.map((note) => env.MO_NOTES.delete(note.key)));
+			return `已清除 ${notes.length} 筆筆記`;
+		}
+
+		if (isNoteSummary) {
+			const notes = await getUserNotes(env, userId);
+			if (notes.length === 0) return "目前沒有筆記可供分析";
+
+			const topKeywords = extractTopKeywords(
+				notes.map((note) => note.content),
+				3
+			);
+			const keywordText = topKeywords.length > 0 ? topKeywords.join(", ") : "無";
+
+			return `你的筆記摘要：
+- 常出現：${keywordText}
+- 筆記數量：${notes.length} 筆`;
+		}
+
+		if (isNoteAiSummary) {
+			const notes = await getUserNotes(env, userId);
+			if (notes.length === 0) return "目前沒有筆記可供分析";
+
+			const mergedNotes = notes
+				.slice(0, 20)
+				.map((note) => note.content)
+				.join("\n")
+				.slice(0, 1500);
+			const aiSummary = await generateAiSummary(mergedNotes, env);
+			if (!aiSummary) return "AI 摘要暫時無法使用，請稍後再試";
+
+			return `你的筆記摘要：
+${aiSummary}`;
+		}
+
+		if (isNoteEdit) {
 			const match = messageText.match(/^\/note\s+edit\s+(\d+)\s+(.+)$/);
 			const indexText = match?.[1] ?? "";
 			const newContent = match?.[2]?.trim() ?? "";
@@ -300,77 +378,6 @@ async function handleCommand(
 			);
 			await env.MO_NOTES.put(targetNote.key, updatedValue);
 			return `已更新：${newContent}`;
-		}
-
-		if (messageText === "/note ai-summary") {
-			const notes = await getUserNotes(env, userId);
-			if (notes.length === 0) return "目前沒有筆記可供分析";
-
-			const mergedNotes = notes
-				.slice(0, 20)
-				.map((note) => note.content)
-				.join("\n")
-				.slice(0, 1500);
-			const aiSummary = await generateAiSummary(mergedNotes, env);
-			if (!aiSummary) return "AI 摘要暫時無法使用，請稍後再試";
-
-			return `你的筆記摘要：
-${aiSummary}`;
-		}
-
-		if (messageText === "/note summary") {
-			const notes = await getUserNotes(env, userId);
-			if (notes.length === 0) return "目前沒有筆記可供分析";
-
-			const topKeywords = extractTopKeywords(
-				notes.map((note) => note.content),
-				3
-			);
-			const keywordText = topKeywords.length > 0 ? topKeywords.join(", ") : "無";
-
-			return `你的筆記摘要：
-- 常出現：${keywordText}
-- 筆記數量：${notes.length} 筆`;
-		}
-
-		if (messageText === "/note clear") {
-			const notes = await getUserNotes(env, userId);
-			if (notes.length === 0) return "目前沒有可清除的筆記";
-
-			await Promise.all(notes.map((note) => env.MO_NOTES.delete(note.key)));
-			return `已清除 ${notes.length} 筆筆記`;
-		}
-
-		if (messageText.startsWith("/note search")) {
-			const match = messageText.match(/^\/note\s+search\s+(.+)$/);
-			const keyword = match?.[1]?.trim() ?? "";
-			if (!keyword) return "請輸入關鍵字，例如 /note search 牛奶";
-
-			const matchedNotes = (await getUserNotes(env, userId)).filter(
-				(note) => note.content.includes(keyword)
-			);
-
-			if (matchedNotes.length === 0) return "找不到相關筆記";
-
-			return `搜尋結果：
-${matchedNotes.map((note, index) => `${index + 1}. ${note.content}`).join("\n")}`;
-		}
-
-		if (messageText.startsWith("/note del")) {
-			const match = messageText.match(/^\/note\s+del\s+(\d+)$/);
-			if (!match) return "請提供正確的編號，例如 /note del 1";
-
-			const index = Number(match[1]);
-			if (!Number.isInteger(index) || index < 1) {
-				return "請提供正確的編號，例如 /note del 1";
-			}
-
-			const notes = await getUserNotes(env, userId);
-			const targetNote = notes[index - 1];
-			if (!targetNote) return "找不到該筆記";
-
-			await env.MO_NOTES.delete(targetNote.key);
-			return `已刪除：${targetNote.content}`;
 		}
 
 		const noteContent = messageText.slice("/note".length).trim();
