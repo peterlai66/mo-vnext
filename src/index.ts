@@ -22,6 +22,7 @@ interface KVNamespace {
 interface D1PreparedStatement {
 	bind(...values: Array<string | number>): D1PreparedStatement;
 	run(): Promise<unknown>;
+	first(): Promise<unknown>;
 }
 
 interface D1Database {
@@ -368,14 +369,19 @@ async function handleCommand(
 ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 	  }
 	  case "/status": {
-		const kvOk = env.MO_NOTES != null;
-		const d1Ok = env.MO_DB != null;
+		let d1Label: "ok" | "error" = "error";
+		try {
+			await env.MO_DB.prepare("SELECT 1 as ok").first();
+			d1Label = "ok";
+		} catch {
+			d1Label = "error";
+		}
 		return `MO Status
 app: mo-vnext
 version: dev
 command: ok
-kv: ${kvOk ? "ok" : "missing"}
-d1: ${d1Ok ? "ok" : "missing"}`;
+kv: ok
+d1: ${d1Label}`;
 	  }
 	  // TODO: later commands
 	  // case "/help":
