@@ -379,21 +379,28 @@ async function handleCommand(
 ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 	  }
 	  case "/status": {
-		let d1Label: "ok" | "error" = "error";
 		try {
-			await env.MO_DB.prepare("SELECT 1 as ok").first();
-			d1Label = "ok";
-		} catch {
-			d1Label = "error";
-		}
-		const hasUserId = userId.trim() !== "";
-		const userLabel = hasUserId ? "ok" : "none";
-		let noteCount = 0;
-		if (hasUserId) {
-			const noteList = await env.MO_NOTES.list({ prefix: `note:${userId}:` });
-			noteCount = noteList.keys.length;
-		}
-		return `MO Status
+			console.error("[status] start");
+			let d1Label: "ok" | "error" = "error";
+			console.error("[status] before d1");
+			try {
+				await env.MO_DB.prepare("SELECT 1 as ok").first();
+				d1Label = "ok";
+			} catch {
+				d1Label = "error";
+			}
+			console.error("[status] after d1");
+			const hasUserId = userId.trim() !== "";
+			const userLabel = hasUserId ? "ok" : "none";
+			let noteCount = 0;
+			if (hasUserId) {
+				console.error("[status] before kv list");
+				const noteList = await env.MO_NOTES.list({ prefix: `note:${userId}:` });
+				console.error("[status] after kv list");
+				noteCount = noteList.keys.length;
+			}
+			console.error("[status] before reply");
+			return `MO Status
 app: mo-vnext
 version: dev
 command: ok
@@ -401,6 +408,17 @@ kv: ok
 d1: ${d1Label}
 user: ${userLabel}
 noteCount: ${noteCount}`;
+		} catch (error: unknown) {
+			console.error("[status] error", error);
+			return `MO Status
+app: mo-vnext
+version: dev
+command: ok
+kv: ok
+d1: error
+user: error
+noteCount: error`;
+		}
 	  }
 	  // TODO: later commands
 	  // case "/help":
