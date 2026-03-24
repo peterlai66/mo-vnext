@@ -372,7 +372,13 @@ async function getReplyText(
 		console.log("[fetch] path", new URL(request.url).pathname);
 		const url = new URL(request.url);
   
-	  if (url.pathname === "/api/line/webhook" && request.method === "POST") {
+	  if (
+		(url.pathname === "/api/line/webhook" || url.pathname === "/line/webhook") &&
+		request.method === "POST"
+	  ) {
+		if (url.pathname === "/line/webhook") {
+			console.log("[line] route hit");
+		}
 		const body = (await request.json()) as LineWebhookBody;
 		console.log("[line] body", JSON.stringify(body));
 		const events = body.events ?? [];
