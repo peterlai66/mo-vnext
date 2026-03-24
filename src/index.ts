@@ -312,10 +312,28 @@ async function handleCommand(
 /ping → 測試系統狀態`;
 	  case "/note": {
 		const noteContent = messageText.slice("/note".length).trim();
-		if (!noteContent) return "請輸入筆記內容";
+		const latestKey = `note:${userId}`;
 
-		const key = `note:${userId}`;
-		await env.MO_NOTES.put(key, noteContent);
+		if (!noteContent) {
+			const stored = await env.MO_NOTES.get(latestKey, "text");
+			if (stored !== null && stored !== "") {
+				return stored;
+			}
+			return "你目前還沒有筆記";
+		}
+
+		await env.MO_NOTES.put(latestKey, noteContent);
+
+		const timestamp = Date.now();
+		const historyKey = `note:${userId}:${timestamp}`;
+		const noteRecord: NoteRecord = {
+			id: String(timestamp),
+			userId,
+			content: noteContent,
+			createdAt: new Date(timestamp).toISOString(),
+		};
+		await env.MO_NOTES.put(historyKey, JSON.stringify(noteRecord));
+
 		return "已儲存你的筆記";
 	  }
 	  case "/notes": {
