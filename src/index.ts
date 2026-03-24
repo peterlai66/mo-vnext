@@ -290,6 +290,7 @@ async function handleCommand(
 ): Promise<string> {
 	switch (command) {
 	  case "/ping":
+		console.log("/ping hit");
 		return "pong";
 	  case "/help":
 		return `可用指令：
@@ -347,6 +348,7 @@ async function getReplyText(
 ): Promise<string> {
 	const text = messageText ?? "";
 	const command = extractCommand(text);
+	console.log("[line webhook] command before handleCommand:", command, "text:", text);
 	return await handleCommand(command, text, env, userId);
 }
   
@@ -371,13 +373,18 @@ async function getReplyText(
 	  if (url.pathname === "/api/line/webhook" && request.method === "POST") {
 		const body = (await request.json()) as LineWebhookBody;
 		const events = body.events ?? [];
-  
+		console.log("[line webhook] eventCount:", events.length);
+
 		for (const event of events) {
+		  if (event.type === "message") {
+			console.log("[line webhook] message event, event.type:", event.type);
+		  }
 		  if (
 			event.type === "message" &&
 			event.message?.type === "text" &&
 			event.replyToken
 		  ) {
+			console.log("[line webhook] text message:", event.message.text ?? "");
 			const userId = event.source?.userId ?? "unknown-user";
 			const replyText = await getReplyText(event.message.text, env, userId);
 			await fetch("https://api.line.me/v2/bot/message/reply", {
