@@ -48,7 +48,17 @@ export interface Env {
 	MO_NOTES: KVNamespace;
 	MO_DB: D1Database;
 	OPENAI_API_KEY: string;
-  }
+	DEBUG_LOG?: string;
+}
+
+function isDebugLogEnabled(env: Env): boolean {
+	return env.DEBUG_LOG === "true";
+}
+
+function debugLog(env: Env, ...args: unknown[]): void {
+	if (!isDebugLogEnabled(env)) return;
+	Reflect.apply(console.log, console, args);
+}
 
 function extractNoteContent(storedValue: string): string {
 	try {
@@ -291,7 +301,7 @@ async function handleCommand(
 ): Promise<string> {
 	switch (command) {
 	  case "/ping":
-		console.log("/ping hit");
+		debugLog(env, "/ping hit");
 		return "pong";
 	  case "/help":
 		return `可用指令：
@@ -412,7 +422,7 @@ async function getReplyText(
 ): Promise<string> {
 	const text = messageText ?? "";
 	const command = extractCommand(text);
-	console.log("[line webhook] command before handleCommand:", command, "text:", text);
+	debugLog(env, "[line webhook] command before handleCommand:", command, "text:", text);
 	return await handleCommand(command, text, env, userId);
 }
   
@@ -432,8 +442,8 @@ async function getReplyText(
   
   export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
-		console.log("[fetch] hit");
-		console.log("[fetch] path", new URL(request.url).pathname);
+		debugLog(env, "[fetch] hit");
+		debugLog(env, "[fetch] path", new URL(request.url).pathname);
 		const url = new URL(request.url);
   
 	  if (
@@ -441,23 +451,23 @@ async function getReplyText(
 		request.method === "POST"
 	  ) {
 		if (url.pathname === "/line/webhook") {
-			console.log("[line] route hit");
+			debugLog(env, "[line] route hit");
 		}
 		const body = (await request.json()) as LineWebhookBody;
-		console.log("[line] body", JSON.stringify(body));
+		debugLog(env, "[line] body", JSON.stringify(body));
 		const events = body.events ?? [];
-		console.log("[line webhook] eventCount:", events.length);
+		debugLog(env, "[line webhook] eventCount:", events.length);
 
 		for (const event of events) {
 		  if (event.type === "message") {
-			console.log("[line webhook] message event, event.type:", event.type);
+			debugLog(env, "[line webhook] message event, event.type:", event.type);
 		  }
 		  if (
 			event.type === "message" &&
 			event.message?.type === "text" &&
 			event.replyToken
 		  ) {
-			console.log("[line webhook] text message:", event.message.text ?? "");
+			debugLog(env, "[line webhook] text message:", event.message.text ?? "");
 			const userId = event.source?.userId ?? "unknown-user";
 			const replyText = await getReplyText(event.message.text, env, userId);
 			const response = await fetch("https://api.line.me/v2/bot/message/reply", {
@@ -476,9 +486,9 @@ async function getReplyText(
 				],
 			  }),
 			});
-			console.log("[line reply] status", response.status);
-			console.log("[line reply] ok", response.ok);
-			console.log("[line reply] body", await response.text());
+			debugLog(env, "[line reply] status", response.status);
+			debugLog(env, "[line reply] ok", response.ok);
+			debugLog(env, "[line reply] body", await response.text());
 		  }
 		}
   
