@@ -376,12 +376,21 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 		} catch {
 			d1Label = "error";
 		}
+		const hasUserId = userId.trim() !== "";
+		const userLabel = hasUserId ? "ok" : "none";
+		let noteCount = 0;
+		if (hasUserId) {
+			const noteList = await env.MO_NOTES.list({ prefix: `note:${userId}:` });
+			noteCount = noteList.keys.length;
+		}
 		return `MO Status
 app: mo-vnext
 version: dev
 command: ok
 kv: ok
-d1: ${d1Label}`;
+d1: ${d1Label}
+user: ${userLabel}
+noteCount: ${noteCount}`;
 	  }
 	  // TODO: later commands
 	  // case "/help":
