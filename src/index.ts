@@ -337,14 +337,26 @@ async function handleCommand(
 		return "已儲存你的筆記";
 	  }
 	  case "/notes": {
-		const notes = (await getUserNotes(env, userId)).slice(0, 10).map(
-			(entry) => entry.content
-		);
+		const prefix = `note:${userId}:`;
+		const list = await env.MO_NOTES.list({ prefix });
+		const sortedKeyNames = [...list.keys]
+			.map((k) => k.name)
+			.sort((a, b) => parseTimestampFromKey(b) - parseTimestampFromKey(a));
 
-		if (notes.length === 0) return "目前沒有已記錄的筆記";
+		const lines: string[] = [];
+		for (const keyName of sortedKeyNames) {
+			if (lines.length >= 5) break;
+			const raw = await env.MO_NOTES.get(keyName, "text");
+			if (raw === null || raw === "") continue;
+			const content = extractNoteContent(raw).trim();
+			if (content === "") continue;
+			lines.push(content);
+		}
+
+		if (lines.length === 0) return "你目前還沒有歷史筆記";
 
 		return `你的最近筆記：
-${notes.map((note, index) => `${index + 1}. ${note}`).join("\n")}`;
+${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 	  }
 	  // TODO: later commands
 	  // case "/help":
