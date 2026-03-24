@@ -368,6 +368,7 @@ async function getReplyText(
   
   export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
+		console.log("[fetch] hit");
 		const url = new URL(request.url);
   
 	  if (url.pathname === "/api/line/webhook" && request.method === "POST") {
