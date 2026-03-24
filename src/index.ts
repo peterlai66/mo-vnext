@@ -314,6 +314,15 @@ async function handleCommand(
 		const noteContent = messageText.slice("/note".length).trim();
 		const latestKey = `note:${userId}`;
 
+		if (noteContent === "del") {
+			const stored = await env.MO_NOTES.get(latestKey, "text");
+			if (stored === null || stored === "") {
+				return "目前沒有可刪除的筆記";
+			}
+			await env.MO_NOTES.delete(latestKey);
+			return "已刪除最新筆記";
+		}
+
 		if (!noteContent) {
 			const stored = await env.MO_NOTES.get(latestKey, "text");
 			if (stored !== null && stored !== "") {
