@@ -367,6 +367,16 @@ async function handleCommand(
 		return `你的最近筆記：
 ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 	  }
+	  case "/status": {
+		const kvOk = env.MO_NOTES != null;
+		const d1Ok = env.MO_DB != null;
+		return `MO Status
+app: mo-vnext
+version: dev
+command: ok
+kv: ${kvOk ? "ok" : "missing"}
+d1: ${d1Ok ? "ok" : "missing"}`;
+	  }
 	  // TODO: later commands
 	  // case "/help":
 	  //  return "...";
