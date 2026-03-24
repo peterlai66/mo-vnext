@@ -8,7 +8,7 @@
 		"start": "wrangler dev",
 		"test": "vitest",
 		"cf-typegen": "wrangler types",
-		"ac": "git add . && git commit -m \"chore: auto commit from cursor\" || true"
+		"ac": "git add . && git commit -m"
 	},
 	"devDependencies": {
 		"@cloudflare/vitest-pool-workers": "^0.12.4",

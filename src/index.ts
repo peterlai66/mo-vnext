@@ -388,6 +388,18 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 		}
 		const hasUserId = userId.trim() !== "";
 		const userLabel = hasUserId ? "ok" : "none";
+		let noteCountDisplay: number | "error" = 0;
+		if (hasUserId) {
+			try {
+				const list = await env.MO_NOTES.list({
+					prefix: `note:${userId}:`,
+					limit: 20,
+				});
+				noteCountDisplay = list.keys.length;
+			} catch {
+				noteCountDisplay = "error";
+			}
+		}
 		return `MO Status
 app: mo-vnext
 version: dev
@@ -395,7 +407,7 @@ command: ok
 kv: ok
 d1: ${d1Label}
 user: ${userLabel}
-noteCount: unknown`;
+noteCount: ${noteCountDisplay}`;
 	  }
 	  // TODO: later commands
 	  // case "/help":
