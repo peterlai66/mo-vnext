@@ -396,7 +396,7 @@ async function getReplyText(
 			console.log("[line webhook] text message:", event.message.text ?? "");
 			const userId = event.source?.userId ?? "unknown-user";
 			const replyText = await getReplyText(event.message.text, env, userId);
-			await fetch("https://api.line.me/v2/bot/message/reply", {
+			const response = await fetch("https://api.line.me/v2/bot/message/reply", {
 			  method: "POST",
 			  headers: {
 				"Content-Type": "application/json",
@@ -412,6 +412,9 @@ async function getReplyText(
 				],
 			  }),
 			});
+			console.log("[line reply] status", response.status);
+			console.log("[line reply] ok", response.ok);
+			console.log("[line reply] body", await response.text());
 		  }
 		}
   
