@@ -373,6 +373,7 @@ async function getReplyText(
   
 	  if (url.pathname === "/api/line/webhook" && request.method === "POST") {
 		const body = (await request.json()) as LineWebhookBody;
+		console.log("[line] body", JSON.stringify(body));
 		const events = body.events ?? [];
 		console.log("[line webhook] eventCount:", events.length);
 
