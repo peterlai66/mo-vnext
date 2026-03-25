@@ -618,6 +618,10 @@ ${notifyMessageLine}`;
 			strategyNotifyPushBody !== null
 		) {
 			try {
+				console.log("[push] start", {
+					userId,
+					message: strategyNotifyPushBody,
+				});
 				await fetch("https://api.line.me/v2/bot/message/push", {
 					method: "POST",
 					headers: {
@@ -629,8 +633,9 @@ ${notifyMessageLine}`;
 						messages: [{ type: "text", text: strategyNotifyPushBody }],
 					}),
 				});
-			} catch {
-				// 推播失敗不影響 /report 文字回覆
+				console.log("[push] done");
+			} catch (error: unknown) {
+				console.log("[push] error", error);
 			}
 		}
 
