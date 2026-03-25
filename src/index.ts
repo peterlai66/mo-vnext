@@ -435,11 +435,28 @@ noteCount: ${s.noteCount}`;
 		const s = await getSystemStatus(env, userId);
 		const notesValue = s.noteCount === "error" ? 0 : s.noteCount;
 		return `MO Report
-system: online
-command: ready
-storage: kv+d1
-user: ${s.user}
-notes: ${notesValue}`;
+
+[System]
+
+* app: ${s.app}
+* command: ${s.command}
+* storage: kv+d1
+* kv: ${s.kv}
+* d1: ${s.d1}
+* user: ${s.user}
+* notes: ${notesValue}
+
+[Summary]
+
+（預留）
+
+[Recommendation]
+
+（預留）
+
+[Simulation]
+
+（預留）`;
 	  }
 	  // TODO: later commands
 	  // case "/help":
