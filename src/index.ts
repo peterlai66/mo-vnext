@@ -281,14 +281,6 @@ function parseStrategyNotifyGateRecord(raw: string): StrategyNotifyGateRecord | 
 	}
 }
 
-/** 與 Workers KV 執行期一致；部分 Env 型別僅含 get(key, "text") overload。 */
-type MoNotesGetTextWithCacheTtl = {
-	get(
-		key: string,
-		options: { type: "text"; cacheTtl: number }
-	): Promise<string | null>;
-};
-
 type MoNotesKvPutExpiry = {
 	put(
 		key: string,
@@ -298,20 +290,19 @@ type MoNotesKvPutExpiry = {
 	delete(key: string): Promise<void>;
 };
 
-/**
- * 讀取 strategy notify gate；cacheTtl: 0 略過 KV edge 快取，避免連續請求讀到過期快照而略過冷卻／去重。
- */
+/** 讀取 strategy notify gate（duplicate / cooldown）；使用預設 KV get，避免非法 cacheTtl。 */
 async function readStrategyNotifyGateFromKv(
 	env: Env,
 	userId: string
 ): Promise<StrategyNotifyGateRecord | null> {
 	try {
 		const gateKey = getStrategyNotifyGateKey(userId);
-		const kv = env.MO_NOTES as unknown as MoNotesGetTextWithCacheTtl;
-		const raw = await kv.get(gateKey, { type: "text", cacheTtl: 0 });
+		const raw = await env.MO_NOTES.get(gateKey, "text");
 		if (raw === null || raw.trim() === "") return null;
 		return parseStrategyNotifyGateRecord(raw);
-	} catch {
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		console.log("[notify] kv get failed: notify_gate", { userId, message });
 		return null;
 	}
 }
@@ -324,10 +315,16 @@ async function acquireStrategyNotifyLock(
 	userId: string
 ): Promise<{ release: () => Promise<void> } | null> {
 	const lockKey = getStrategyNotifyLockKey(userId);
-	const kv = env.MO_NOTES as unknown as MoNotesGetTextWithCacheTtl;
 	const kvRw = env.MO_NOTES as unknown as MoNotesKvPutExpiry;
 	const now = Date.now();
-	const existingRaw = await kv.get(lockKey, { type: "text", cacheTtl: 0 });
+	let existingRaw: string | null;
+	try {
+		existingRaw = await env.MO_NOTES.get(lockKey, "text");
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		console.log("[notify] kv get failed: notify_lock_check", { userId, message });
+		return null;
+	}
 	if (existingRaw !== null && existingRaw.trim() !== "") {
 		const existing = parseStrategyNotifyLockRecord(existingRaw);
 		if (existing !== null && existing.until > now) {
@@ -343,7 +340,14 @@ async function acquireStrategyNotifyLock(
 	} catch {
 		return null;
 	}
-	const verifyRaw = await kv.get(lockKey, { type: "text", cacheTtl: 0 });
+	let verifyRaw: string | null;
+	try {
+		verifyRaw = await env.MO_NOTES.get(lockKey, "text");
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		console.log("[notify] kv get failed: notify_lock_verify", { userId, message });
+		return null;
+	}
 	const verified =
 		verifyRaw !== null && verifyRaw.trim() !== "" ?
 			parseStrategyNotifyLockRecord(verifyRaw)
@@ -353,7 +357,17 @@ async function acquireStrategyNotifyLock(
 	}
 	const release = async (): Promise<void> => {
 		try {
-			const curRaw = await kv.get(lockKey, { type: "text", cacheTtl: 0 });
+			let curRaw: string | null;
+			try {
+				curRaw = await env.MO_NOTES.get(lockKey, "text");
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				console.log("[notify] kv get failed: notify_lock_release", {
+					userId,
+					message,
+				});
+				curRaw = null;
+			}
 			const cur =
 				curRaw !== null && curRaw.trim() !== "" ?
 					parseStrategyNotifyLockRecord(curRaw)
