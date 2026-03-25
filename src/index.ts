@@ -864,9 +864,23 @@ function extractCommand(messageText: string): string | null {
 	// 後續若要支援 `/command arg`，可在這裡擴充解析。
 	if (messageText === "/notes") return "/notes";
 	if (messageText === "/push-test") return "/push-test";
+	if (messageText === "/report-test-change") return "/report-test-change";
 	if (messageText === "/debug-strategy-change") return "/debug-strategy-change";
 	if (/^\/note(?:\s+|$)/.test(messageText)) return "/note";
 	return /^\/[A-Za-z0-9_]+$/.test(messageText) ? messageText : null;
+}
+
+/** 暫時測試：/report-test-change 用，使 current 與 KV previous 不同以驗證 notify */
+function pickForcedStrategyForReportTest(
+	prevTrim: string,
+	computed: "aggressive" | "balanced" | "conservative"
+): "aggressive" | "balanced" | "conservative" {
+	if (prevTrim === "aggressive") return "conservative";
+	if (prevTrim === "balanced") return "conservative";
+	if (prevTrim === "conservative") return "aggressive";
+	if (computed === "aggressive") return "conservative";
+	if (computed === "balanced") return "aggressive";
+	return "balanced";
 }
 
 async function getSystemStatus(env: Env, userId: string): Promise<SystemStatus> {
@@ -1065,7 +1079,9 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 			state,
 		});
 	  }
+	  case "/report-test-change":
 	  case "/report": {
+		const isReportTestChange = command === "/report-test-change";
 		const s = await getSystemStatus(env, userId);
 		const notesValue = s.noteCount === "error" ? 0 : s.noteCount;
 
@@ -1151,8 +1167,9 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 		} else {
 			strategy = "conservative";
 		}
+		const strategyFromScore = strategy;
 		const recommendationBlock = `* score: ${score}
-* strategy: ${strategy}
+* strategy: ${strategyFromScore}
 * status: ${recStatus}
 * reason: ${recReason}
 * action: ${recAction}`;
@@ -1163,9 +1180,9 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 		let simResult: string;
 		if (noteCountForRec === 0) {
 			simResult = "無法模擬";
-		} else if (strategy === "aggressive") {
+		} else if (strategyFromScore === "aggressive") {
 			simResult = "模擬偏積極策略，可提高部位配置";
-		} else if (strategy === "balanced") {
+		} else if (strategyFromScore === "balanced") {
 			simResult = "模擬偏平衡策略，建議分批配置";
 		} else {
 			simResult = "模擬偏保守策略，建議先觀察";
@@ -1190,8 +1207,21 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 			const prevRaw = await env.MO_NOTES.get(strategyKey, "text");
 			const prevTrim = prevRaw !== null ? prevRaw.trim() : "";
 			const previousDisplay = prevTrim === "" ? "none" : prevTrim;
+			if (isReportTestChange && userId !== "unknown-user") {
+				strategy = pickForcedStrategyForReportTest(prevTrim, strategyFromScore);
+				console.log("[test] force strategy change", {
+					userId,
+					previous: prevTrim === "" ? "(empty)" : prevTrim,
+					fromScore: strategyFromScore,
+					forced: strategy,
+				});
+			}
 			const changed: "yes" | "no" =
-				prevTrim !== "" && prevTrim !== strategy ? "yes" : "no";
+				isReportTestChange && userId !== "unknown-user" && prevTrim === "" ?
+					"yes"
+				:	prevTrim !== "" && prevTrim !== strategy ?
+					"yes"
+				:	"no";
 			const shouldNotify: "yes" | "no" = changed === "yes" ? "yes" : "no";
 			reportPreviousStrategy = previousDisplay;
 			reportChanged = changed === "yes";
