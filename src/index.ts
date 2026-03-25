@@ -209,7 +209,66 @@ const MO_USER_KV_PREFIX = {
 	lastPushNotify: "last_push_notify",
 	lastStrategyDecision: "last_strategy_decision",
 	lastReportSummary: "last_report_summary",
+	lastStrategyNotifyGate: "last_strategy_notify_gate",
 } as const;
+
+/** 正式 strategy notify：兩次推播嘗試最短間隔（毫秒） */
+const STRATEGY_NOTIFY_COOLDOWN_MS = 10 * 60 * 1000;
+
+type StrategyNotifyGateRecord = {
+	lastNotifyMessage: string;
+	lastNotifyAt: number;
+};
+
+function getStrategyNotifyGateKey(userId: string): string {
+	return buildMoUserKvKey(MO_USER_KV_PREFIX.lastStrategyNotifyGate, userId);
+}
+
+function parseStrategyNotifyGateRecord(raw: string): StrategyNotifyGateRecord | null {
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (typeof parsed !== "object" || parsed === null) return null;
+		if (
+			!("lastNotifyMessage" in parsed) ||
+			typeof parsed.lastNotifyMessage !== "string"
+		) {
+			return null;
+		}
+		if (
+			!("lastNotifyAt" in parsed) ||
+			typeof parsed.lastNotifyAt !== "number" ||
+			!Number.isFinite(parsed.lastNotifyAt)
+		) {
+			return null;
+		}
+		return {
+			lastNotifyMessage: parsed.lastNotifyMessage,
+			lastNotifyAt: parsed.lastNotifyAt,
+		};
+	} catch {
+		return null;
+	}
+}
+
+async function recordStrategyNotifyGateAttempt(
+	env: Env,
+	userId: string,
+	message: string,
+	atMs: number
+): Promise<void> {
+	try {
+		const rec: StrategyNotifyGateRecord = {
+			lastNotifyMessage: message,
+			lastNotifyAt: atMs,
+		};
+		await env.MO_NOTES.put(
+			getStrategyNotifyGateKey(userId),
+			JSON.stringify(rec)
+		);
+	} catch {
+		// gate 寫入失敗不阻擋 notify 主流程
+	}
+}
 
 const MO_STATUS_DEFAULT_BLOCK = {
 	lastPush: "lastPush: none",
@@ -1285,37 +1344,65 @@ ${notifyMessageLine}`;
 			} else if (strategyNotifyPushBody === null) {
 				console.log("[notify] skipped: hasMessage=false", { userId });
 			} else {
-				console.log("[notify] start", { userId });
-				const notifyPush = await lineBotPushTextMessage(
+				const notifyBody = strategyNotifyPushBody;
+				const gateKey = getStrategyNotifyGateKey(userId);
+				const gate = await readMoUserKvJson(
 					env,
 					userId,
-					strategyNotifyPushBody
+					gateKey,
+					parseStrategyNotifyGateRecord
 				);
-				await recordLinePushOutcomeForStatus(env, userId, notifyPush);
-				switch (notifyPush.result) {
-					case "success":
-						console.log("[notify] done", { userId });
-						break;
-					case "blocked_by_monthly_limit":
-						console.log("[notify] blocked_monthly_limit", {
-							userId,
-							status: notifyPush.httpStatus,
-							body: notifyPush.httpBody,
-						});
-						break;
-					case "failed":
-						console.log("[notify] failed", {
-							userId,
-							status: notifyPush.httpStatus,
-							body: notifyPush.httpBody,
-						});
-						break;
-					case "network_error":
-						console.log("[notify] failed", {
-							userId,
-							reason: "network_error",
-						});
-						break;
+				const nowMs = Date.now();
+				if (gate !== null && gate.lastNotifyMessage === notifyBody) {
+					console.log("[notify] skipped: duplicate_message", { userId });
+				} else if (
+					gate !== null &&
+					nowMs - gate.lastNotifyAt < STRATEGY_NOTIFY_COOLDOWN_MS
+				) {
+					console.log("[notify] skipped: cooldown", {
+						userId,
+						elapsedMs: nowMs - gate.lastNotifyAt,
+						cooldownMs: STRATEGY_NOTIFY_COOLDOWN_MS,
+					});
+				} else {
+					console.log("[notify] start", { userId });
+					const notifyPush = await lineBotPushTextMessage(
+						env,
+						userId,
+						notifyBody
+					);
+					await recordStrategyNotifyGateAttempt(
+						env,
+						userId,
+						notifyBody,
+						Date.now()
+					);
+					await recordLinePushOutcomeForStatus(env, userId, notifyPush);
+					switch (notifyPush.result) {
+						case "success":
+							console.log("[notify] done", { userId });
+							break;
+						case "blocked_by_monthly_limit":
+							console.log("[notify] blocked_monthly_limit", {
+								userId,
+								status: notifyPush.httpStatus,
+								body: notifyPush.httpBody,
+							});
+							break;
+						case "failed":
+							console.log("[notify] failed", {
+								userId,
+								status: notifyPush.httpStatus,
+								body: notifyPush.httpBody,
+							});
+							break;
+						case "network_error":
+							console.log("[notify] failed", {
+								userId,
+								reason: "network_error",
+							});
+							break;
+					}
 				}
 			}
 		}
