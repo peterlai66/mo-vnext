@@ -72,12 +72,24 @@ function debugLog(env: Env, ...args: unknown[]): void {
 
 const LINE_MESSAGE_PUSH_URL = "https://api.line.me/v2/bot/message/push";
 
-/** LINE push；失敗不 throw，僅 log（不影響 caller） */
+type LinePushResult =
+	| "success"
+	| "failed"
+	| "blocked_by_monthly_limit"
+	| "network_error";
+
+function isLinePushMonthlyLimitDenied(status: number, body: string): boolean {
+	if (status !== 429) return false;
+	if (body.includes("You have reached your monthly limit")) return true;
+	return body.toLowerCase().includes("monthly limit");
+}
+
+/** LINE push；失敗不 throw，僅 log（不影響 caller）；回傳值供呼叫端判讀是否送達 */
 async function lineBotPushTextMessage(
 	env: Env,
 	userId: string,
 	text: string
-): Promise<void> {
+): Promise<LinePushResult> {
 	try {
 		console.log("[push] start", { userId, message: text });
 		const response = await fetch(LINE_MESSAGE_PUSH_URL, {
@@ -92,22 +104,35 @@ async function lineBotPushTextMessage(
 			}),
 		});
 		const body = await response.text();
+		const status = response.status;
+		const statusText = response.statusText;
 		console.log("[push] response", {
-			status: response.status,
-			statusText: response.statusText,
+			status,
+			statusText,
 			body,
 		});
 		if (response.ok) {
 			console.log("[push] success");
-		} else {
-			console.log("[push] failed", {
-				status: response.status,
-				statusText: response.statusText,
+			return "success";
+		}
+		if (isLinePushMonthlyLimitDenied(status, body)) {
+			console.log("[push] blocked by monthly limit", {
+				userId,
+				status,
+				statusText,
 				body,
 			});
+			return "blocked_by_monthly_limit";
 		}
+		console.log("[push] failed", {
+			status,
+			statusText,
+			body,
+		});
+		return "failed";
 	} catch (error: unknown) {
 		console.log("[push] error", error);
+		return "network_error";
 	}
 }
 
