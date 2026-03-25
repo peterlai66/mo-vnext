@@ -94,6 +94,33 @@ function parseTimestampFromKey(keyName: string): number {
 	return Number.isFinite(timestamp) ? timestamp : 0;
 }
 
+/** 將 key 尾段 timestamp（毫秒）轉為台北本地時間 YYYY-MM-DD HH:mm；失敗則回傳原字串 */
+function formatNoteKeyTimestampForReport(tail: string): string {
+	const n = Number(tail);
+	if (!Number.isFinite(n)) return tail;
+	const d = new Date(n);
+	const ms = d.getTime();
+	if (!Number.isFinite(ms)) return tail;
+	const parts = new Intl.DateTimeFormat("en-CA", {
+		timeZone: "Asia/Taipei",
+		year: "numeric",
+		month: "2-digit",
+		day: "2-digit",
+		hour: "2-digit",
+		minute: "2-digit",
+		hour12: false,
+	}).formatToParts(d);
+	const pick = (type: Intl.DateTimeFormatPart["type"]) =>
+		parts.find((p) => p.type === type)?.value ?? "";
+	const y = pick("year");
+	const mo = pick("month");
+	const day = pick("day");
+	const h = pick("hour");
+	const min = pick("minute");
+	if (y === "" || mo === "" || day === "" || h === "" || min === "") return tail;
+	return `${y}-${mo}-${day} ${h}:${min}`;
+}
+
 function parseUserNote(keyName: string, storedValue: string): UserNote {
 	const fallbackTimestamp = parseTimestampFromKey(keyName);
 
@@ -454,11 +481,12 @@ noteCount: ${s.noteCount}`;
   no notes`;
 				} else {
 					const lines = keyNames.map((name, i) => {
-						const simplified =
+						const tail =
 							name.startsWith(`note:${userId}:`) ?
 								name.slice(`note:${userId}:`.length)
-							:	name;
-						return `  ${i + 1}. ${simplified}`;
+							:	name.split(":").pop() ?? name;
+						const readable = formatNoteKeyTimestampForReport(tail);
+						return `  ${i + 1}. ${readable}`;
 					});
 					summaryRecentNotes = `* recentNotes:
 
