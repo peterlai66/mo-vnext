@@ -497,6 +497,13 @@ noteCount: ${s.noteCount}`;
 			}
 		}
 
+		const noteCountForRec = s.noteCount === "error" ? 0 : s.noteCount;
+		const recStatus = noteCountForRec > 0 ? "active" : "idle";
+		const recReason =
+			noteCountForRec > 0 ? "有筆記資料，可進行分析" : "尚無資料";
+		const recommendationBlock = `* status: ${recStatus}
+* reason: ${recReason}`;
+
 		return `MO Report
 
 [System]
@@ -515,7 +522,7 @@ ${summaryBlock}
 
 [Recommendation]
 
-（預留）
+${recommendationBlock}
 
 [Simulation]
 
