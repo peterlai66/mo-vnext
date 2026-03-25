@@ -554,12 +554,14 @@ noteCount: ${s.noteCount}`;
 		const simReason =
 			noteCountForRec > 0 ? "可進行模擬" : "無資料可模擬";
 		let simResult: string;
-		if (noteCountForRec >= 10) {
-			simResult = "模擬策略可執行，預期穩定";
-		} else if (noteCountForRec >= 1) {
-			simResult = "模擬資料不足，結果不穩定";
-		} else {
+		if (noteCountForRec === 0) {
 			simResult = "無法模擬";
+		} else if (strategy === "aggressive") {
+			simResult = "模擬偏積極策略，可提高部位配置";
+		} else if (strategy === "balanced") {
+			simResult = "模擬偏平衡策略，建議分批配置";
+		} else {
+			simResult = "模擬偏保守策略，建議先觀察";
 		}
 		const simulationBlock = `* ready: ${simReady}
 * reason: ${simReason}
