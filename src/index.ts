@@ -464,6 +464,7 @@ noteCount: ${s.noteCount}`;
 
 		const hasUserId = userId.trim() !== "";
 		const totalNotesNum = s.noteCount === "error" ? 0 : s.noteCount;
+		let latestNoteMs: number | null = null;
 		let summaryBlock: string;
 		if (!hasUserId) {
 			summaryBlock = `* latestNote: none
@@ -487,6 +488,13 @@ noteCount: ${s.noteCount}`;
 						latestName.startsWith(`note:${userId}:`) ?
 							latestName.slice(`note:${userId}:`.length)
 						:	latestName.split(":").pop() ?? latestName;
+					const ts = Number(tail);
+					if (Number.isFinite(ts)) {
+						const t = new Date(ts).getTime();
+						if (Number.isFinite(t)) {
+							latestNoteMs = ts;
+						}
+					}
 					const latestReadable = formatNoteKeyTimestampForReport(tail);
 					summaryBlock = `* latestNote: ${latestReadable}
 * totalNotes: ${totalNotesNum}`;
@@ -497,12 +505,25 @@ noteCount: ${s.noteCount}`;
 			}
 		}
 
-		const noteCountForRec = s.noteCount === "error" ? 0 : s.noteCount;
-		const recStatus = noteCountForRec > 0 ? "active" : "idle";
-		const recReason =
-			noteCountForRec > 0 ? "有筆記資料，可進行分析" : "尚無資料";
+		const twentyFourHoursMs = 24 * 60 * 60 * 1000;
+		let recStatus: "active" | "idle";
+		let recReason: string;
+		if (latestNoteMs === null) {
+			recStatus = "idle";
+			recReason = "尚無資料";
+		} else {
+			const deltaMs = Date.now() - latestNoteMs;
+			if (deltaMs <= twentyFourHoursMs) {
+				recStatus = "active";
+				recReason = "近期有活動";
+			} else {
+				recStatus = "idle";
+				recReason = "長時間未更新";
+			}
+		}
 		const recommendationBlock = `* status: ${recStatus}
 * reason: ${recReason}`;
+		const noteCountForRec = s.noteCount === "error" ? 0 : s.noteCount;
 		const simReady = noteCountForRec > 0 ? "yes" : "no";
 		const simReason =
 			noteCountForRec > 0 ? "可進行模擬" : "無資料可模擬";
