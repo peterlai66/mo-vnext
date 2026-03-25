@@ -207,6 +207,7 @@ function summarizePushBodyForStatus(body: string | undefined, maxLen: number): s
 
 const MO_USER_KV_PREFIX = {
 	lastPushNotify: "last_push_notify",
+	lastStrategyNotifyStatus: "last_strategy_notify_status",
 	lastStrategyDecision: "last_strategy_decision",
 	lastReportSummary: "last_report_summary",
 	lastStrategyNotifyGate: "last_strategy_notify_gate",
@@ -405,7 +406,10 @@ async function recordStrategyNotifyGateAttempt(
 }
 
 const MO_STATUS_DEFAULT_BLOCK = {
-	lastPush: "lastPush: none",
+	lastPush: `lastNotifyResult: none
+lastNotifyReason: none
+lastNotifyAt: none
+lastPush: none`,
 	decision: "decision: none",
 	report: "report: none",
 } as const;
@@ -435,6 +439,121 @@ async function readMoUserKvJson<T>(
 
 function getLastPushNotifyKey(userId: string): string {
 	return buildMoUserKvKey(MO_USER_KV_PREFIX.lastPushNotify, userId);
+}
+
+function getLastStrategyNotifyStatusKey(userId: string): string {
+	return buildMoUserKvKey(MO_USER_KV_PREFIX.lastStrategyNotifyStatus, userId);
+}
+
+/** /status：最近一次 strategy notify 決策（含略過與 LINE 結果） */
+type StrategyNotifyResultLabel =
+	| "duplicate_message"
+	| "cooldown"
+	| "in_progress"
+	| "blocked_monthly_limit"
+	| "success"
+	| "failed";
+
+type StrategyNotifyStatusRecord = {
+	lastNotifyResult: StrategyNotifyResultLabel;
+	lastNotifyReason: string;
+	lastNotifyAt: string;
+};
+
+function isStrategyNotifyResultLabel(value: string): value is StrategyNotifyResultLabel {
+	return (
+		value === "duplicate_message" ||
+		value === "cooldown" ||
+		value === "in_progress" ||
+		value === "blocked_monthly_limit" ||
+		value === "success" ||
+		value === "failed"
+	);
+}
+
+function parseStrategyNotifyStatusRecord(raw: string): StrategyNotifyStatusRecord | null {
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (typeof parsed !== "object" || parsed === null) return null;
+		if (
+			!("lastNotifyResult" in parsed) ||
+			typeof parsed.lastNotifyResult !== "string" ||
+			!isStrategyNotifyResultLabel(parsed.lastNotifyResult)
+		) {
+			return null;
+		}
+		if (!("lastNotifyAt" in parsed) || typeof parsed.lastNotifyAt !== "string") {
+			return null;
+		}
+		let lastNotifyReason = "";
+		if (
+			"lastNotifyReason" in parsed &&
+			typeof parsed.lastNotifyReason === "string"
+		) {
+			lastNotifyReason = parsed.lastNotifyReason;
+		}
+		return {
+			lastNotifyResult: parsed.lastNotifyResult,
+			lastNotifyReason,
+			lastNotifyAt: parsed.lastNotifyAt,
+		};
+	} catch {
+		return null;
+	}
+}
+
+function linePushOutcomeToStrategyNotifyStatus(
+	outcome: LinePushOutcome
+): Pick<StrategyNotifyStatusRecord, "lastNotifyResult" | "lastNotifyReason"> {
+	switch (outcome.result) {
+		case "success":
+			return { lastNotifyResult: "success", lastNotifyReason: "" };
+		case "blocked_by_monthly_limit": {
+			const st =
+				outcome.httpStatus !== undefined ?
+					`status=${String(outcome.httpStatus)}`
+				:	"";
+			return { lastNotifyResult: "blocked_monthly_limit", lastNotifyReason: st };
+		}
+		case "failed": {
+			const st =
+				outcome.httpStatus !== undefined ?
+					`status=${String(outcome.httpStatus)}`
+				:	"";
+			const body = summarizePushBodyForStatus(outcome.httpBody, 80);
+			const parts = [st, body !== undefined ? `body=${body}` : ""].filter(
+				(s) => s !== ""
+			);
+			return {
+				lastNotifyResult: "failed",
+				lastNotifyReason: parts.join(" "),
+			};
+		}
+		case "network_error":
+			return { lastNotifyResult: "failed", lastNotifyReason: "network_error" };
+	}
+}
+
+async function recordStrategyNotifyOutcomeForStatus(
+	env: Env,
+	userId: string,
+	result: StrategyNotifyResultLabel,
+	reason: string
+): Promise<void> {
+	const rec: StrategyNotifyStatusRecord = {
+		lastNotifyResult: result,
+		lastNotifyReason: reason,
+		lastNotifyAt: formatStatusPushAtTaipei(new Date()),
+	};
+	try {
+		await env.MO_NOTES.put(
+			getLastStrategyNotifyStatusKey(userId),
+			JSON.stringify(rec)
+		);
+	} catch (err: unknown) {
+		const message = err instanceof Error ? err.message : String(err);
+		console.log("[notify] status kv write failed", { userId, message });
+	}
 }
 
 function isLastPushDisplayKind(value: string): value is LastPushDisplayKind {
@@ -508,14 +627,39 @@ async function formatLastPushStatusBlock(
 	userId: string
 ): Promise<string> {
 	if (!hasMoStatusUserId(userId)) return MO_STATUS_DEFAULT_BLOCK.lastPush;
-	const r = await readMoUserKvJson(
-		env,
-		userId,
-		getLastPushNotifyKey(userId),
-		parseLastPushNotifyRecord
-	);
-	if (r === null) return MO_STATUS_DEFAULT_BLOCK.lastPush;
-	const lines: string[] = [`lastPush: ${r.kind}`];
+	const [n, r] = await Promise.all([
+		readMoUserKvJson(
+			env,
+			userId,
+			getLastStrategyNotifyStatusKey(userId),
+			parseStrategyNotifyStatusRecord
+		),
+		readMoUserKvJson(
+			env,
+			userId,
+			getLastPushNotifyKey(userId),
+			parseLastPushNotifyRecord
+		),
+	]);
+	const lines: string[] = [];
+	if (n === null) {
+		lines.push(
+			"lastNotifyResult: none",
+			"lastNotifyReason: none",
+			"lastNotifyAt: none"
+		);
+	} else {
+		lines.push(`lastNotifyResult: ${n.lastNotifyResult}`);
+		lines.push(
+			`lastNotifyReason: ${n.lastNotifyReason === "" ? "none" : n.lastNotifyReason}`
+		);
+		lines.push(`lastNotifyAt: ${n.lastNotifyAt}`);
+	}
+	if (r === null) {
+		lines.push("lastPush: none");
+		return lines.join("\n");
+	}
+	lines.push(`lastPush: ${r.kind}`);
 	if (r.pushStatus !== undefined) {
 		lines.push(`pushStatus: ${r.pushStatus}`);
 	}
@@ -1145,6 +1289,13 @@ reason: forced debug strategy change`;
 
 		const pushOutcome = await lineBotPushTextMessage(env, userId, notifyMessage);
 		await recordLinePushOutcomeForStatus(env, userId, pushOutcome);
+		const dbgNs = linePushOutcomeToStrategyNotifyStatus(pushOutcome);
+		await recordStrategyNotifyOutcomeForStatus(
+			env,
+			userId,
+			dbgNs.lastNotifyResult,
+			dbgNs.lastNotifyReason
+		);
 
 		switch (pushOutcome.result) {
 			case "success":
@@ -1482,6 +1633,12 @@ ${notifyMessageLine}`;
 				const lockSlot = await acquireStrategyNotifyLock(env, userId);
 				if (lockSlot === null) {
 					console.log("[notify] skipped: in_progress", { userId });
+					await recordStrategyNotifyOutcomeForStatus(
+						env,
+						userId,
+						"in_progress",
+						""
+					);
 				} else {
 					console.log("[notify] lock acquired", { userId });
 					try {
@@ -1489,15 +1646,28 @@ ${notifyMessageLine}`;
 						const nowMs = Date.now();
 						if (gate !== null && gate.lastNotifyMessage === notifyBody) {
 							console.log("[notify] skipped: duplicate_message", { userId });
+							await recordStrategyNotifyOutcomeForStatus(
+								env,
+								userId,
+								"duplicate_message",
+								""
+							);
 						} else if (
 							gate !== null &&
 							nowMs - gate.lastNotifyAt < STRATEGY_NOTIFY_COOLDOWN_MS
 						) {
+							const elapsedMs = nowMs - gate.lastNotifyAt;
 							console.log("[notify] skipped: cooldown", {
 								userId,
-								elapsedMs: nowMs - gate.lastNotifyAt,
+								elapsedMs,
 								cooldownMs: STRATEGY_NOTIFY_COOLDOWN_MS,
 							});
+							await recordStrategyNotifyOutcomeForStatus(
+								env,
+								userId,
+								"cooldown",
+								`elapsedMs=${String(elapsedMs)}`
+							);
 						} else {
 							console.log("[notify] start", { userId });
 							await recordStrategyNotifyGateAttempt(
@@ -1512,6 +1682,13 @@ ${notifyMessageLine}`;
 								notifyBody
 							);
 							await recordLinePushOutcomeForStatus(env, userId, notifyPush);
+							const ns = linePushOutcomeToStrategyNotifyStatus(notifyPush);
+							await recordStrategyNotifyOutcomeForStatus(
+								env,
+								userId,
+								ns.lastNotifyResult,
+								ns.lastNotifyReason
+							);
 							switch (notifyPush.result) {
 								case "success":
 									console.log("[notify] done", { userId });
