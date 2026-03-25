@@ -558,6 +558,7 @@ function extractCommand(messageText: string): string | null {
 	// 後續若要支援 `/command arg`，可在這裡擴充解析。
 	if (messageText === "/notes") return "/notes";
 	if (messageText === "/push-test") return "/push-test";
+	if (messageText === "/debug-strategy-change") return "/debug-strategy-change";
 	if (/^\/note(?:\s+|$)/.test(messageText)) return "/note";
 	return /^\/[A-Za-z0-9_]+$/.test(messageText) ? messageText : null;
 }
@@ -604,6 +605,62 @@ async function handleCommand(
 	  case "/ping":
 		debugLog(env, "/ping hit");
 		return "pong";
+	  case "/debug-strategy-change": {
+		const hasLineUser =
+			userId.trim() !== "" && userId !== "unknown-user";
+		if (!hasLineUser) {
+			return "debug strategy change failed: no user";
+		}
+
+		const strategyKey = `strategy:${userId}`;
+		const prevRaw = await env.MO_NOTES.get(strategyKey, "text");
+		const previous =
+			prevRaw !== null && prevRaw.trim() !== "" ? prevRaw.trim() : "balanced";
+		const current = previous === "aggressive" ? "balanced" : "aggressive";
+		const notifyMessage = `MO Strategy Update (DEBUG)
+previous: ${previous}
+current: ${current}
+reason: forced debug strategy change`;
+
+		const strategyDecision: StrategyDecisionRecord = {
+			changed: true,
+			shouldNotify: true,
+			hasMessage: true,
+			timestamp: formatStatusPushAtTaipei(new Date()),
+		};
+		await recordStrategyDecision(env, userId, strategyDecision);
+
+		const pushOutcome = await lineBotPushTextMessage(env, userId, notifyMessage);
+		recordLinePushOutcomeForStatus(pushOutcome);
+
+		switch (pushOutcome.result) {
+			case "success":
+				console.log("[debug-strategy-change] success", { userId });
+				break;
+			case "blocked_by_monthly_limit":
+				console.log("[debug-strategy-change] blocked by monthly limit", {
+					userId,
+					status: pushOutcome.httpStatus,
+					body: pushOutcome.httpBody,
+				});
+				break;
+			case "failed":
+				console.log("[debug-strategy-change] failed", {
+					userId,
+					status: pushOutcome.httpStatus,
+					body: pushOutcome.httpBody,
+				});
+				break;
+			case "network_error":
+				console.log("[debug-strategy-change] failed", {
+					userId,
+					reason: "network_error",
+				});
+				break;
+		}
+
+		return "DEBUG STRATEGY CHANGE EXECUTED";
+	  }
 	  case "/push-test": {
 		const hasLineUser =
 			userId.trim() !== "" && userId !== "unknown-user";
