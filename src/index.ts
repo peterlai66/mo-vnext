@@ -463,39 +463,37 @@ noteCount: ${s.noteCount}`;
 		const notesValue = s.noteCount === "error" ? 0 : s.noteCount;
 
 		const hasUserId = userId.trim() !== "";
-		let summaryRecentNotes: string;
+		const totalNotesNum = s.noteCount === "error" ? 0 : s.noteCount;
+		let summaryBlock: string;
 		if (!hasUserId) {
-			summaryRecentNotes = `* recentNotes:
-
-  no user`;
+			summaryBlock = `* latestNote: none
+* totalNotes: 0`;
 		} else {
 			try {
 				const list = await env.MO_NOTES.list({
 					prefix: `note:${userId}:`,
-					limit: 3,
+					limit: 20,
 				});
 				const keyNames = list.keys.map((k) => k.name);
 				if (keyNames.length === 0) {
-					summaryRecentNotes = `* recentNotes:
-
-  no notes`;
+					summaryBlock = `* latestNote: none
+* totalNotes: 0`;
 				} else {
-					const lines = keyNames.map((name, i) => {
-						const tail =
-							name.startsWith(`note:${userId}:`) ?
-								name.slice(`note:${userId}:`.length)
-							:	name.split(":").pop() ?? name;
-						const readable = formatNoteKeyTimestampForReport(tail);
-						return `  ${i + 1}. ${readable}`;
-					});
-					summaryRecentNotes = `* recentNotes:
-
-${lines.join("\n")}`;
+					const sorted = [...keyNames].sort(
+						(a, b) => parseTimestampFromKey(b) - parseTimestampFromKey(a)
+					);
+					const latestName = sorted[0];
+					const tail =
+						latestName.startsWith(`note:${userId}:`) ?
+							latestName.slice(`note:${userId}:`.length)
+						:	latestName.split(":").pop() ?? latestName;
+					const latestReadable = formatNoteKeyTimestampForReport(tail);
+					summaryBlock = `* latestNote: ${latestReadable}
+* totalNotes: ${totalNotesNum}`;
 				}
 			} catch {
-				summaryRecentNotes = `* recentNotes:
-
-  no notes`;
+				summaryBlock = `* latestNote: none
+* totalNotes: 0`;
 			}
 		}
 
@@ -513,7 +511,7 @@ ${lines.join("\n")}`;
 
 [Summary]
 
-${summaryRecentNotes}
+${summaryBlock}
 
 [Recommendation]
 
