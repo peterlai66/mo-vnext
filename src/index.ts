@@ -70,6 +70,47 @@ function debugLog(env: Env, ...args: unknown[]): void {
 	Reflect.apply(console.log, console, args);
 }
 
+const LINE_MESSAGE_PUSH_URL = "https://api.line.me/v2/bot/message/push";
+
+/** LINE push；失敗不 throw，僅 log（不影響 caller） */
+async function lineBotPushTextMessage(
+	env: Env,
+	userId: string,
+	text: string
+): Promise<void> {
+	try {
+		console.log("[push] start", { userId, message: text });
+		const response = await fetch(LINE_MESSAGE_PUSH_URL, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN}`,
+			},
+			body: JSON.stringify({
+				to: userId,
+				messages: [{ type: "text", text }],
+			}),
+		});
+		const body = await response.text();
+		console.log("[push] response", {
+			status: response.status,
+			statusText: response.statusText,
+			body,
+		});
+		if (response.ok) {
+			console.log("[push] success");
+		} else {
+			console.log("[push] failed", {
+				status: response.status,
+				statusText: response.statusText,
+				body,
+			});
+		}
+	} catch (error: unknown) {
+		console.log("[push] error", error);
+	}
+}
+
 function extractNoteContent(storedValue: string): string {
 	try {
 		const parsed: unknown = JSON.parse(storedValue);
@@ -626,26 +667,7 @@ ${notifyMessageLine}`;
 			shouldNotifyOut === "yes" &&
 			strategyNotifyPushBody !== null
 		) {
-			try {
-				console.log("[push] start", {
-					userId,
-					message: strategyNotifyPushBody,
-				});
-				await fetch("https://api.line.me/v2/bot/message/push", {
-					method: "POST",
-					headers: {
-						"Content-Type": "application/json",
-						Authorization: `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN}`,
-					},
-					body: JSON.stringify({
-						to: userId,
-						messages: [{ type: "text", text: strategyNotifyPushBody }],
-					}),
-				});
-				console.log("[push] done");
-			} catch (error: unknown) {
-				console.log("[push] error", error);
-			}
+			await lineBotPushTextMessage(env, userId, strategyNotifyPushBody);
 		}
 
 		const reportUserLine = s.user === "ok" ? `ok (${userId})` : "none";
@@ -797,23 +819,7 @@ async function getReplyText(
 				userId.trim() !== "" &&
 				userId !== "unknown-user"
 			) {
-				try {
-					console.log("[push-test] start", { userId });
-					await fetch("https://api.line.me/v2/bot/message/push", {
-						method: "POST",
-						headers: {
-							"Content-Type": "application/json",
-							Authorization: `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN}`,
-						},
-						body: JSON.stringify({
-							to: userId,
-							messages: [{ type: "text", text: "PUSH TEST OK" }],
-						}),
-					});
-					console.log("[push-test] done");
-				} catch (error: unknown) {
-					console.log("[push-test] error", error);
-				}
+				await lineBotPushTextMessage(env, userId, "PUSH TEST OK");
 			}
 		  }
 		}
