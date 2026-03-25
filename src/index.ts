@@ -78,18 +78,26 @@ type LinePushResult =
 	| "blocked_by_monthly_limit"
 	| "network_error";
 
+/** push 結果 + 呼叫端判讀用 HTTP 資訊（network_error 時無 http*） */
+type LinePushOutcome = {
+	result: LinePushResult;
+	httpStatus?: number;
+	httpStatusText?: string;
+	httpBody?: string;
+};
+
 function isLinePushMonthlyLimitDenied(status: number, body: string): boolean {
 	if (status !== 429) return false;
 	if (body.includes("You have reached your monthly limit")) return true;
 	return body.toLowerCase().includes("monthly limit");
 }
 
-/** LINE push；失敗不 throw，僅 log（不影響 caller）；回傳值供呼叫端判讀是否送達 */
+/** LINE push；失敗不 throw，僅 log（不影響 caller） */
 async function lineBotPushTextMessage(
 	env: Env,
 	userId: string,
 	text: string
-): Promise<LinePushResult> {
+): Promise<LinePushOutcome> {
 	try {
 		console.log("[push] start", { userId, message: text });
 		const response = await fetch(LINE_MESSAGE_PUSH_URL, {
@@ -111,9 +119,10 @@ async function lineBotPushTextMessage(
 			statusText,
 			body,
 		});
+		const http = { httpStatus: status, httpStatusText: statusText, httpBody: body };
 		if (response.ok) {
 			console.log("[push] success");
-			return "success";
+			return { result: "success", ...http };
 		}
 		if (isLinePushMonthlyLimitDenied(status, body)) {
 			console.log("[push] blocked by monthly limit", {
@@ -122,17 +131,17 @@ async function lineBotPushTextMessage(
 				statusText,
 				body,
 			});
-			return "blocked_by_monthly_limit";
+			return { result: "blocked_by_monthly_limit", ...http };
 		}
 		console.log("[push] failed", {
 			status,
 			statusText,
 			body,
 		});
-		return "failed";
+		return { result: "failed", ...http };
 	} catch (error: unknown) {
 		console.log("[push] error", error);
-		return "network_error";
+		return { result: "network_error" };
 	}
 }
 
@@ -692,7 +701,33 @@ ${notifyMessageLine}`;
 			shouldNotifyOut === "yes" &&
 			strategyNotifyPushBody !== null
 		) {
-			await lineBotPushTextMessage(env, userId, strategyNotifyPushBody);
+			const notifyPush = await lineBotPushTextMessage(
+				env,
+				userId,
+				strategyNotifyPushBody
+			);
+			switch (notifyPush.result) {
+				case "success":
+					console.log("[notify] success", { userId });
+					break;
+				case "blocked_by_monthly_limit":
+					console.log("[notify] blocked by monthly limit", {
+						userId,
+						status: notifyPush.httpStatus,
+						body: notifyPush.httpBody,
+					});
+					break;
+				case "failed":
+					console.log("[notify] failed", {
+						userId,
+						status: notifyPush.httpStatus,
+						body: notifyPush.httpBody,
+					});
+					break;
+				case "network_error":
+					console.log("[notify] network_error", { userId });
+					break;
+			}
 		}
 
 		const reportUserLine = s.user === "ok" ? `ok (${userId})` : "none";
@@ -844,7 +879,33 @@ async function getReplyText(
 				userId.trim() !== "" &&
 				userId !== "unknown-user"
 			) {
-				await lineBotPushTextMessage(env, userId, "PUSH TEST OK");
+				const pushTestOutcome = await lineBotPushTextMessage(
+					env,
+					userId,
+					"PUSH TEST OK"
+				);
+				switch (pushTestOutcome.result) {
+					case "success":
+						console.log("[push-test] success");
+						break;
+					case "blocked_by_monthly_limit":
+						console.log("[push-test] blocked by monthly limit", {
+							userId,
+							status: pushTestOutcome.httpStatus,
+							body: pushTestOutcome.httpBody,
+						});
+						break;
+					case "failed":
+						console.log("[push-test] failed", {
+							userId,
+							status: pushTestOutcome.httpStatus,
+							body: pushTestOutcome.httpBody,
+						});
+						break;
+					case "network_error":
+						console.log("[push-test] failed", { userId, reason: "network_error" });
+						break;
+				}
 			}
 		  }
 		}
