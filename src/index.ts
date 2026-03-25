@@ -362,6 +362,98 @@ decisionAt: ${decision.timestamp}`;
 	}
 }
 
+type ReportSummaryRecord = {
+	currentStrategy: "aggressive" | "balanced" | "conservative";
+	previousStrategy: string;
+	changed: boolean;
+	shouldNotify: boolean;
+	recommendationStatus: "active" | "none";
+	simulationReady: boolean;
+	timestamp: string;
+};
+
+function getLastReportSummaryKey(userId: string): string {
+	return `last_report_summary:${userId}`;
+}
+
+async function recordLastReportSummary(
+	env: Env,
+	userId: string,
+	summary: ReportSummaryRecord
+): Promise<void> {
+	try {
+		await env.MO_NOTES.put(getLastReportSummaryKey(userId), JSON.stringify(summary));
+	} catch {
+		// report summary 記錄失敗不影響 /report 主流程
+	}
+}
+
+function parseReportSummaryRecord(raw: string): ReportSummaryRecord | null {
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (typeof parsed !== "object" || parsed === null) return null;
+
+		if (!("currentStrategy" in parsed) || typeof parsed.currentStrategy !== "string") {
+			return null;
+		}
+		if (
+			parsed.currentStrategy !== "aggressive" &&
+			parsed.currentStrategy !== "balanced" &&
+			parsed.currentStrategy !== "conservative"
+		) {
+			return null;
+		}
+		if (!("previousStrategy" in parsed) || typeof parsed.previousStrategy !== "string") {
+			return null;
+		}
+		if (!("changed" in parsed) || typeof parsed.changed !== "boolean") return null;
+		if (!("shouldNotify" in parsed) || typeof parsed.shouldNotify !== "boolean") return null;
+		if (
+			!("recommendationStatus" in parsed) ||
+			typeof parsed.recommendationStatus !== "string" ||
+			(parsed.recommendationStatus !== "active" && parsed.recommendationStatus !== "none")
+		) {
+			return null;
+		}
+		if (!("simulationReady" in parsed) || typeof parsed.simulationReady !== "boolean") {
+			return null;
+		}
+		if (!("timestamp" in parsed) || typeof parsed.timestamp !== "string") return null;
+
+		return {
+			currentStrategy: parsed.currentStrategy,
+			previousStrategy: parsed.previousStrategy,
+			changed: parsed.changed,
+			shouldNotify: parsed.shouldNotify,
+			recommendationStatus: parsed.recommendationStatus,
+			simulationReady: parsed.simulationReady,
+			timestamp: parsed.timestamp,
+		};
+	} catch {
+		return null;
+	}
+}
+
+async function formatLastReportSummaryStatusBlock(env: Env, userId: string): Promise<string> {
+	const hasUserId = userId.trim() !== "" && userId !== "unknown-user";
+	if (!hasUserId) return "report: none";
+	try {
+		const raw = await env.MO_NOTES.get(getLastReportSummaryKey(userId), "text");
+		if (raw === null || raw.trim() === "") return "report: none";
+		const r = parseReportSummaryRecord(raw);
+		if (r === null) return "report: none";
+		return `reportStrategy: ${r.currentStrategy}
+reportPrev: ${r.previousStrategy}
+reportChanged: ${r.changed}
+reportShouldNotify: ${r.shouldNotify}
+reportRec: ${r.recommendationStatus}
+reportSimReady: ${r.simulationReady ? "yes" : "no"}
+reportAt: ${r.timestamp}`;
+	} catch {
+		return "report: none";
+	}
+}
+
 function extractNoteContent(storedValue: string): string {
 	try {
 		const parsed: unknown = JSON.parse(storedValue);
@@ -813,6 +905,7 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 			env,
 			userId
 		);
+		const lastReportSummaryStatus = await formatLastReportSummaryStatusBlock(env, userId);
 		return `MO Status
 app: ${s.app}
 version: dev
@@ -822,7 +915,8 @@ d1: ${s.d1}
 user: ${statusUserLine}
 noteCount: ${s.noteCount}
 ${lastPushBlock}
-${strategyDecisionStatus}`;
+${strategyDecisionStatus}
+${lastReportSummaryStatus}`;
 	  }
 	  case "/report": {
 		const s = await getSystemStatus(env, userId);
@@ -936,6 +1030,9 @@ ${strategyDecisionStatus}`;
 		let strategyChangeBlock: string;
 		let shouldNotifyOut: "yes" | "no" = "no";
 		let strategyNotifyPushBody: string | null = null;
+		let reportPreviousStrategy = "none";
+		let reportChanged = false;
+		let reportShouldNotify = false;
 		if (!hasUserId) {
 			strategyChangeBlock = `* current: ${strategy}
 * previous: none
@@ -951,6 +1048,9 @@ ${strategyDecisionStatus}`;
 				prevTrim !== "" && prevTrim !== strategy ? "yes" : "no";
 			const shouldNotify: "yes" | "no" = changed === "yes" ? "yes" : "no";
 			shouldNotifyOut = shouldNotify;
+			reportPreviousStrategy = previousDisplay;
+			reportChanged = changed === "yes";
+			reportShouldNotify = shouldNotify === "yes";
 			await env.MO_NOTES.put(strategyKey, strategy);
 			const notifyMessageLine =
 				shouldNotify === "yes" ?
@@ -1017,6 +1117,19 @@ ${notifyMessageLine}`;
 					console.log("[notify] network_error", { userId });
 					break;
 			}
+		}
+
+		if (hasUserId && userId !== "unknown-user") {
+			const summary: ReportSummaryRecord = {
+				currentStrategy: strategy,
+				previousStrategy: reportPreviousStrategy,
+				changed: reportChanged,
+				shouldNotify: reportShouldNotify,
+				recommendationStatus: recStatus === "active" ? "active" : "none",
+				simulationReady: simReady === "yes",
+				timestamp: formatStatusPushAtTaipei(new Date()),
+			};
+			await recordLastReportSummary(env, userId, summary);
 		}
 
 		const reportUserLine = s.user === "ok" ? `ok (${userId})` : "none";
