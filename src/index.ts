@@ -409,6 +409,28 @@ d1: ${d1Label}
 user: ${userLabel}
 noteCount: ${noteCountDisplay}`;
 	  }
+	  case "/report": {
+		const hasUserId = userId.trim() !== "";
+		const userLabel = hasUserId ? "ok" : "none";
+		let notesCount = 0;
+		if (hasUserId) {
+			try {
+				const list = await env.MO_NOTES.list({
+					prefix: `note:${userId}:`,
+					limit: 20,
+				});
+				notesCount = list.keys.length;
+			} catch {
+				notesCount = 0;
+			}
+		}
+		return `MO Report
+system: online
+command: ready
+storage: kv+d1
+user: ${userLabel}
+notes: ${notesCount}`;
+	  }
 	  // TODO: later commands
 	  // case "/help":
 	  //  return "...";
