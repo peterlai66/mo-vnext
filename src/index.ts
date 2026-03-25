@@ -568,6 +568,8 @@ noteCount: ${s.noteCount}`;
 * result: ${simResult}`;
 
 		let strategyChangeBlock: string;
+		let shouldNotifyOut: "yes" | "no" = "no";
+		let strategyNotifyPushBody: string | null = null;
 		if (!hasUserId) {
 			strategyChangeBlock = `* current: ${strategy}
 * previous: none
@@ -582,6 +584,7 @@ noteCount: ${s.noteCount}`;
 			const changed: "yes" | "no" =
 				prevTrim !== "" && prevTrim !== strategy ? "yes" : "no";
 			const shouldNotify: "yes" | "no" = changed === "yes" ? "yes" : "no";
+			shouldNotifyOut = shouldNotify;
 			await env.MO_NOTES.put(strategyKey, strategy);
 			const notifyMessageLine =
 				shouldNotify === "yes" ?
@@ -593,11 +596,41 @@ current: ${strategy}
 score: ${score}
 action: ${recAction}`
 				:	`* notifyMessage: none`;
+			if (shouldNotify === "yes") {
+				strategyNotifyPushBody = `MO Strategy Update
+previous: ${previousDisplay}
+current: ${strategy}
+score: ${score}
+action: ${recAction}`;
+			}
 			strategyChangeBlock = `* current: ${strategy}
 * previous: ${previousDisplay}
 * changed: ${changed}
 * shouldNotify: ${shouldNotify}
 ${notifyMessageLine}`;
+		}
+
+		if (
+			hasUserId &&
+			userId !== "unknown-user" &&
+			shouldNotifyOut === "yes" &&
+			strategyNotifyPushBody !== null
+		) {
+			try {
+				await fetch("https://api.line.me/v2/bot/message/push", {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						Authorization: `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN}`,
+					},
+					body: JSON.stringify({
+						to: userId,
+						messages: [{ type: "text", text: strategyNotifyPushBody }],
+					}),
+				});
+			} catch {
+				// 推播失敗不影響 /report 文字回覆
+			}
 		}
 
 		return `MO Report
