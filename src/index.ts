@@ -42,6 +42,16 @@ interface UserNote {
 	createdAt: number;
 }
 
+interface SystemStatus {
+	app: string;
+	command: string;
+	kv: string;
+	d1: string;
+	user: string;
+	/** 歷史筆記 key 數；無 user 為 0；KV list 失敗為 "error"（與 /status 顯示一致） */
+	noteCount: number | "error";
+}
+
 export interface Env {
 	LINE_CHANNEL_ACCESS_TOKEN: string;
 	LINE_CHANNEL_SECRET: string;
@@ -293,6 +303,38 @@ function extractCommand(messageText: string): string | null {
 	return /^\/[A-Za-z0-9_]+$/.test(messageText) ? messageText : null;
 }
 
+async function getSystemStatus(env: Env, userId: string): Promise<SystemStatus> {
+	let d1Label: "ok" | "error" = "error";
+	try {
+		await env.MO_DB.prepare("SELECT 1 as ok").first();
+		d1Label = "ok";
+	} catch {
+		d1Label = "error";
+	}
+	const hasUserId = userId.trim() !== "";
+	const userLabel = hasUserId ? "ok" : "none";
+	let noteCount: number | "error" = 0;
+	if (hasUserId) {
+		try {
+			const list = await env.MO_NOTES.list({
+				prefix: `note:${userId}:`,
+				limit: 20,
+			});
+			noteCount = list.keys.length;
+		} catch {
+			noteCount = "error";
+		}
+	}
+	return {
+		app: "mo-vnext",
+		command: "ok",
+		kv: "ok",
+		d1: d1Label,
+		user: userLabel,
+		noteCount,
+	};
+}
+
 async function handleCommand(
 	command: string | null,
 	messageText: string,
@@ -379,57 +421,25 @@ async function handleCommand(
 ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 	  }
 	  case "/status": {
-		let d1Label: "ok" | "error" = "error";
-		try {
-			await env.MO_DB.prepare("SELECT 1 as ok").first();
-			d1Label = "ok";
-		} catch {
-			d1Label = "error";
-		}
-		const hasUserId = userId.trim() !== "";
-		const userLabel = hasUserId ? "ok" : "none";
-		let noteCountDisplay: number | "error" = 0;
-		if (hasUserId) {
-			try {
-				const list = await env.MO_NOTES.list({
-					prefix: `note:${userId}:`,
-					limit: 20,
-				});
-				noteCountDisplay = list.keys.length;
-			} catch {
-				noteCountDisplay = "error";
-			}
-		}
+		const s = await getSystemStatus(env, userId);
 		return `MO Status
-app: mo-vnext
+app: ${s.app}
 version: dev
-command: ok
-kv: ok
-d1: ${d1Label}
-user: ${userLabel}
-noteCount: ${noteCountDisplay}`;
+command: ${s.command}
+kv: ${s.kv}
+d1: ${s.d1}
+user: ${s.user}
+noteCount: ${s.noteCount}`;
 	  }
 	  case "/report": {
-		const hasUserId = userId.trim() !== "";
-		const userLabel = hasUserId ? "ok" : "none";
-		let notesCount = 0;
-		if (hasUserId) {
-			try {
-				const list = await env.MO_NOTES.list({
-					prefix: `note:${userId}:`,
-					limit: 20,
-				});
-				notesCount = list.keys.length;
-			} catch {
-				notesCount = 0;
-			}
-		}
+		const s = await getSystemStatus(env, userId);
+		const notesValue = s.noteCount === "error" ? 0 : s.noteCount;
 		return `MO Report
 system: online
 command: ready
 storage: kv+d1
-user: ${userLabel}
-notes: ${notesCount}`;
+user: ${s.user}
+notes: ${notesValue}`;
 	  }
 	  // TODO: later commands
 	  // case "/help":
