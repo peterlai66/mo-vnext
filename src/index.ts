@@ -636,6 +636,28 @@ ${notifyMessageLine}`;
 
 		const reportUserLine = s.user === "ok" ? `ok (${userId})` : "none";
 
+		const debugNotePrefixStr = `note:${userId}:`;
+		let debugKvListCountForSystem = 0;
+		let debugKvKeysSection = "* debugKvKeys: none";
+		if (hasUserId) {
+			try {
+				const debugKvList = await env.MO_NOTES.list({
+					prefix: debugNotePrefixStr,
+					limit: 20,
+				});
+				debugKvListCountForSystem = debugKvList.keys.length;
+				if (debugKvList.keys.length > 0) {
+					const dkLines = debugKvList.keys
+						.map((k, i) => `  ${i + 1}. ${k.name}`)
+						.join("\n");
+					debugKvKeysSection = `* debugKvKeys:\n${dkLines}`;
+				}
+			} catch {
+				debugKvListCountForSystem = 0;
+				debugKvKeysSection = "* debugKvKeys: none";
+			}
+		}
+
 		return `MO Report
 
 [System]
@@ -647,6 +669,9 @@ ${notifyMessageLine}`;
 * d1: ${s.d1}
 * user: ${reportUserLine}
 * notes: ${notesValue}
+* debugNotePrefix: ${debugNotePrefixStr}
+* debugKvListCount: ${debugKvListCountForSystem}
+${debugKvKeysSection}
 
 [Strategy]
 
