@@ -480,6 +480,21 @@ async function formatLastReportSummaryStatusBlock(env: Env, userId: string): Pro
 	}
 }
 
+type MoStatusState = {
+	lastPushBlock: string;
+	decisionBlock: string;
+	reportBlock: string;
+};
+
+async function buildMoStatusState(env: Env, userId: string): Promise<MoStatusState> {
+	const [lastPushBlock, decisionBlock, reportBlock] = await Promise.all([
+		formatLastPushStatusBlock(env, userId),
+		formatLastStrategyDecisionStatusBlock(env, userId),
+		formatLastReportSummaryStatusBlock(env, userId),
+	]);
+	return { lastPushBlock, decisionBlock, reportBlock };
+}
+
 function extractNoteContent(storedValue: string): string {
 	try {
 		const parsed: unknown = JSON.parse(storedValue);
@@ -926,12 +941,7 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 	  case "/status": {
 		const s = await getSystemStatus(env, userId);
 		const statusUserLine = s.user === "ok" ? `ok (${userId})` : "none";
-		const lastPushBlock = await formatLastPushStatusBlock(env, userId);
-		const strategyDecisionStatus = await formatLastStrategyDecisionStatusBlock(
-			env,
-			userId
-		);
-		const lastReportSummaryStatus = await formatLastReportSummaryStatusBlock(env, userId);
+		const state = await buildMoStatusState(env, userId);
 		const formatSection = (title: string, block: string): string => {
 			const lines = block
 				.split(/\r?\n/u)
@@ -949,11 +959,11 @@ d1: ${s.d1}
 user: ${statusUserLine}
 noteCount: ${s.noteCount}
 
-${formatSection("Push", lastPushBlock)}
+${formatSection("Push", state.lastPushBlock)}
 
-${formatSection("Decision", strategyDecisionStatus)}
+${formatSection("Decision", state.decisionBlock)}
 
-${formatSection("Report", lastReportSummaryStatus)}`;
+${formatSection("Report", state.reportBlock)}`;
 		// safeguard: 避免標題被意外多出字元（例如 eMO Status）
 		return statusText.replace(/^eMO Status/u, "MO Status");
 	  }
