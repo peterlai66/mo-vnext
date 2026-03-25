@@ -503,6 +503,11 @@ noteCount: ${s.noteCount}`;
 			noteCountForRec > 0 ? "有筆記資料，可進行分析" : "尚無資料";
 		const recommendationBlock = `* status: ${recStatus}
 * reason: ${recReason}`;
+		const simReady = noteCountForRec > 0 ? "yes" : "no";
+		const simReason =
+			noteCountForRec > 0 ? "可進行模擬" : "無資料可模擬";
+		const simulationBlock = `* ready: ${simReady}
+* reason: ${simReason}`;
 
 		return `MO Report
 
@@ -526,7 +531,7 @@ ${recommendationBlock}
 
 [Simulation]
 
-（預留）`;
+${simulationBlock}`;
 	  }
 	  // TODO: later commands
 	  // case "/help":
