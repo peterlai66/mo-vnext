@@ -368,7 +368,9 @@ type ReportSummaryRecord = {
 	changed: boolean;
 	shouldNotify: boolean;
 	recommendationStatus: "active" | "none";
+	recommendationReason?: string;
 	simulationReady: boolean;
+	simulationResult?: string;
 	timestamp: string;
 };
 
@@ -420,7 +422,7 @@ function parseReportSummaryRecord(raw: string): ReportSummaryRecord | null {
 		}
 		if (!("timestamp" in parsed) || typeof parsed.timestamp !== "string") return null;
 
-		return {
+		const rec: ReportSummaryRecord = {
 			currentStrategy: parsed.currentStrategy,
 			previousStrategy: parsed.previousStrategy,
 			changed: parsed.changed,
@@ -429,6 +431,21 @@ function parseReportSummaryRecord(raw: string): ReportSummaryRecord | null {
 			simulationReady: parsed.simulationReady,
 			timestamp: parsed.timestamp,
 		};
+		if (
+			"recommendationReason" in parsed &&
+			typeof parsed.recommendationReason === "string" &&
+			parsed.recommendationReason.trim() !== ""
+		) {
+			rec.recommendationReason = parsed.recommendationReason;
+		}
+		if (
+			"simulationResult" in parsed &&
+			typeof parsed.simulationResult === "string" &&
+			parsed.simulationResult.trim() !== ""
+		) {
+			rec.simulationResult = parsed.simulationResult;
+		}
+		return rec;
 	} catch {
 		return null;
 	}
@@ -442,13 +459,22 @@ async function formatLastReportSummaryStatusBlock(env: Env, userId: string): Pro
 		if (raw === null || raw.trim() === "") return "report: none";
 		const r = parseReportSummaryRecord(raw);
 		if (r === null) return "report: none";
-		return `reportStrategy: ${r.currentStrategy}
-reportPrev: ${r.previousStrategy}
-reportChanged: ${r.changed}
-reportShouldNotify: ${r.shouldNotify}
-reportRec: ${r.recommendationStatus}
-reportSimReady: ${r.simulationReady ? "yes" : "no"}
-reportAt: ${r.timestamp}`;
+		const lines: string[] = [
+			`reportStrategy: ${r.currentStrategy}`,
+			`reportPrev: ${r.previousStrategy}`,
+			`reportChanged: ${r.changed}`,
+			`reportShouldNotify: ${r.shouldNotify}`,
+			`reportRec: ${r.recommendationStatus}`,
+		];
+		if (r.recommendationReason !== undefined) {
+			lines.push(`reportReason: ${r.recommendationReason}`);
+		}
+		lines.push(`reportSimReady: ${r.simulationReady ? "yes" : "no"}`);
+		if (r.simulationResult !== undefined) {
+			lines.push(`reportSimResult: ${r.simulationResult}`);
+		}
+		lines.push(`reportAt: ${r.timestamp}`);
+		return lines.join("\n");
 	} catch {
 		return "report: none";
 	}
@@ -1126,7 +1152,9 @@ ${notifyMessageLine}`;
 				changed: reportChanged,
 				shouldNotify: reportShouldNotify,
 				recommendationStatus: recStatus === "active" ? "active" : "none",
+				recommendationReason: recReason,
 				simulationReady: simReady === "yes",
+				simulationResult: simResult,
 				timestamp: formatStatusPushAtTaipei(new Date()),
 			};
 			await recordLastReportSummary(env, userId, summary);
