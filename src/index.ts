@@ -1168,8 +1168,37 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 			strategy = "conservative";
 		}
 		const strategyFromScore = strategy;
+		let prevTrimForReport = "";
+		let strategyFinal: "aggressive" | "balanced" | "conservative" = strategyFromScore;
+		if (hasUserId) {
+			const strategyKeyRead = `strategy:${userId}`;
+			const prevRawRead = await env.MO_NOTES.get(strategyKeyRead, "text");
+			prevTrimForReport = prevRawRead !== null ? prevRawRead.trim() : "";
+			if (isReportTestChange && userId !== "unknown-user") {
+				strategyFinal = pickForcedStrategyForReportTest(
+					prevTrimForReport,
+					strategyFromScore
+				);
+				console.log("[test] force strategy change", {
+					userId,
+					previous: prevTrimForReport === "" ? "(empty)" : prevTrimForReport,
+					fromScore: strategyFromScore,
+					forced: strategyFinal,
+				});
+			}
+		}
+		console.log("[report] final strategy selected", {
+			userId,
+			fromScore: strategyFromScore,
+			final: strategyFinal,
+			reportTestChange: isReportTestChange,
+		});
+		console.log("[report] recommendation strategy synced", {
+			strategy: strategyFinal,
+		});
+
 		const recommendationBlock = `* score: ${score}
-* strategy: ${strategyFromScore}
+* strategy: ${strategyFinal}
 * status: ${recStatus}
 * reason: ${recReason}
 * action: ${recAction}`;
@@ -1180,9 +1209,9 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 		let simResult: string;
 		if (noteCountForRec === 0) {
 			simResult = "無法模擬";
-		} else if (strategyFromScore === "aggressive") {
+		} else if (strategyFinal === "aggressive") {
 			simResult = "模擬偏積極策略，可提高部位配置";
-		} else if (strategyFromScore === "balanced") {
+		} else if (strategyFinal === "balanced") {
 			simResult = "模擬偏平衡策略，建議分批配置";
 		} else {
 			simResult = "模擬偏保守策略，建議先觀察";
@@ -1197,50 +1226,40 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 		let reportChanged = false;
 		let reportShouldNotify = false;
 		if (!hasUserId) {
-			strategyChangeBlock = `* current: ${strategy}
+			strategyChangeBlock = `* current: ${strategyFinal}
 * previous: none
 * changed: no
 * shouldNotify: no
 * notifyMessage: none`;
 		} else {
 			const strategyKey = `strategy:${userId}`;
-			const prevRaw = await env.MO_NOTES.get(strategyKey, "text");
-			const prevTrim = prevRaw !== null ? prevRaw.trim() : "";
+			const prevTrim = prevTrimForReport;
 			const previousDisplay = prevTrim === "" ? "none" : prevTrim;
-			if (isReportTestChange && userId !== "unknown-user") {
-				strategy = pickForcedStrategyForReportTest(prevTrim, strategyFromScore);
-				console.log("[test] force strategy change", {
-					userId,
-					previous: prevTrim === "" ? "(empty)" : prevTrim,
-					fromScore: strategyFromScore,
-					forced: strategy,
-				});
-			}
 			const changed: "yes" | "no" =
 				isReportTestChange && userId !== "unknown-user" && prevTrim === "" ?
 					"yes"
-				:	prevTrim !== "" && prevTrim !== strategy ?
+				:	prevTrim !== "" && prevTrim !== strategyFinal ?
 					"yes"
 				:	"no";
 			const shouldNotify: "yes" | "no" = changed === "yes" ? "yes" : "no";
 			reportPreviousStrategy = previousDisplay;
 			reportChanged = changed === "yes";
 			reportShouldNotify = shouldNotify === "yes";
-			await env.MO_NOTES.put(strategyKey, strategy);
+			await env.MO_NOTES.put(strategyKey, strategyFinal);
 			const notifyMessageLine =
 				shouldNotify === "yes" ?
 					`* notifyMessage:
 
 MO Strategy Update
 previous: ${previousDisplay}
-current: ${strategy}
+current: ${strategyFinal}
 score: ${score}
 action: ${recAction}`
 				:	`* notifyMessage: none`;
 			if (shouldNotify === "yes") {
 				strategyNotifyPushBody = `MO Strategy Update
 previous: ${previousDisplay}
-current: ${strategy}
+current: ${strategyFinal}
 score: ${score}
 action: ${recAction}`;
 			}
@@ -1251,7 +1270,7 @@ action: ${recAction}`;
 				timestamp: formatStatusPushAtTaipei(new Date()),
 			};
 			await recordStrategyDecision(env, userId, strategyDecision);
-			strategyChangeBlock = `* current: ${strategy}
+			strategyChangeBlock = `* current: ${strategyFinal}
 * previous: ${previousDisplay}
 * changed: ${changed}
 * shouldNotify: ${shouldNotify}
@@ -1303,7 +1322,7 @@ ${notifyMessageLine}`;
 
 		if (hasUserId && userId !== "unknown-user") {
 			const summary: ReportSummaryRecord = {
-				currentStrategy: strategy,
+				currentStrategy: strategyFinal,
 				previousStrategy: reportPreviousStrategy,
 				changed: reportChanged,
 				shouldNotify: reportShouldNotify,
