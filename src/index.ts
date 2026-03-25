@@ -521,8 +521,13 @@ noteCount: ${s.noteCount}`;
 				recReason = "長時間未更新";
 			}
 		}
+		const recAction =
+			recStatus === "active" ?
+				"建議開始分析或建立策略"
+			:	"建議新增資料或等待更新";
 		const recommendationBlock = `* status: ${recStatus}
-* reason: ${recReason}`;
+* reason: ${recReason}
+* action: ${recAction}`;
 		const noteCountForRec = s.noteCount === "error" ? 0 : s.noteCount;
 		const simReady = noteCountForRec > 0 ? "yes" : "no";
 		const simReason =
