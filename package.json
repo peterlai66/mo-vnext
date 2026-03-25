@@ -8,7 +8,7 @@
 		"start": "wrangler dev",
 		"test": "vitest",
 		"cf-typegen": "wrangler types",
-		"ac": "git add . && node scripts/auto-commit.mjs | xargs -I {} git commit -m \"{}\"",
+		"ac": "git add . && sh -c 'git commit -m \"${1:-chore: 提交變更}\"' --",
 		"ship": "npm run ac && git push && npm run deploy"
 	},
 	"devDependencies": {
