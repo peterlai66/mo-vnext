@@ -940,7 +940,7 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 			if (lines.length === 0) return `[${title}]\n- none`;
 			return `[${title}]\n${lines.map((l) => `- ${l}`).join("\n")}`;
 		};
-		return `MO Status
+		const statusText = `MO Status
 app: ${s.app}
 version: dev
 command: ${s.command}
@@ -954,6 +954,8 @@ ${formatSection("Push", lastPushBlock)}
 ${formatSection("Decision", strategyDecisionStatus)}
 
 ${formatSection("Report", lastReportSummaryStatus)}`;
+		// safeguard: 避免標題被意外多出字元（例如 eMO Status）
+		return statusText.replace(/^eMO Status/u, "MO Status");
 	  }
 	  case "/report": {
 		const s = await getSystemStatus(env, userId);
