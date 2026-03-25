@@ -529,7 +529,15 @@ noteCount: ${s.noteCount}`;
 		} else {
 			recAction = "建議新增第一筆資料";
 		}
-		const recommendationBlock = `* status: ${recStatus}
+		const baseScore = Math.min(50, totalNotesNum * 5);
+		const timeBonus =
+			latestNoteMs !== null && Date.now() - latestNoteMs <= twentyFourHoursMs ?
+				30
+			:	0;
+		const activityBonus = totalNotesNum >= 10 ? 20 : 0;
+		const score = Math.min(100, baseScore + timeBonus + activityBonus);
+		const recommendationBlock = `* score: ${score}
+* status: ${recStatus}
 * reason: ${recReason}
 * action: ${recAction}`;
 		const noteCountForRec = s.noteCount === "error" ? 0 : s.noteCount;
