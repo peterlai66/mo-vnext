@@ -449,13 +449,14 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 	  }
 	  case "/status": {
 		const s = await getSystemStatus(env, userId);
+		const statusUserLine = s.user === "ok" ? `ok (${userId})` : "none";
 		return `MO Status
 app: ${s.app}
 version: dev
 command: ${s.command}
 kv: ${s.kv}
 d1: ${s.d1}
-user: ${s.user}
+user: ${statusUserLine}
 noteCount: ${s.noteCount}`;
 	  }
 	  case "/report": {
@@ -633,6 +634,8 @@ ${notifyMessageLine}`;
 			}
 		}
 
+		const reportUserLine = s.user === "ok" ? `ok (${userId})` : "none";
+
 		return `MO Report
 
 [System]
@@ -642,7 +645,7 @@ ${notifyMessageLine}`;
 * storage: kv+d1
 * kv: ${s.kv}
 * d1: ${s.d1}
-* user: ${s.user}
+* user: ${reportUserLine}
 * notes: ${notesValue}
 
 [Strategy]
