@@ -145,6 +145,100 @@ async function lineBotPushTextMessage(
 	}
 }
 
+/** /status 顯示用；與 LinePushResult 對應（blocked 用 snake 以符合簡潔標籤） */
+type LastPushDisplayKind =
+	| "success"
+	| "failed"
+	| "blocked_monthly_limit"
+	| "network_error";
+
+type LastPushNotifyRecord = {
+	kind: LastPushDisplayKind;
+	pushAt: string;
+	pushStatus?: number;
+	pushBodySummary?: string;
+};
+
+let lastPushNotifyRecord: LastPushNotifyRecord | null = null;
+
+function linePushResultToDisplayKind(result: LinePushResult): LastPushDisplayKind {
+	switch (result) {
+		case "success":
+			return "success";
+		case "failed":
+			return "failed";
+		case "blocked_by_monthly_limit":
+			return "blocked_monthly_limit";
+		case "network_error":
+			return "network_error";
+	}
+}
+
+function formatStatusPushAtTaipei(d: Date): string {
+	const parts = new Intl.DateTimeFormat("en-CA", {
+		timeZone: "Asia/Taipei",
+		year: "numeric",
+		month: "2-digit",
+		day: "2-digit",
+		hour: "2-digit",
+		minute: "2-digit",
+		second: "2-digit",
+		hour12: false,
+	}).formatToParts(d);
+	const pick = (type: Intl.DateTimeFormatPart["type"]) =>
+		parts.find((p) => p.type === type)?.value ?? "";
+	const y = pick("year");
+	const mo = pick("month");
+	const day = pick("day");
+	const h = pick("hour");
+	const min = pick("minute");
+	const sec = pick("second");
+	if (y === "" || mo === "" || day === "" || h === "" || min === "" || sec === "") {
+		return d.toISOString();
+	}
+	return `${y}-${mo}-${day}T${h}:${min}:${sec}+08:00`;
+}
+
+function summarizePushBodyForStatus(body: string | undefined, maxLen: number): string | undefined {
+	if (body === undefined) return undefined;
+	const one = body.replace(/\s+/gu, " ").trim();
+	if (one === "") return undefined;
+	if (one.length <= maxLen) return one;
+	return `${one.slice(0, maxLen)}…`;
+}
+
+function recordLinePushOutcomeForStatus(outcome: LinePushOutcome): void {
+	const kind = linePushResultToDisplayKind(outcome.result);
+	const pushAt = formatStatusPushAtTaipei(new Date());
+	const pushStatus = outcome.httpStatus;
+	const pushBodySummary =
+		outcome.result === "network_error" ?
+			"network_error"
+		:	summarizePushBodyForStatus(outcome.httpBody, 160);
+	lastPushNotifyRecord = {
+		kind,
+		pushAt,
+		...(pushStatus !== undefined ? { pushStatus } : {}),
+		...(pushBodySummary !== undefined ? { pushBodySummary } : {}),
+	};
+}
+
+function formatLastPushStatusBlock(): string {
+	if (lastPushNotifyRecord === null) {
+		return "lastPush: none";
+	}
+	const r = lastPushNotifyRecord;
+	const lines: string[] = [`lastPush: ${r.kind}`];
+	if (r.pushStatus !== undefined) {
+		lines.push(`pushStatus: ${r.pushStatus}`);
+	}
+	lines.push(`pushAt: ${r.pushAt}`);
+	if (r.pushBodySummary !== undefined && r.pushBodySummary !== "") {
+		lines.push(`pushBody: ${r.pushBodySummary}`);
+	}
+	return lines.join("\n");
+}
+
 function extractNoteContent(storedValue: string): string {
 	try {
 		const parsed: unknown = JSON.parse(storedValue);
@@ -541,7 +635,8 @@ command: ${s.command}
 kv: ${s.kv}
 d1: ${s.d1}
 user: ${statusUserLine}
-noteCount: ${s.noteCount}`;
+noteCount: ${s.noteCount}
+${formatLastPushStatusBlock()}`;
 	  }
 	  case "/report": {
 		const s = await getSystemStatus(env, userId);
@@ -706,6 +801,7 @@ ${notifyMessageLine}`;
 				userId,
 				strategyNotifyPushBody
 			);
+			recordLinePushOutcomeForStatus(notifyPush);
 			switch (notifyPush.result) {
 				case "success":
 					console.log("[notify] success", { userId });
@@ -884,6 +980,7 @@ async function getReplyText(
 					userId,
 					"PUSH TEST OK"
 				);
+				recordLinePushOutcomeForStatus(pushTestOutcome);
 				switch (pushTestOutcome.result) {
 					case "success":
 						console.log("[push-test] success");
