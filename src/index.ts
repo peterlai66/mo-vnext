@@ -1175,7 +1175,6 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 * result: ${simResult}`;
 
 		let strategyChangeBlock: string;
-		let shouldNotifyOut: "yes" | "no" = "no";
 		let strategyNotifyPushBody: string | null = null;
 		let reportPreviousStrategy = "none";
 		let reportChanged = false;
@@ -1194,7 +1193,6 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 			const changed: "yes" | "no" =
 				prevTrim !== "" && prevTrim !== strategy ? "yes" : "no";
 			const shouldNotify: "yes" | "no" = changed === "yes" ? "yes" : "no";
-			shouldNotifyOut = shouldNotify;
 			reportPreviousStrategy = previousDisplay;
 			reportChanged = changed === "yes";
 			reportShouldNotify = shouldNotify === "yes";
@@ -1230,39 +1228,46 @@ action: ${recAction}`;
 ${notifyMessageLine}`;
 		}
 
-		if (
-			hasUserId &&
-			userId !== "unknown-user" &&
-			shouldNotifyOut === "yes" &&
-			strategyNotifyPushBody !== null
-		) {
-			const notifyPush = await lineBotPushTextMessage(
-				env,
-				userId,
-				strategyNotifyPushBody
-			);
-			await recordLinePushOutcomeForStatus(env, userId, notifyPush);
-			switch (notifyPush.result) {
-				case "success":
-					console.log("[notify] success", { userId });
-					break;
-				case "blocked_by_monthly_limit":
-					console.log("[notify] blocked by monthly limit", {
-						userId,
-						status: notifyPush.httpStatus,
-						body: notifyPush.httpBody,
-					});
-					break;
-				case "failed":
-					console.log("[notify] failed", {
-						userId,
-						status: notifyPush.httpStatus,
-						body: notifyPush.httpBody,
-					});
-					break;
-				case "network_error":
-					console.log("[notify] network_error", { userId });
-					break;
+		if (hasUserId && userId !== "unknown-user") {
+			if (!reportChanged) {
+				console.log("[notify] skipped: decisionChanged=false", { userId });
+			} else if (!reportShouldNotify) {
+				console.log("[notify] skipped: shouldNotify=false", { userId });
+			} else if (strategyNotifyPushBody === null) {
+				console.log("[notify] skipped: hasMessage=false", { userId });
+			} else {
+				console.log("[notify] start", { userId });
+				const notifyPush = await lineBotPushTextMessage(
+					env,
+					userId,
+					strategyNotifyPushBody
+				);
+				await recordLinePushOutcomeForStatus(env, userId, notifyPush);
+				switch (notifyPush.result) {
+					case "success":
+						console.log("[notify] done", { userId });
+						break;
+					case "blocked_by_monthly_limit":
+						console.log("[notify] blocked_monthly_limit", {
+							userId,
+							status: notifyPush.httpStatus,
+							body: notifyPush.httpBody,
+						});
+						break;
+					case "failed":
+						console.log("[notify] failed", {
+							userId,
+							status: notifyPush.httpStatus,
+							body: notifyPush.httpBody,
+						});
+						break;
+					case "network_error":
+						console.log("[notify] failed", {
+							userId,
+							reason: "network_error",
+						});
+						break;
+				}
 			}
 		}
 
