@@ -572,7 +572,8 @@ noteCount: ${s.noteCount}`;
 			strategyChangeBlock = `* current: ${strategy}
 * previous: none
 * changed: no
-* shouldNotify: no`;
+* shouldNotify: no
+* notifyMessage: none`;
 		} else {
 			const strategyKey = `strategy:${userId}`;
 			const prevRaw = await env.MO_NOTES.get(strategyKey, "text");
@@ -582,10 +583,21 @@ noteCount: ${s.noteCount}`;
 				prevTrim !== "" && prevTrim !== strategy ? "yes" : "no";
 			const shouldNotify: "yes" | "no" = changed === "yes" ? "yes" : "no";
 			await env.MO_NOTES.put(strategyKey, strategy);
+			const notifyMessageLine =
+				shouldNotify === "yes" ?
+					`* notifyMessage:
+
+MO Strategy Update
+previous: ${previousDisplay}
+current: ${strategy}
+score: ${score}
+action: ${recAction}`
+				:	`* notifyMessage: none`;
 			strategyChangeBlock = `* current: ${strategy}
 * previous: ${previousDisplay}
 * changed: ${changed}
-* shouldNotify: ${shouldNotify}`;
+* shouldNotify: ${shouldNotify}
+${notifyMessageLine}`;
 		}
 
 		return `MO Report
