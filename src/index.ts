@@ -326,6 +326,7 @@ function extractCommand(messageText: string): string | null {
 	// 目前只把「整句就是指令」當作 command（避免改變既有行為，如 `/ping ` 仍會走 echo）
 	// 後續若要支援 `/command arg`，可在這裡擴充解析。
 	if (messageText === "/notes") return "/notes";
+	if (messageText === "/push-test") return "/push-test";
 	if (/^\/note(?:\s+|$)/.test(messageText)) return "/note";
 	return /^\/[A-Za-z0-9_]+$/.test(messageText) ? messageText : null;
 }
@@ -372,6 +373,14 @@ async function handleCommand(
 	  case "/ping":
 		debugLog(env, "/ping hit");
 		return "pong";
+	  case "/push-test": {
+		const hasLineUser =
+			userId.trim() !== "" && userId !== "unknown-user";
+		if (!hasLineUser) {
+			return "push test failed: no user";
+		}
+		return "PUSH TEST START";
+	  }
 	  case "/help":
 		return `可用指令：
 
@@ -781,6 +790,31 @@ async function getReplyText(
 			debugLog(env, "[line reply] status", response.status);
 			debugLog(env, "[line reply] ok", response.ok);
 			debugLog(env, "[line reply] body", await response.text());
+
+			const pushTestCmd = extractCommand(event.message.text ?? "");
+			if (
+				pushTestCmd === "/push-test" &&
+				userId.trim() !== "" &&
+				userId !== "unknown-user"
+			) {
+				try {
+					console.log("[push-test] start", { userId });
+					await fetch("https://api.line.me/v2/bot/message/push", {
+						method: "POST",
+						headers: {
+							"Content-Type": "application/json",
+							Authorization: `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN}`,
+						},
+						body: JSON.stringify({
+							to: userId,
+							messages: [{ type: "text", text: "PUSH TEST OK" }],
+						}),
+					});
+					console.log("[push-test] done");
+				} catch (error: unknown) {
+					console.log("[push-test] error", error);
+				}
+			}
 		  }
 		}
   
