@@ -159,8 +159,6 @@ type LastPushNotifyRecord = {
 	pushBodySummary?: string;
 };
 
-let lastPushNotifyRecord: LastPushNotifyRecord | null = null;
-
 function linePushResultToDisplayKind(result: LinePushResult): LastPushDisplayKind {
 	switch (result) {
 		case "success":
@@ -207,7 +205,56 @@ function summarizePushBodyForStatus(body: string | undefined, maxLen: number): s
 	return `${one.slice(0, maxLen)}…`;
 }
 
-function recordLinePushOutcomeForStatus(outcome: LinePushOutcome): void {
+function getLastPushNotifyKey(userId: string): string {
+	return `last_push_notify:${userId}`;
+}
+
+function isLastPushDisplayKind(value: string): value is LastPushDisplayKind {
+	return (
+		value === "success" ||
+		value === "failed" ||
+		value === "blocked_monthly_limit" ||
+		value === "network_error"
+	);
+}
+
+function parseLastPushNotifyRecord(raw: string): LastPushNotifyRecord | null {
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (typeof parsed !== "object" || parsed === null) return null;
+		if (!("kind" in parsed) || typeof parsed.kind !== "string") return null;
+		if (!isLastPushDisplayKind(parsed.kind)) return null;
+		if (!("pushAt" in parsed) || typeof parsed.pushAt !== "string") return null;
+		const rec: LastPushNotifyRecord = {
+			kind: parsed.kind,
+			pushAt: parsed.pushAt,
+		};
+		if (
+			"pushStatus" in parsed &&
+			typeof parsed.pushStatus === "number" &&
+			Number.isFinite(parsed.pushStatus)
+		) {
+			rec.pushStatus = parsed.pushStatus;
+		}
+		if (
+			"pushBodySummary" in parsed &&
+			typeof parsed.pushBodySummary === "string" &&
+			parsed.pushBodySummary !== ""
+		) {
+			rec.pushBodySummary = parsed.pushBodySummary;
+		}
+		return rec;
+	} catch {
+		return null;
+	}
+}
+
+/** 將 push 結果寫入 KV（與 decision 相同命名空間），供 /status 跨 isolate 讀取 */
+async function recordLinePushOutcomeForStatus(
+	env: Env,
+	userId: string,
+	outcome: LinePushOutcome
+): Promise<void> {
 	const kind = linePushResultToDisplayKind(outcome.result);
 	const pushAt = formatStatusPushAtTaipei(new Date());
 	const pushStatus = outcome.httpStatus;
@@ -215,28 +262,42 @@ function recordLinePushOutcomeForStatus(outcome: LinePushOutcome): void {
 		outcome.result === "network_error" ?
 			"network_error"
 		:	summarizePushBodyForStatus(outcome.httpBody, 160);
-	lastPushNotifyRecord = {
+	const record: LastPushNotifyRecord = {
 		kind,
 		pushAt,
 		...(pushStatus !== undefined ? { pushStatus } : {}),
 		...(pushBodySummary !== undefined ? { pushBodySummary } : {}),
 	};
+	try {
+		await env.MO_NOTES.put(getLastPushNotifyKey(userId), JSON.stringify(record));
+	} catch {
+		// 記錄失敗不影響 push / reply 主流程
+	}
 }
 
-function formatLastPushStatusBlock(): string {
-	if (lastPushNotifyRecord === null) {
+async function formatLastPushStatusBlock(
+	env: Env,
+	userId: string
+): Promise<string> {
+	const hasUserId = userId.trim() !== "" && userId !== "unknown-user";
+	if (!hasUserId) return "lastPush: none";
+	try {
+		const raw = await env.MO_NOTES.get(getLastPushNotifyKey(userId), "text");
+		if (raw === null || raw.trim() === "") return "lastPush: none";
+		const r = parseLastPushNotifyRecord(raw);
+		if (r === null) return "lastPush: none";
+		const lines: string[] = [`lastPush: ${r.kind}`];
+		if (r.pushStatus !== undefined) {
+			lines.push(`pushStatus: ${r.pushStatus}`);
+		}
+		lines.push(`pushAt: ${r.pushAt}`);
+		if (r.pushBodySummary !== undefined && r.pushBodySummary !== "") {
+			lines.push(`pushBody: ${r.pushBodySummary}`);
+		}
+		return lines.join("\n");
+	} catch {
 		return "lastPush: none";
 	}
-	const r = lastPushNotifyRecord;
-	const lines: string[] = [`lastPush: ${r.kind}`];
-	if (r.pushStatus !== undefined) {
-		lines.push(`pushStatus: ${r.pushStatus}`);
-	}
-	lines.push(`pushAt: ${r.pushAt}`);
-	if (r.pushBodySummary !== undefined && r.pushBodySummary !== "") {
-		lines.push(`pushBody: ${r.pushBodySummary}`);
-	}
-	return lines.join("\n");
 }
 
 type StrategyDecisionRecord = {
@@ -631,7 +692,7 @@ reason: forced debug strategy change`;
 		await recordStrategyDecision(env, userId, strategyDecision);
 
 		const pushOutcome = await lineBotPushTextMessage(env, userId, notifyMessage);
-		recordLinePushOutcomeForStatus(pushOutcome);
+		await recordLinePushOutcomeForStatus(env, userId, pushOutcome);
 
 		switch (pushOutcome.result) {
 			case "success":
@@ -747,6 +808,7 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 	  case "/status": {
 		const s = await getSystemStatus(env, userId);
 		const statusUserLine = s.user === "ok" ? `ok (${userId})` : "none";
+		const lastPushBlock = await formatLastPushStatusBlock(env, userId);
 		const strategyDecisionStatus = await formatLastStrategyDecisionStatusBlock(
 			env,
 			userId
@@ -759,7 +821,7 @@ kv: ${s.kv}
 d1: ${s.d1}
 user: ${statusUserLine}
 noteCount: ${s.noteCount}
-${formatLastPushStatusBlock()}
+${lastPushBlock}
 ${strategyDecisionStatus}`;
 	  }
 	  case "/report": {
@@ -932,7 +994,7 @@ ${notifyMessageLine}`;
 				userId,
 				strategyNotifyPushBody
 			);
-			recordLinePushOutcomeForStatus(notifyPush);
+			await recordLinePushOutcomeForStatus(env, userId, notifyPush);
 			switch (notifyPush.result) {
 				case "success":
 					console.log("[notify] success", { userId });
@@ -1111,7 +1173,7 @@ async function getReplyText(
 					userId,
 					"PUSH TEST OK"
 				);
-				recordLinePushOutcomeForStatus(pushTestOutcome);
+				await recordLinePushOutcomeForStatus(env, userId, pushTestOutcome);
 				switch (pushTestOutcome.result) {
 					case "success":
 						console.log("[push-test] success");
