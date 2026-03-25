@@ -521,10 +521,14 @@ noteCount: ${s.noteCount}`;
 				recReason = "長時間未更新";
 			}
 		}
-		const recAction =
-			recStatus === "active" ?
-				"建議開始分析或建立策略"
-			:	"建議新增資料或等待更新";
+		let recAction: string;
+		if (totalNotesNum >= 10) {
+			recAction = "建議進行策略分析（資料充足）";
+		} else if (totalNotesNum >= 1) {
+			recAction = "建議持續累積資料";
+		} else {
+			recAction = "建議新增第一筆資料";
+		}
 		const recommendationBlock = `* status: ${recStatus}
 * reason: ${recReason}
 * action: ${recAction}`;
