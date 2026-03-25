@@ -524,6 +524,89 @@ async function buildMoStatusState(env: Env, userId: string): Promise<MoStatusSta
 	return { lastPushBlock, decisionBlock, reportBlock };
 }
 
+function renderMoStatusText(params: {
+	app: string;
+	version: string;
+	command: string;
+	kv: string;
+	d1: string;
+	userLine: string;
+	noteCount: number | "error";
+	state: MoStatusState;
+}): string {
+	const formatSection = (title: string, block: string): string => {
+		const lines = block
+			.split(/\r?\n/u)
+			.map((l) => l.trim())
+			.filter((l) => l !== "");
+		if (lines.length === 0) return `[${title}]\n- none`;
+		return `[${title}]\n${lines.map((l) => `- ${l}`).join("\n")}`;
+	};
+	const statusText = `MO Status
+app: ${params.app}
+version: ${params.version}
+command: ${params.command}
+kv: ${params.kv}
+d1: ${params.d1}
+user: ${params.userLine}
+noteCount: ${params.noteCount}
+
+${formatSection("Push", params.state.lastPushBlock)}
+
+${formatSection("Decision", params.state.decisionBlock)}
+
+${formatSection("Report", params.state.reportBlock)}`;
+	// safeguard: 避免標題被意外多出字元（例如 eMO Status）
+	return statusText.replace(/^eMO Status/u, "MO Status");
+}
+
+function renderMoReportText(params: {
+	app: string;
+	command: string;
+	kv: string;
+	d1: string;
+	userLine: string;
+	notesValue: number;
+	debugNotePrefix: string;
+	debugKvListCount: number;
+	debugKvKeysSection: string;
+	strategyChangeBlock: string;
+	summaryBlock: string;
+	recommendationBlock: string;
+	simulationBlock: string;
+}): string {
+	return `MO Report
+
+[System]
+
+* app: ${params.app}
+* command: ${params.command}
+* storage: kv+d1
+* kv: ${params.kv}
+* d1: ${params.d1}
+* user: ${params.userLine}
+* notes: ${params.notesValue}
+* debugNotePrefix: ${params.debugNotePrefix}
+* debugKvListCount: ${params.debugKvListCount}
+${params.debugKvKeysSection}
+
+[Strategy]
+
+${params.strategyChangeBlock}
+
+[Summary]
+
+${params.summaryBlock}
+
+[Recommendation]
+
+${params.recommendationBlock}
+
+[Simulation]
+
+${params.simulationBlock}`;
+}
+
 function extractNoteContent(storedValue: string): string {
 	try {
 		const parsed: unknown = JSON.parse(storedValue);
@@ -971,30 +1054,16 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 		const s = await getSystemStatus(env, userId);
 		const statusUserLine = s.user === "ok" ? `ok (${userId})` : "none";
 		const state = await buildMoStatusState(env, userId);
-		const formatSection = (title: string, block: string): string => {
-			const lines = block
-				.split(/\r?\n/u)
-				.map((l) => l.trim())
-				.filter((l) => l !== "");
-			if (lines.length === 0) return `[${title}]\n- none`;
-			return `[${title}]\n${lines.map((l) => `- ${l}`).join("\n")}`;
-		};
-		const statusText = `MO Status
-app: ${s.app}
-version: dev
-command: ${s.command}
-kv: ${s.kv}
-d1: ${s.d1}
-user: ${statusUserLine}
-noteCount: ${s.noteCount}
-
-${formatSection("Push", state.lastPushBlock)}
-
-${formatSection("Decision", state.decisionBlock)}
-
-${formatSection("Report", state.reportBlock)}`;
-		// safeguard: 避免標題被意外多出字元（例如 eMO Status）
-		return statusText.replace(/^eMO Status/u, "MO Status");
+		return renderMoStatusText({
+			app: s.app,
+			version: "dev",
+			command: s.command,
+			kv: s.kv,
+			d1: s.d1,
+			userLine: statusUserLine,
+			noteCount: s.noteCount,
+			state,
+		});
 	  }
 	  case "/report": {
 		const s = await getSystemStatus(env, userId);
@@ -1236,36 +1305,21 @@ ${notifyMessageLine}`;
 			}
 		}
 
-		return `MO Report
-
-[System]
-
-* app: ${s.app}
-* command: ${s.command}
-* storage: kv+d1
-* kv: ${s.kv}
-* d1: ${s.d1}
-* user: ${reportUserLine}
-* notes: ${notesValue}
-* debugNotePrefix: ${debugNotePrefixStr}
-* debugKvListCount: ${debugKvListCountForSystem}
-${debugKvKeysSection}
-
-[Strategy]
-
-${strategyChangeBlock}
-
-[Summary]
-
-${summaryBlock}
-
-[Recommendation]
-
-${recommendationBlock}
-
-[Simulation]
-
-${simulationBlock}`;
+		return renderMoReportText({
+			app: s.app,
+			command: s.command,
+			kv: s.kv,
+			d1: s.d1,
+			userLine: reportUserLine,
+			notesValue,
+			debugNotePrefix: debugNotePrefixStr,
+			debugKvListCount: debugKvListCountForSystem,
+			debugKvKeysSection,
+			strategyChangeBlock,
+			summaryBlock,
+			recommendationBlock,
+			simulationBlock,
+		});
 	  }
 	  // TODO: later commands
 	  // case "/help":
