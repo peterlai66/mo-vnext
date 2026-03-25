@@ -502,18 +502,50 @@ function parseStrategyNotifyStatusRecord(raw: string): StrategyNotifyStatusRecor
 	}
 }
 
+/** detail 為空時依 result 補上可讀說明，與 lastNotifyResult 對齊 */
+function normalizeStrategyNotifyReason(
+	result: StrategyNotifyResultLabel,
+	detail: string
+): string {
+	const t = detail.replace(/\s+/gu, " ").trim();
+	if (t !== "") return t;
+	switch (result) {
+		case "duplicate_message":
+			return "notify_body_matches_recorded_gate";
+		case "cooldown":
+			return "within_notify_cooldown_window";
+		case "in_progress":
+			return "parallel_notify_lock_active";
+		case "blocked_monthly_limit":
+			return "line_monthly_push_quota_exceeded";
+		case "success":
+			return "line_push_accepted";
+		case "failed":
+			return "line_push_request_failed";
+	}
+}
+
 function linePushOutcomeToStrategyNotifyStatus(
 	outcome: LinePushOutcome
 ): Pick<StrategyNotifyStatusRecord, "lastNotifyResult" | "lastNotifyReason"> {
 	switch (outcome.result) {
 		case "success":
-			return { lastNotifyResult: "success", lastNotifyReason: "" };
+			return {
+				lastNotifyResult: "success",
+				lastNotifyReason: normalizeStrategyNotifyReason("success", ""),
+			};
 		case "blocked_by_monthly_limit": {
 			const st =
 				outcome.httpStatus !== undefined ?
 					`status=${String(outcome.httpStatus)}`
 				:	"";
-			return { lastNotifyResult: "blocked_monthly_limit", lastNotifyReason: st };
+			return {
+				lastNotifyResult: "blocked_monthly_limit",
+				lastNotifyReason: normalizeStrategyNotifyReason(
+					"blocked_monthly_limit",
+					st
+				),
+			};
 		}
 		case "failed": {
 			const st =
@@ -526,11 +558,14 @@ function linePushOutcomeToStrategyNotifyStatus(
 			);
 			return {
 				lastNotifyResult: "failed",
-				lastNotifyReason: parts.join(" "),
+				lastNotifyReason: normalizeStrategyNotifyReason("failed", parts.join(" ")),
 			};
 		}
 		case "network_error":
-			return { lastNotifyResult: "failed", lastNotifyReason: "network_error" };
+			return {
+				lastNotifyResult: "failed",
+				lastNotifyReason: normalizeStrategyNotifyReason("failed", "network_error"),
+			};
 	}
 }
 
@@ -540,9 +575,10 @@ async function recordStrategyNotifyOutcomeForStatus(
 	result: StrategyNotifyResultLabel,
 	reason: string
 ): Promise<void> {
+	const lastNotifyReason = normalizeStrategyNotifyReason(result, reason);
 	const rec: StrategyNotifyStatusRecord = {
 		lastNotifyResult: result,
-		lastNotifyReason: reason,
+		lastNotifyReason,
 		lastNotifyAt: formatStatusPushAtTaipei(new Date()),
 	};
 	try {
@@ -649,10 +685,12 @@ async function formatLastPushStatusBlock(
 			"lastNotifyAt: none"
 		);
 	} else {
-		lines.push(`lastNotifyResult: ${n.lastNotifyResult}`);
-		lines.push(
-			`lastNotifyReason: ${n.lastNotifyReason === "" ? "none" : n.lastNotifyReason}`
+		const reasonForDisplay = normalizeStrategyNotifyReason(
+			n.lastNotifyResult,
+			n.lastNotifyReason
 		);
+		lines.push(`lastNotifyResult: ${n.lastNotifyResult}`);
+		lines.push(`lastNotifyReason: ${reasonForDisplay}`);
 		lines.push(`lastNotifyAt: ${n.lastNotifyAt}`);
 	}
 	if (r === null) {
