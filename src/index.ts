@@ -536,7 +536,16 @@ noteCount: ${s.noteCount}`;
 			:	0;
 		const activityBonus = totalNotesNum >= 10 ? 20 : 0;
 		const score = Math.min(100, baseScore + timeBonus + activityBonus);
+		let strategy: "aggressive" | "balanced" | "conservative";
+		if (score >= 80) {
+			strategy = "aggressive";
+		} else if (score >= 50) {
+			strategy = "balanced";
+		} else {
+			strategy = "conservative";
+		}
 		const recommendationBlock = `* score: ${score}
+* strategy: ${strategy}
 * status: ${recStatus}
 * reason: ${recReason}
 * action: ${recAction}`;
