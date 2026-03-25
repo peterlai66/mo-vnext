@@ -932,6 +932,14 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 			userId
 		);
 		const lastReportSummaryStatus = await formatLastReportSummaryStatusBlock(env, userId);
+		const formatSection = (title: string, block: string): string => {
+			const lines = block
+				.split(/\r?\n/u)
+				.map((l) => l.trim())
+				.filter((l) => l !== "");
+			if (lines.length === 0) return `[${title}]\n- none`;
+			return `[${title}]\n${lines.map((l) => `- ${l}`).join("\n")}`;
+		};
 		return `MO Status
 app: ${s.app}
 version: dev
@@ -940,9 +948,12 @@ kv: ${s.kv}
 d1: ${s.d1}
 user: ${statusUserLine}
 noteCount: ${s.noteCount}
-${lastPushBlock}
-${strategyDecisionStatus}
-${lastReportSummaryStatus}`;
+
+${formatSection("Push", lastPushBlock)}
+
+${formatSection("Decision", strategyDecisionStatus)}
+
+${formatSection("Report", lastReportSummaryStatus)}`;
 	  }
 	  case "/report": {
 		const s = await getSystemStatus(env, userId);
