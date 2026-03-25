@@ -567,6 +567,24 @@ noteCount: ${s.noteCount}`;
 * reason: ${simReason}
 * result: ${simResult}`;
 
+		let strategyChangeBlock: string;
+		if (!hasUserId) {
+			strategyChangeBlock = `* current: ${strategy}
+* previous: none
+* changed: no`;
+		} else {
+			const strategyKey = `strategy:${userId}`;
+			const prevRaw = await env.MO_NOTES.get(strategyKey, "text");
+			const prevTrim = prevRaw !== null ? prevRaw.trim() : "";
+			const previousDisplay = prevTrim === "" ? "none" : prevTrim;
+			const changed: "yes" | "no" =
+				prevTrim !== "" && prevTrim !== strategy ? "yes" : "no";
+			await env.MO_NOTES.put(strategyKey, strategy);
+			strategyChangeBlock = `* current: ${strategy}
+* previous: ${previousDisplay}
+* changed: ${changed}`;
+		}
+
 		return `MO Report
 
 [System]
@@ -578,6 +596,10 @@ noteCount: ${s.noteCount}`;
 * d1: ${s.d1}
 * user: ${s.user}
 * notes: ${notesValue}
+
+[Strategy]
+
+${strategyChangeBlock}
 
 [Summary]
 
