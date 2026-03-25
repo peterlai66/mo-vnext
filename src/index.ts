@@ -434,6 +434,43 @@ noteCount: ${s.noteCount}`;
 	  case "/report": {
 		const s = await getSystemStatus(env, userId);
 		const notesValue = s.noteCount === "error" ? 0 : s.noteCount;
+
+		const hasUserId = userId.trim() !== "";
+		let summaryRecentNotes: string;
+		if (!hasUserId) {
+			summaryRecentNotes = `* recentNotes:
+
+  no user`;
+		} else {
+			try {
+				const list = await env.MO_NOTES.list({
+					prefix: `note:${userId}:`,
+					limit: 3,
+				});
+				const keyNames = list.keys.map((k) => k.name);
+				if (keyNames.length === 0) {
+					summaryRecentNotes = `* recentNotes:
+
+  no notes`;
+				} else {
+					const lines = keyNames.map((name, i) => {
+						const simplified =
+							name.startsWith(`note:${userId}:`) ?
+								name.slice(`note:${userId}:`.length)
+							:	name;
+						return `  ${i + 1}. ${simplified}`;
+					});
+					summaryRecentNotes = `* recentNotes:
+
+${lines.join("\n")}`;
+				}
+			} catch {
+				summaryRecentNotes = `* recentNotes:
+
+  no notes`;
+			}
+		}
+
 		return `MO Report
 
 [System]
@@ -448,7 +485,7 @@ noteCount: ${s.noteCount}`;
 
 [Summary]
 
-（預留）
+${summaryRecentNotes}
 
 [Recommendation]
 
