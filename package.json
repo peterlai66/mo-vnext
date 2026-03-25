@@ -9,7 +9,7 @@
 		"test": "vitest",
 		"cf-typegen": "wrangler types",
 		"ac": "git add . && sh -c 'git commit -m \"${1:-chore: 提交變更}\"' --",
-		"ship": "npm run ac && git push && npm run deploy"
+		"ship": "sh -c 'if [ -n \"$1\" ]; then npm run ac -- \"$1\"; else npm run ac; fi && git push && npm run deploy' --"
 	},
 	"devDependencies": {
 		"@cloudflare/vitest-pool-workers": "^0.12.4",
