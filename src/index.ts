@@ -205,8 +205,43 @@ function summarizePushBodyForStatus(body: string | undefined, maxLen: number): s
 	return `${one.slice(0, maxLen)}…`;
 }
 
+const MO_USER_KV_PREFIX = {
+	lastPushNotify: "last_push_notify",
+	lastStrategyDecision: "last_strategy_decision",
+	lastReportSummary: "last_report_summary",
+} as const;
+
+const MO_STATUS_DEFAULT_BLOCK = {
+	lastPush: "lastPush: none",
+	decision: "decision: none",
+	report: "report: none",
+} as const;
+
+function hasMoStatusUserId(userId: string): boolean {
+	return userId.trim() !== "" && userId !== "unknown-user";
+}
+
+function buildMoUserKvKey(prefix: string, userId: string): string {
+	return `${prefix}:${userId}`;
+}
+
+async function readMoUserKvJson<T>(
+	env: Env,
+	userId: string,
+	key: string,
+	parse: (raw: string) => T | null
+): Promise<T | null> {
+	try {
+		const raw = await env.MO_NOTES.get(key, "text");
+		if (raw === null || raw.trim() === "") return null;
+		return parse(raw);
+	} catch {
+		return null;
+	}
+}
+
 function getLastPushNotifyKey(userId: string): string {
-	return `last_push_notify:${userId}`;
+	return buildMoUserKvKey(MO_USER_KV_PREFIX.lastPushNotify, userId);
 }
 
 function isLastPushDisplayKind(value: string): value is LastPushDisplayKind {
@@ -279,25 +314,23 @@ async function formatLastPushStatusBlock(
 	env: Env,
 	userId: string
 ): Promise<string> {
-	const hasUserId = userId.trim() !== "" && userId !== "unknown-user";
-	if (!hasUserId) return "lastPush: none";
-	try {
-		const raw = await env.MO_NOTES.get(getLastPushNotifyKey(userId), "text");
-		if (raw === null || raw.trim() === "") return "lastPush: none";
-		const r = parseLastPushNotifyRecord(raw);
-		if (r === null) return "lastPush: none";
-		const lines: string[] = [`lastPush: ${r.kind}`];
-		if (r.pushStatus !== undefined) {
-			lines.push(`pushStatus: ${r.pushStatus}`);
-		}
-		lines.push(`pushAt: ${r.pushAt}`);
-		if (r.pushBodySummary !== undefined && r.pushBodySummary !== "") {
-			lines.push(`pushBody: ${r.pushBodySummary}`);
-		}
-		return lines.join("\n");
-	} catch {
-		return "lastPush: none";
+	if (!hasMoStatusUserId(userId)) return MO_STATUS_DEFAULT_BLOCK.lastPush;
+	const r = await readMoUserKvJson(
+		env,
+		userId,
+		getLastPushNotifyKey(userId),
+		parseLastPushNotifyRecord
+	);
+	if (r === null) return MO_STATUS_DEFAULT_BLOCK.lastPush;
+	const lines: string[] = [`lastPush: ${r.kind}`];
+	if (r.pushStatus !== undefined) {
+		lines.push(`pushStatus: ${r.pushStatus}`);
 	}
+	lines.push(`pushAt: ${r.pushAt}`);
+	if (r.pushBodySummary !== undefined && r.pushBodySummary !== "") {
+		lines.push(`pushBody: ${r.pushBodySummary}`);
+	}
+	return lines.join("\n");
 }
 
 type StrategyDecisionRecord = {
@@ -308,7 +341,7 @@ type StrategyDecisionRecord = {
 };
 
 function getLastStrategyDecisionKey(userId: string): string {
-	return `last_strategy_decision:${userId}`;
+	return buildMoUserKvKey(MO_USER_KV_PREFIX.lastStrategyDecision, userId);
 }
 
 async function recordStrategyDecision(
@@ -346,20 +379,18 @@ async function formatLastStrategyDecisionStatusBlock(
 	env: Env,
 	userId: string
 ): Promise<string> {
-	const hasUserId = userId.trim() !== "" && userId !== "unknown-user";
-	if (!hasUserId) return "decision: none";
-	try {
-		const raw = await env.MO_NOTES.get(getLastStrategyDecisionKey(userId), "text");
-		if (raw === null || raw.trim() === "") return "decision: none";
-		const decision = parseStrategyDecisionRecord(raw);
-		if (decision === null) return "decision: none";
-		return `decisionChanged: ${decision.changed}
+	if (!hasMoStatusUserId(userId)) return MO_STATUS_DEFAULT_BLOCK.decision;
+	const decision = await readMoUserKvJson(
+		env,
+		userId,
+		getLastStrategyDecisionKey(userId),
+		parseStrategyDecisionRecord
+	);
+	if (decision === null) return MO_STATUS_DEFAULT_BLOCK.decision;
+	return `decisionChanged: ${decision.changed}
 shouldNotify: ${decision.shouldNotify}
 hasMessage: ${decision.hasMessage}
 decisionAt: ${decision.timestamp}`;
-	} catch {
-		return "decision: none";
-	}
 }
 
 type ReportSummaryRecord = {
@@ -375,7 +406,7 @@ type ReportSummaryRecord = {
 };
 
 function getLastReportSummaryKey(userId: string): string {
-	return `last_report_summary:${userId}`;
+	return buildMoUserKvKey(MO_USER_KV_PREFIX.lastReportSummary, userId);
 }
 
 async function recordLastReportSummary(
@@ -452,32 +483,30 @@ function parseReportSummaryRecord(raw: string): ReportSummaryRecord | null {
 }
 
 async function formatLastReportSummaryStatusBlock(env: Env, userId: string): Promise<string> {
-	const hasUserId = userId.trim() !== "" && userId !== "unknown-user";
-	if (!hasUserId) return "report: none";
-	try {
-		const raw = await env.MO_NOTES.get(getLastReportSummaryKey(userId), "text");
-		if (raw === null || raw.trim() === "") return "report: none";
-		const r = parseReportSummaryRecord(raw);
-		if (r === null) return "report: none";
-		const lines: string[] = [
-			`reportStrategy: ${r.currentStrategy}`,
-			`reportPrev: ${r.previousStrategy}`,
-			`reportChanged: ${r.changed}`,
-			`reportShouldNotify: ${r.shouldNotify}`,
-			`reportRec: ${r.recommendationStatus}`,
-		];
-		if (r.recommendationReason !== undefined) {
-			lines.push(`reportReason: ${r.recommendationReason}`);
-		}
-		lines.push(`reportSimReady: ${r.simulationReady ? "yes" : "no"}`);
-		if (r.simulationResult !== undefined) {
-			lines.push(`reportSimResult: ${r.simulationResult}`);
-		}
-		lines.push(`reportAt: ${r.timestamp}`);
-		return lines.join("\n");
-	} catch {
-		return "report: none";
+	if (!hasMoStatusUserId(userId)) return MO_STATUS_DEFAULT_BLOCK.report;
+	const r = await readMoUserKvJson(
+		env,
+		userId,
+		getLastReportSummaryKey(userId),
+		parseReportSummaryRecord
+	);
+	if (r === null) return MO_STATUS_DEFAULT_BLOCK.report;
+	const lines: string[] = [
+		`reportStrategy: ${r.currentStrategy}`,
+		`reportPrev: ${r.previousStrategy}`,
+		`reportChanged: ${r.changed}`,
+		`reportShouldNotify: ${r.shouldNotify}`,
+		`reportRec: ${r.recommendationStatus}`,
+	];
+	if (r.recommendationReason !== undefined) {
+		lines.push(`reportReason: ${r.recommendationReason}`);
 	}
+	lines.push(`reportSimReady: ${r.simulationReady ? "yes" : "no"}`);
+	if (r.simulationResult !== undefined) {
+		lines.push(`reportSimResult: ${r.simulationResult}`);
+	}
+	lines.push(`reportAt: ${r.timestamp}`);
+	return lines.join("\n");
 }
 
 type MoStatusState = {
