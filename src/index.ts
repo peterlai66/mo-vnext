@@ -210,10 +210,14 @@ const MO_USER_KV_PREFIX = {
 	lastStrategyDecision: "last_strategy_decision",
 	lastReportSummary: "last_report_summary",
 	lastStrategyNotifyGate: "last_strategy_notify_gate",
+	strategyNotifyLock: "strategy_notify_lock",
 } as const;
 
 /** 正式 strategy notify：兩次推播嘗試最短間隔（毫秒） */
 const STRATEGY_NOTIFY_COOLDOWN_MS = 10 * 60 * 1000;
+
+/** notify 併發鎖租約（毫秒）；應涵蓋 push 往返時間，逾時由 KV expiration 回收 */
+const STRATEGY_NOTIFY_LOCK_LEASE_MS = 3 * 60 * 1000;
 
 type StrategyNotifyGateRecord = {
 	lastNotifyMessage: string;
@@ -222,6 +226,33 @@ type StrategyNotifyGateRecord = {
 
 function getStrategyNotifyGateKey(userId: string): string {
 	return buildMoUserKvKey(MO_USER_KV_PREFIX.lastStrategyNotifyGate, userId);
+}
+
+function getStrategyNotifyLockKey(userId: string): string {
+	return buildMoUserKvKey(MO_USER_KV_PREFIX.strategyNotifyLock, userId);
+}
+
+type StrategyNotifyLockRecord = {
+	token: string;
+	until: number;
+};
+
+function parseStrategyNotifyLockRecord(raw: string): StrategyNotifyLockRecord | null {
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (typeof parsed !== "object" || parsed === null) return null;
+		if (!("token" in parsed) || typeof parsed.token !== "string") return null;
+		if (
+			!("until" in parsed) ||
+			typeof parsed.until !== "number" ||
+			!Number.isFinite(parsed.until)
+		) {
+			return null;
+		}
+		return { token: parsed.token, until: parsed.until };
+	} catch {
+		return null;
+	}
 }
 
 function parseStrategyNotifyGateRecord(raw: string): StrategyNotifyGateRecord | null {
@@ -258,6 +289,15 @@ type MoNotesGetTextWithCacheTtl = {
 	): Promise<string | null>;
 };
 
+type MoNotesKvPutExpiry = {
+	put(
+		key: string,
+		value: string,
+		options: { expirationTtl: number }
+	): Promise<void>;
+	delete(key: string): Promise<void>;
+};
+
 /**
  * 讀取 strategy notify gate；cacheTtl: 0 略過 KV edge 快取，避免連續請求讀到過期快照而略過冷卻／去重。
  */
@@ -274,6 +314,59 @@ async function readStrategyNotifyGateFromKv(
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * 以 KV 租約 + token 驗證取得同一 user 的 notify 互斥；失敗表示已有流程進行中或競態落敗。
+ */
+async function acquireStrategyNotifyLock(
+	env: Env,
+	userId: string
+): Promise<{ release: () => Promise<void> } | null> {
+	const lockKey = getStrategyNotifyLockKey(userId);
+	const kv = env.MO_NOTES as unknown as MoNotesGetTextWithCacheTtl;
+	const kvRw = env.MO_NOTES as unknown as MoNotesKvPutExpiry;
+	const now = Date.now();
+	const existingRaw = await kv.get(lockKey, { type: "text", cacheTtl: 0 });
+	if (existingRaw !== null && existingRaw.trim() !== "") {
+		const existing = parseStrategyNotifyLockRecord(existingRaw);
+		if (existing !== null && existing.until > now) {
+			return null;
+		}
+	}
+	const token = crypto.randomUUID();
+	const until = now + STRATEGY_NOTIFY_LOCK_LEASE_MS;
+	const payload = JSON.stringify({ token, until });
+	const expSec = Math.ceil(STRATEGY_NOTIFY_LOCK_LEASE_MS / 1000) + 120;
+	try {
+		await kvRw.put(lockKey, payload, { expirationTtl: expSec });
+	} catch {
+		return null;
+	}
+	const verifyRaw = await kv.get(lockKey, { type: "text", cacheTtl: 0 });
+	const verified =
+		verifyRaw !== null && verifyRaw.trim() !== "" ?
+			parseStrategyNotifyLockRecord(verifyRaw)
+		:	null;
+	if (verified === null || verified.token !== token) {
+		return null;
+	}
+	const release = async (): Promise<void> => {
+		try {
+			const curRaw = await kv.get(lockKey, { type: "text", cacheTtl: 0 });
+			const cur =
+				curRaw !== null && curRaw.trim() !== "" ?
+					parseStrategyNotifyLockRecord(curRaw)
+				:	null;
+			if (cur !== null && cur.token === token) {
+				await kvRw.delete(lockKey);
+			}
+		} catch {
+			// 釋放失敗不阻擋；租約仍會由 expirationTtl 回收
+		}
+		console.log("[notify] lock released", { userId });
+	};
+	return { release };
 }
 
 async function recordStrategyNotifyGateAttempt(
@@ -1372,57 +1465,67 @@ ${notifyMessageLine}`;
 				console.log("[notify] skipped: hasMessage=false", { userId });
 			} else {
 				const notifyBody = strategyNotifyPushBody;
-				const gate = await readStrategyNotifyGateFromKv(env, userId);
-				const nowMs = Date.now();
-				if (gate !== null && gate.lastNotifyMessage === notifyBody) {
-					console.log("[notify] skipped: duplicate_message", { userId });
-				} else if (
-					gate !== null &&
-					nowMs - gate.lastNotifyAt < STRATEGY_NOTIFY_COOLDOWN_MS
-				) {
-					console.log("[notify] skipped: cooldown", {
-						userId,
-						elapsedMs: nowMs - gate.lastNotifyAt,
-						cooldownMs: STRATEGY_NOTIFY_COOLDOWN_MS,
-					});
+				const lockSlot = await acquireStrategyNotifyLock(env, userId);
+				if (lockSlot === null) {
+					console.log("[notify] skipped: in_progress", { userId });
 				} else {
-					console.log("[notify] start", { userId });
-					await recordStrategyNotifyGateAttempt(
-						env,
-						userId,
-						notifyBody,
-						nowMs
-					);
-					const notifyPush = await lineBotPushTextMessage(
-						env,
-						userId,
-						notifyBody
-					);
-					await recordLinePushOutcomeForStatus(env, userId, notifyPush);
-					switch (notifyPush.result) {
-						case "success":
-							console.log("[notify] done", { userId });
-							break;
-						case "blocked_by_monthly_limit":
-							console.log("[notify] blocked_monthly_limit", {
+					console.log("[notify] lock acquired", { userId });
+					try {
+						const gate = await readStrategyNotifyGateFromKv(env, userId);
+						const nowMs = Date.now();
+						if (gate !== null && gate.lastNotifyMessage === notifyBody) {
+							console.log("[notify] skipped: duplicate_message", { userId });
+						} else if (
+							gate !== null &&
+							nowMs - gate.lastNotifyAt < STRATEGY_NOTIFY_COOLDOWN_MS
+						) {
+							console.log("[notify] skipped: cooldown", {
 								userId,
-								status: notifyPush.httpStatus,
-								body: notifyPush.httpBody,
+								elapsedMs: nowMs - gate.lastNotifyAt,
+								cooldownMs: STRATEGY_NOTIFY_COOLDOWN_MS,
 							});
-							break;
-						case "failed":
-							console.log("[notify] failed", {
+						} else {
+							console.log("[notify] start", { userId });
+							await recordStrategyNotifyGateAttempt(
+								env,
 								userId,
-								status: notifyPush.httpStatus,
-								body: notifyPush.httpBody,
-							});
-							break;
-						case "network_error":
-							console.log("[notify] failed", {
+								notifyBody,
+								nowMs
+							);
+							const notifyPush = await lineBotPushTextMessage(
+								env,
 								userId,
-								reason: "network_error",
-							});
-							break;
+								notifyBody
+							);
+							await recordLinePushOutcomeForStatus(env, userId, notifyPush);
+							switch (notifyPush.result) {
+								case "success":
+									console.log("[notify] done", { userId });
+									break;
+								case "blocked_by_monthly_limit":
+									console.log("[notify] blocked_monthly_limit", {
+										userId,
+										status: notifyPush.httpStatus,
+										body: notifyPush.httpBody,
+									});
+									break;
+								case "failed":
+									console.log("[notify] failed", {
+										userId,
+										status: notifyPush.httpStatus,
+										body: notifyPush.httpBody,
+									});
+									break;
+								case "network_error":
+									console.log("[notify] failed", {
+										userId,
+										reason: "network_error",
+									});
+									break;
+							}
+						}
+					} finally {
+						await lockSlot.release();
 					}
 				}
 			}
