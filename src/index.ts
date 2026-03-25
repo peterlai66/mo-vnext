@@ -250,6 +250,32 @@ function parseStrategyNotifyGateRecord(raw: string): StrategyNotifyGateRecord | 
 	}
 }
 
+/** 與 Workers KV 執行期一致；部分 Env 型別僅含 get(key, "text") overload。 */
+type MoNotesGetTextWithCacheTtl = {
+	get(
+		key: string,
+		options: { type: "text"; cacheTtl: number }
+	): Promise<string | null>;
+};
+
+/**
+ * 讀取 strategy notify gate；cacheTtl: 0 略過 KV edge 快取，避免連續請求讀到過期快照而略過冷卻／去重。
+ */
+async function readStrategyNotifyGateFromKv(
+	env: Env,
+	userId: string
+): Promise<StrategyNotifyGateRecord | null> {
+	try {
+		const gateKey = getStrategyNotifyGateKey(userId);
+		const kv = env.MO_NOTES as unknown as MoNotesGetTextWithCacheTtl;
+		const raw = await kv.get(gateKey, { type: "text", cacheTtl: 0 });
+		if (raw === null || raw.trim() === "") return null;
+		return parseStrategyNotifyGateRecord(raw);
+	} catch {
+		return null;
+	}
+}
+
 async function recordStrategyNotifyGateAttempt(
 	env: Env,
 	userId: string,
@@ -265,6 +291,7 @@ async function recordStrategyNotifyGateAttempt(
 			getStrategyNotifyGateKey(userId),
 			JSON.stringify(rec)
 		);
+		console.log("[notify] cache updated", { userId });
 	} catch {
 		// gate 寫入失敗不阻擋 notify 主流程
 	}
@@ -1345,13 +1372,7 @@ ${notifyMessageLine}`;
 				console.log("[notify] skipped: hasMessage=false", { userId });
 			} else {
 				const notifyBody = strategyNotifyPushBody;
-				const gateKey = getStrategyNotifyGateKey(userId);
-				const gate = await readMoUserKvJson(
-					env,
-					userId,
-					gateKey,
-					parseStrategyNotifyGateRecord
-				);
+				const gate = await readStrategyNotifyGateFromKv(env, userId);
 				const nowMs = Date.now();
 				if (gate !== null && gate.lastNotifyMessage === notifyBody) {
 					console.log("[notify] skipped: duplicate_message", { userId });
@@ -1366,16 +1387,16 @@ ${notifyMessageLine}`;
 					});
 				} else {
 					console.log("[notify] start", { userId });
-					const notifyPush = await lineBotPushTextMessage(
-						env,
-						userId,
-						notifyBody
-					);
 					await recordStrategyNotifyGateAttempt(
 						env,
 						userId,
 						notifyBody,
-						Date.now()
+						nowMs
+					);
+					const notifyPush = await lineBotPushTextMessage(
+						env,
+						userId,
+						notifyBody
 					);
 					await recordLinePushOutcomeForStatus(env, userId, notifyPush);
 					switch (notifyPush.result) {
