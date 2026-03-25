@@ -1360,7 +1360,7 @@ async function getReplyText(
   };
   
   export default {
-	async fetch(request: Request, env: Env): Promise<Response> {
+	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		debugLog(env, "[fetch] hit");
 		debugLog(env, "[fetch] path", new URL(request.url).pathname);
 		const url = new URL(request.url);
@@ -1378,73 +1378,78 @@ async function getReplyText(
 		debugLog(env, "[line webhook] eventCount:", events.length);
 
 		for (const event of events) {
-		  if (event.type === "message") {
-			debugLog(env, "[line webhook] message event, event.type:", event.type);
-		  }
-		  if (
-			event.type === "message" &&
-			event.message?.type === "text" &&
-			event.replyToken
-		  ) {
-			debugLog(env, "[line webhook] text message:", event.message.text ?? "");
-			const userId = event.source?.userId ?? "unknown-user";
-			const replyText = await getReplyText(event.message.text, env, userId);
-			const response = await fetch("https://api.line.me/v2/bot/message/reply", {
-			  method: "POST",
-			  headers: {
-				"Content-Type": "application/json",
-				Authorization: `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN}`,
-			  },
-			  body: JSON.stringify({
-				replyToken: event.replyToken,
-				messages: [
-				  {
-					type: "text",
-					text: replyText,
-				  },
-				],
-			  }),
-			});
-			debugLog(env, "[line reply] status", response.status);
-			debugLog(env, "[line reply] ok", response.ok);
-			debugLog(env, "[line reply] body", await response.text());
-
-			const pushTestCmd = extractCommand(event.message.text ?? "");
-			if (
-				pushTestCmd === "/push-test" &&
-				userId.trim() !== "" &&
-				userId !== "unknown-user"
-			) {
-				const pushTestOutcome = await lineBotPushTextMessage(
-					env,
-					userId,
-					"PUSH TEST OK"
-				);
-				await recordLinePushOutcomeForStatus(env, userId, pushTestOutcome);
-				switch (pushTestOutcome.result) {
-					case "success":
-						console.log("[push-test] success");
-						break;
-					case "blocked_by_monthly_limit":
-						console.log("[push-test] blocked by monthly limit", {
-							userId,
-							status: pushTestOutcome.httpStatus,
-							body: pushTestOutcome.httpBody,
-						});
-						break;
-					case "failed":
-						console.log("[push-test] failed", {
-							userId,
-							status: pushTestOutcome.httpStatus,
-							body: pushTestOutcome.httpBody,
-						});
-						break;
-					case "network_error":
-						console.log("[push-test] failed", { userId, reason: "network_error" });
-						break;
-				}
+			if (event.type === "message") {
+				debugLog(env, "[line webhook] message event, event.type:", event.type);
 			}
-		  }
+			if (
+				event.type === "message" &&
+				event.message?.type === "text" &&
+				event.replyToken
+			) {
+				// 重要：盡快回 200，避免 webhook request 因耗時而被取消（Canceled）
+				ctx.waitUntil(
+					(async () => {
+						debugLog(env, "[line webhook] text message:", event.message?.text ?? "");
+						const userId = event.source?.userId ?? "unknown-user";
+						const replyText = await getReplyText(event.message?.text, env, userId);
+						const response = await fetch("https://api.line.me/v2/bot/message/reply", {
+							method: "POST",
+							headers: {
+								"Content-Type": "application/json",
+								Authorization: `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN}`,
+							},
+							body: JSON.stringify({
+								replyToken: event.replyToken,
+								messages: [
+									{
+										type: "text",
+										text: replyText,
+									},
+								],
+							}),
+						});
+						debugLog(env, "[line reply] status", response.status);
+						debugLog(env, "[line reply] ok", response.ok);
+						debugLog(env, "[line reply] body", await response.text());
+
+						const pushTestCmd = extractCommand(event.message?.text ?? "");
+						if (
+							pushTestCmd === "/push-test" &&
+							userId.trim() !== "" &&
+							userId !== "unknown-user"
+						) {
+							const pushTestOutcome = await lineBotPushTextMessage(
+								env,
+								userId,
+								"PUSH TEST OK"
+							);
+							await recordLinePushOutcomeForStatus(env, userId, pushTestOutcome);
+							switch (pushTestOutcome.result) {
+								case "success":
+									console.log("[push-test] success");
+									break;
+								case "blocked_by_monthly_limit":
+									console.log("[push-test] blocked by monthly limit", {
+										userId,
+										status: pushTestOutcome.httpStatus,
+										body: pushTestOutcome.httpBody,
+									});
+									break;
+								case "failed":
+									console.log("[push-test] failed", {
+										userId,
+										status: pushTestOutcome.httpStatus,
+										body: pushTestOutcome.httpBody,
+									});
+									break;
+								case "network_error":
+									console.log("[push-test] failed", { userId, reason: "network_error" });
+									break;
+							}
+						}
+					})()
+				);
+			}
 		}
   
 		return new Response(
