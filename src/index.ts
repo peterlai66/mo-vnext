@@ -239,6 +239,68 @@ function formatLastPushStatusBlock(): string {
 	return lines.join("\n");
 }
 
+type StrategyDecisionRecord = {
+	changed: boolean;
+	shouldNotify: boolean;
+	hasMessage: boolean;
+	timestamp: string;
+};
+
+function getLastStrategyDecisionKey(userId: string): string {
+	return `last_strategy_decision:${userId}`;
+}
+
+async function recordStrategyDecision(
+	env: Env,
+	userId: string,
+	decision: StrategyDecisionRecord
+): Promise<void> {
+	try {
+		await env.MO_NOTES.put(getLastStrategyDecisionKey(userId), JSON.stringify(decision));
+	} catch {
+		// decision 記錄失敗不影響 /report 主流程
+	}
+}
+
+function parseStrategyDecisionRecord(raw: string): StrategyDecisionRecord | null {
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (typeof parsed !== "object" || parsed === null) return null;
+		if (!("changed" in parsed) || typeof parsed.changed !== "boolean") return null;
+		if (!("shouldNotify" in parsed) || typeof parsed.shouldNotify !== "boolean") return null;
+		if (!("hasMessage" in parsed) || typeof parsed.hasMessage !== "boolean") return null;
+		if (!("timestamp" in parsed) || typeof parsed.timestamp !== "string") return null;
+		return {
+			changed: parsed.changed,
+			shouldNotify: parsed.shouldNotify,
+			hasMessage: parsed.hasMessage,
+			timestamp: parsed.timestamp,
+		};
+	} catch {
+		return null;
+	}
+}
+
+async function formatLastStrategyDecisionStatusBlock(
+	env: Env,
+	userId: string
+): Promise<string> {
+	const hasUserId = userId.trim() !== "" && userId !== "unknown-user";
+	if (!hasUserId) return "decision: none";
+	try {
+		const raw = await env.MO_NOTES.get(getLastStrategyDecisionKey(userId), "text");
+		if (raw === null || raw.trim() === "") return "decision: none";
+		const decision = parseStrategyDecisionRecord(raw);
+		if (decision === null) return "decision: none";
+		return `decisionChanged: ${decision.changed}
+shouldNotify: ${decision.shouldNotify}
+hasMessage: ${decision.hasMessage}
+decisionAt: ${decision.timestamp}`;
+	} catch {
+		return "decision: none";
+	}
+}
+
 function extractNoteContent(storedValue: string): string {
 	try {
 		const parsed: unknown = JSON.parse(storedValue);
@@ -628,6 +690,10 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 	  case "/status": {
 		const s = await getSystemStatus(env, userId);
 		const statusUserLine = s.user === "ok" ? `ok (${userId})` : "none";
+		const strategyDecisionStatus = await formatLastStrategyDecisionStatusBlock(
+			env,
+			userId
+		);
 		return `MO Status
 app: ${s.app}
 version: dev
@@ -636,7 +702,8 @@ kv: ${s.kv}
 d1: ${s.d1}
 user: ${statusUserLine}
 noteCount: ${s.noteCount}
-${formatLastPushStatusBlock()}`;
+${formatLastPushStatusBlock()}
+${strategyDecisionStatus}`;
 	  }
 	  case "/report": {
 		const s = await getSystemStatus(env, userId);
@@ -783,6 +850,13 @@ current: ${strategy}
 score: ${score}
 action: ${recAction}`;
 			}
+			const strategyDecision: StrategyDecisionRecord = {
+				changed: changed === "yes",
+				shouldNotify: shouldNotify === "yes",
+				hasMessage: strategyNotifyPushBody !== null,
+				timestamp: formatStatusPushAtTaipei(new Date()),
+			};
+			await recordStrategyDecision(env, userId, strategyDecision);
 			strategyChangeBlock = `* current: ${strategy}
 * previous: ${previousDisplay}
 * changed: ${changed}
