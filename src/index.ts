@@ -1293,6 +1293,9 @@ function extractCommand(messageText: string): string | null {
 	if (messageText === "/strategy-candidate-clone-active") return "/strategy-candidate-clone-active";
 	if (messageText === "/strategy-candidate-set-balanced30") return "/strategy-candidate-set-balanced30";
 	if (messageText === "/strategy-candidate-set-balanced20") return "/strategy-candidate-set-balanced20";
+	if (/^\/strategy-candidate-patch(?:\s+|$)/u.test(messageText)) {
+		return "/strategy-candidate-patch";
+	}
 	if (messageText === "/debug-strategy-change") return "/debug-strategy-change";
 	if (/^\/note(?:\s+|$)/.test(messageText)) return "/note";
 	return /^\/[A-Za-z0-9_]+$/.test(messageText) ? messageText : null;
@@ -2722,6 +2725,106 @@ activeConfigVersion: ${active.config.configVersion}
 candidateConfigVersion: ${updated.configVersion}
 result: updated
 updatedField: balancedMinScore=20`;
+	  }
+	  case "/strategy-candidate-patch": {
+		const active = await readActiveStrategyConfig(env);
+		const candidate = await readCandidateStrategyConfig(env);
+		if (candidate === null) {
+			return `MO Strategy Candidate Patch
+
+activeConfigVersion: ${active.config.configVersion}
+candidateConfigVersion: (none)
+result: failed
+reason: candidate config not found`;
+		}
+
+		const args = messageText
+			.slice("/strategy-candidate-patch".length)
+			.trim()
+			.split(/\s+/u)
+			.filter((s) => s !== "");
+		const field = args[0] ?? "";
+		const valueRaw = args[1] ?? "";
+		if (field === "" || valueRaw === "") {
+			return `MO Strategy Candidate Patch
+
+activeConfigVersion: ${active.config.configVersion}
+candidateConfigVersion: ${candidate.configVersion}
+result: failed
+reason: usage: /strategy-candidate-patch <field> <number>`;
+		}
+		const valueNum = Number(valueRaw);
+		if (!Number.isFinite(valueNum)) {
+			return `MO Strategy Candidate Patch
+
+activeConfigVersion: ${active.config.configVersion}
+candidateConfigVersion: ${candidate.configVersion}
+result: failed
+reason: invalid number`;
+		}
+
+		const nowIso = new Date().toISOString();
+		let updated: StrategyActiveConfig;
+		switch (field) {
+			case "balancedMinScore":
+				updated = { ...candidate, balancedMinScore: Math.round(valueNum), updatedAt: nowIso };
+				break;
+			case "aggressiveMinScore":
+				updated = { ...candidate, aggressiveMinScore: Math.round(valueNum), updatedAt: nowIso };
+				break;
+			case "freshnessWeight":
+				updated = { ...candidate, freshnessWeight: valueNum, updatedAt: nowIso };
+				break;
+			case "volumeWeight":
+				updated = { ...candidate, volumeWeight: valueNum, updatedAt: nowIso };
+				break;
+			case "simulationWeight":
+				updated = { ...candidate, simulationWeight: valueNum, updatedAt: nowIso };
+				break;
+			case "freshnessIdleThresholdMs":
+				updated = { ...candidate, freshnessIdleThresholdMs: Math.round(valueNum), updatedAt: nowIso };
+				break;
+			default:
+				return `MO Strategy Candidate Patch
+
+activeConfigVersion: ${active.config.configVersion}
+candidateConfigVersion: ${candidate.configVersion}
+result: failed
+reason: unsupported field`;
+		}
+
+		await env.MO_NOTES.put(
+			MO_CANDIDATE_STRATEGY_CONFIG_KEY,
+			JSON.stringify(updated)
+		);
+		console.log("[strategy] candidate field patched", {
+			candidateConfigVersion: updated.configVersion,
+			field,
+			value: updated[field as keyof StrategyActiveConfig],
+		});
+
+		// 最小同步：把 review state 拉回 reviewing，避免沿用舊狀態
+		try {
+			const s = await readStrategyReviewState(env);
+			if (s !== null) {
+				await writeStrategyReviewState(env, {
+					...s,
+					reviewStatus: "reviewing",
+					lastReviewedAt: nowIso,
+					note: `candidate field updated: ${field}`,
+				});
+			}
+		} catch {
+			// ignore
+		}
+
+		return `MO Strategy Candidate Patch
+
+activeConfigVersion: ${active.config.configVersion}
+candidateConfigVersion: ${updated.configVersion}
+result: updated
+updatedField: ${field}
+updatedValue: ${String(valueNum)}`;
 	  }
 	  case "/strategy-promote-candidate": {
 		const [active, candidate, state, decision] = await Promise.all([
