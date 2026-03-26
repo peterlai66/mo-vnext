@@ -1469,6 +1469,18 @@ async function readActiveStrategyConfig(
 	}
 }
 
+async function readCandidateStrategyConfig(
+	env: Env
+): Promise<StrategyActiveConfig | null> {
+	try {
+		const raw = await env.MO_NOTES.get(MO_CANDIDATE_STRATEGY_CONFIG_KEY, "text");
+		if (raw === null || raw.trim() === "") return null;
+		return parseStrategyActiveConfigRecord(raw);
+	} catch {
+		return null;
+	}
+}
+
 function isStrategyReviewStatus(v: string): v is StrategyReviewStatus {
 	return v === "none" || v === "reviewing" || v === "ready" || v === "promoted";
 }
@@ -1663,7 +1675,10 @@ reviewStatus: ${reviewState.reviewStatus}`;
 reviewKey: ${MO_STRATEGY_REVIEW_STATE_KEY}
 reviewState: none`;
 		}
-		return `MO Strategy Review Debug
+		const active = await readActiveStrategyConfig(env);
+		const candidate = await readCandidateStrategyConfig(env);
+		if (candidate === null) {
+			return `MO Strategy Review Debug
 
 reviewKey: ${MO_STRATEGY_REVIEW_STATE_KEY}
 activeConfigVersion: ${s.activeConfigVersion}
@@ -1672,6 +1687,30 @@ reviewStatus: ${s.reviewStatus}
 reviewStartedAt: ${s.reviewStartedAt}
 lastReviewedAt: ${s.lastReviewedAt}
 note: ${s.note}`;
+		}
+		console.log("[strategy] review debug diff", {
+			activeConfigVersion: active.config.configVersion,
+			candidateConfigVersion: candidate.configVersion,
+		});
+		const a = active.config;
+		const c = candidate;
+		return `MO Strategy Review Debug
+
+reviewKey: ${MO_STRATEGY_REVIEW_STATE_KEY}
+activeConfigVersion: ${s.activeConfigVersion}
+candidateConfigVersion: ${s.candidateConfigVersion}
+reviewStatus: ${s.reviewStatus}
+reviewStartedAt: ${s.reviewStartedAt}
+lastReviewedAt: ${s.lastReviewedAt}
+note: ${s.note}
+
+[Diff]
+freshnessWeight: active=${a.freshnessWeight} candidate=${c.freshnessWeight}
+volumeWeight: active=${a.volumeWeight} candidate=${c.volumeWeight}
+simulationWeight: active=${a.simulationWeight} candidate=${c.simulationWeight}
+aggressiveMinScore: active=${a.aggressiveMinScore} candidate=${c.aggressiveMinScore}
+balancedMinScore: active=${a.balancedMinScore} candidate=${c.balancedMinScore}
+freshnessIdleThresholdMs: active=${a.freshnessIdleThresholdMs} candidate=${c.freshnessIdleThresholdMs}`;
 	  }
 	  case "/debug-strategy-change": {
 		const hasLineUser =
