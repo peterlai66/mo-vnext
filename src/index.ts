@@ -1348,6 +1348,7 @@ type StrategyReviewResult = {
 
 type StrategyReviewDecisionLabel =
 	| "keep_active"
+	| "hold_review"
 	| "candidate_watch"
 	| "candidate_promising"
 	| "candidate_reject"
@@ -1633,6 +1634,7 @@ function parseStrategyReviewDecisionRecord(raw: string): StrategyReviewDecisionR
 		const decision = obj.decision;
 		if (
 			decision !== "keep_active" &&
+			decision !== "hold_review" &&
 			decision !== "candidate_watch" &&
 			decision !== "candidate_promising" &&
 			decision !== "candidate_reject" &&
@@ -1692,34 +1694,81 @@ type StrategyCurrentSnapshot = {
 function computeStrategyReviewDecision(params: {
 	snapshot: StrategyCurrentSnapshot;
 	activeConfig: StrategyActiveConfig;
+	candidateConfig: StrategyActiveConfig | null;
+	reviewState: StrategyReviewState | null;
+	reviewResult: StrategyReviewResult | null;
 }): { decision: StrategyReviewDecisionLabel; reason: string } {
 	const s = params.snapshot;
 	const cfg = params.activeConfig;
+	const candidate = params.candidateConfig;
+	const reviewState = params.reviewState;
+	const reviewResult = params.reviewResult;
+
+	// 0) 必要 review 資料不足：先 hold_review（不做任何 promotion）
+	if (candidate === null || reviewState === null || reviewResult === null) {
+		return {
+			decision: "hold_review",
+			reason: "缺少必要 review 資料，暫不評估 promotion",
+		};
+	}
 
 	// A
 	if (s.dataFreshnessScore === 0 && s.status === "idle") {
 		return { decision: "keep_active", reason: "資料過舊，不適合評估 candidate" };
 	}
 
-	// C（優先於 B）
-	if (s.score >= cfg.aggressiveMinScore && s.simulationReadyScore >= 80) {
+	// 1) active / candidate 差異不足：hold_review 或 keep_active
+	const diffs: string[] = [];
+	const addDiff = (k: string, a: number, b: number): void => {
+		if (a !== b) diffs.push(k);
+	};
+	addDiff("freshnessWeight", cfg.freshnessWeight, candidate.freshnessWeight);
+	addDiff("volumeWeight", cfg.volumeWeight, candidate.volumeWeight);
+	addDiff("simulationWeight", cfg.simulationWeight, candidate.simulationWeight);
+	addDiff("aggressiveMinScore", cfg.aggressiveMinScore, candidate.aggressiveMinScore);
+	addDiff("balancedMinScore", cfg.balancedMinScore, candidate.balancedMinScore);
+	addDiff(
+		"freshnessIdleThresholdMs",
+		cfg.freshnessIdleThresholdMs,
+		candidate.freshnessIdleThresholdMs
+	);
+	if (diffs.length === 0) {
 		return {
-			decision: "candidate_promising",
-			reason: "良好條件下具潛力，可納入候選觀察",
+			decision: "hold_review",
+			reason: "active 與 candidate 幾乎無差異，暫不評估 promotion",
 		};
 	}
 
-	// B
-	if (s.score >= cfg.balancedMinScore && s.dataVolumeScore >= 80) {
-		return { decision: "candidate_watch", reason: "資料充足，可持續觀察 candidate" };
+	// 2) 若 compareDecision 仍是 keep_active：先 hold_review（沿用 review 結果，不做平行決策）
+	if (reviewResult.compareDecision === "keep_active") {
+		const why =
+			reviewResult.compareReason.trim() === "" ?
+				"review_result 建議 keep_active"
+			:	`review_result: ${reviewResult.compareReason.trim()}`;
+		return { decision: "hold_review", reason: why };
 	}
 
-	// D
+	// 3) score 明顯偏低：keep_active
 	if (s.score < cfg.balancedMinScore) {
-		return { decision: "candidate_reject", reason: "策略表現不足" };
+		return { decision: "keep_active", reason: "score 偏低，先維持 active" };
 	}
 
-	return { decision: "keep_active", reason: "條件不足，先維持 active" };
+	// 4) promotion 條件（deterministic、保守）：資料夠新 + review 完整 + 差異明確 + 條件良好
+	const hasGoodData = s.dataVolumeScore >= 80 && s.simulationReadyScore >= 80;
+	const hasGoodScore = s.score >= cfg.aggressiveMinScore || s.score >= cfg.balancedMinScore;
+	const hasClearDiff = diffs.length >= 2;
+	if (s.status === "active" && hasGoodData && hasGoodScore && hasClearDiff) {
+		return {
+			decision: "promote_candidate",
+			reason: `條件良好且差異明確，可人工確認 promotion（diff: ${diffs.join(", ")}）`,
+		};
+	}
+
+	// 5) 其他：hold_review（可持續觀察）
+	return {
+		decision: "hold_review",
+		reason: `資料或條件不足，先觀察（diff: ${diffs.join(", ")}）`,
+	};
 }
 
 async function computeAndRecordStrategyReviewDecision(params: {
@@ -1727,9 +1776,18 @@ async function computeAndRecordStrategyReviewDecision(params: {
 	activeConfig: StrategyActiveConfig;
 	snapshot: StrategyCurrentSnapshot;
 }): Promise<void> {
+	// decision 規則只依賴現有資料；讀取失敗不阻擋主流程
+	const [candidate, reviewState, reviewResult] = await Promise.all([
+		readCandidateStrategyConfig(params.env),
+		readStrategyReviewState(params.env),
+		readStrategyReviewResult(params.env),
+	]);
 	const r = computeStrategyReviewDecision({
 		snapshot: params.snapshot,
 		activeConfig: params.activeConfig,
+		candidateConfig: candidate,
+		reviewState,
+		reviewResult,
 	});
 	const rec: StrategyReviewDecisionRecord = {
 		decision: r.decision,
