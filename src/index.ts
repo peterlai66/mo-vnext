@@ -1337,7 +1337,7 @@ type StrategyReviewState = {
 	note: string;
 };
 
-type StrategyCompareDecision = "keep_active" | "promote_candidate";
+type StrategyCompareDecision = "keep_active" | "hold_review" | "promote_candidate";
 
 type StrategyReviewResult = {
 	activeConfigVersion: string;
@@ -1580,7 +1580,7 @@ async function writeStrategyReviewState(env: Env, state: StrategyReviewState): P
 }
 
 function isStrategyCompareDecision(v: string): v is StrategyCompareDecision {
-	return v === "keep_active" || v === "promote_candidate";
+	return v === "keep_active" || v === "hold_review" || v === "promote_candidate";
 }
 
 function parseStrategyReviewResultRecord(raw: string): StrategyReviewResult | null {
@@ -1828,11 +1828,11 @@ function computeStrategyReviewDecision(params: {
 		};
 	}
 
-	// 2) 若 compareDecision 仍是 keep_active：先 hold_review（沿用 review 結果，不做平行決策）
-	if (reviewResult.compareDecision === "keep_active") {
+	// 2) 若 compareDecision 不是 promote_candidate：先 hold_review（沿用 review 結果，不做平行決策）
+	if (reviewResult.compareDecision !== "promote_candidate") {
 		const why =
 			reviewResult.compareReason.trim() === "" ?
-				"review_result 建議 keep_active"
+				`review_result: ${reviewResult.compareDecision}`
 			:	`review_result: ${reviewResult.compareReason.trim()}`;
 		return { decision: "hold_review", reason: why };
 	}
@@ -2294,13 +2294,35 @@ reason: candidate_strategy_config 或 strategy_review_state 不存在`;
 			diffs.push("freshnessIdleThresholdMs");
 		}
 
-		const compareDecision: StrategyCompareDecision = "keep_active";
-		const compareReason =
-			diffs.length === 0 ?
-				"no_config_diff"
-			:	`candidate changes: ${diffs.join(", ")}`;
-		const compareSummary =
-			diffs.length === 0 ? "active and candidate are identical" : "active vs candidate differ";
+		const demoOverrideForCompare = await readStrategyReviewDemoOverride(env);
+		const isDemoStrong =
+			demoOverrideForCompare !== null &&
+			demoOverrideForCompare.status === "active" &&
+			demoOverrideForCompare.dataFreshnessScore >= 80 &&
+			demoOverrideForCompare.dataVolumeScore >= 80 &&
+			demoOverrideForCompare.simulationReadyScore >= 80;
+
+		let compareDecision: StrategyCompareDecision;
+		let compareReason: string;
+		let compareSummary: string;
+		if (diffs.length === 0) {
+			compareDecision = "keep_active";
+			compareReason = "no_material_diff";
+			compareSummary = "active vs candidate same";
+		} else if (isDemoStrong) {
+			compareDecision = "promote_candidate";
+			compareReason = `candidate changes validated under demo review conditions: ${diffs.join(", ")}`;
+			compareSummary = "candidate validated for promotion";
+		} else {
+			compareDecision = "hold_review";
+			compareReason = `candidate changes but review conditions not strong enough: ${diffs.join(", ")}`;
+			compareSummary = "active vs candidate differ";
+		}
+		console.log("[strategy] review compare computed", {
+			compareDecision,
+			compareReason,
+			demoOverride: demoOverrideForCompare === null ? "off" : "on",
+		});
 
 		const nowIso = new Date().toISOString();
 		const result: StrategyReviewResult = {
