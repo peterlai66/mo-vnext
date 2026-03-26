@@ -1296,6 +1296,144 @@ function pickForcedStrategyForReportTest(
 	return "balanced";
 }
 
+type StrategyActiveConfig = {
+	freshnessWeight: number;
+	volumeWeight: number;
+	simulationWeight: number;
+	aggressiveMinScore: number;
+	balancedMinScore: number;
+	freshnessIdleThresholdMs: number;
+	configVersion: string;
+	updatedAt: string;
+};
+
+const MO_ACTIVE_STRATEGY_CONFIG_KEY = "active_strategy_config";
+
+function getDefaultStrategyActiveConfig(): StrategyActiveConfig {
+	return {
+		freshnessWeight: 0.5,
+		volumeWeight: 0.35,
+		simulationWeight: 0.15,
+		aggressiveMinScore: 80,
+		balancedMinScore: 60,
+		freshnessIdleThresholdMs: 24 * 60 * 60 * 1000,
+		configVersion: "default-v1",
+		updatedAt: "",
+	};
+}
+
+function parseStrategyActiveConfigRecord(
+	raw: string
+): StrategyActiveConfig | null {
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (typeof parsed !== "object" || parsed === null) return null;
+
+		const getNum = (k: string): number | null => {
+			if (!(k in parsed)) return null;
+			const v = (parsed as Record<string, unknown>)[k];
+			return typeof v === "number" && Number.isFinite(v) ? v : null;
+		};
+		const getStr = (k: string): string | null => {
+			if (!(k in parsed)) return null;
+			const v = (parsed as Record<string, unknown>)[k];
+			return typeof v === "string" ? v : null;
+		};
+
+		const freshnessWeight = getNum("freshnessWeight");
+		const volumeWeight = getNum("volumeWeight");
+		const simulationWeight = getNum("simulationWeight");
+		const aggressiveMinScore = getNum("aggressiveMinScore");
+		const balancedMinScore = getNum("balancedMinScore");
+		const freshnessIdleThresholdMs = getNum("freshnessIdleThresholdMs");
+		const configVersion = getStr("configVersion");
+		const updatedAt = getStr("updatedAt");
+
+		if (
+			freshnessWeight === null ||
+			volumeWeight === null ||
+			simulationWeight === null ||
+			aggressiveMinScore === null ||
+			balancedMinScore === null ||
+			freshnessIdleThresholdMs === null ||
+			configVersion === null ||
+			updatedAt === null
+		) {
+			return null;
+		}
+		if (freshnessIdleThresholdMs <= 0) return null;
+		if (balancedMinScore < 0 || aggressiveMinScore < 0) return null;
+		if (balancedMinScore > aggressiveMinScore) return null;
+		if (
+			freshnessWeight < 0 ||
+			volumeWeight < 0 ||
+			simulationWeight < 0
+		) {
+			return null;
+		}
+		return {
+			freshnessWeight,
+			volumeWeight,
+			simulationWeight,
+			aggressiveMinScore,
+			balancedMinScore,
+			freshnessIdleThresholdMs,
+			configVersion,
+			updatedAt,
+		};
+	} catch {
+		return null;
+	}
+}
+
+async function readActiveStrategyConfig(
+	env: Env
+): Promise<{ config: StrategyActiveConfig; source: "kv" | "default" }> {
+	const defaultConfig = getDefaultStrategyActiveConfig();
+	try {
+		const raw = await env.MO_NOTES.get(MO_ACTIVE_STRATEGY_CONFIG_KEY, "text");
+		if (raw === null || raw.trim() === "") {
+			console.log("[strategy] config source", {
+				source: "default",
+				key: MO_ACTIVE_STRATEGY_CONFIG_KEY,
+			});
+			console.log("[strategy] config loaded", {
+				configVersion: defaultConfig.configVersion,
+			});
+			return { config: defaultConfig, source: "default" };
+		}
+		const parsed = parseStrategyActiveConfigRecord(raw);
+		if (parsed === null) {
+			console.log("[strategy] config source", {
+				source: "default_invalid",
+				key: MO_ACTIVE_STRATEGY_CONFIG_KEY,
+			});
+			console.log("[strategy] config loaded", {
+				configVersion: defaultConfig.configVersion,
+			});
+			return { config: defaultConfig, source: "default" };
+		}
+		console.log("[strategy] config source", {
+			source: "kv",
+			key: MO_ACTIVE_STRATEGY_CONFIG_KEY,
+		});
+		console.log("[strategy] config loaded", {
+			configVersion: parsed.configVersion,
+			updatedAt: parsed.updatedAt,
+		});
+		return { config: parsed, source: "kv" };
+	} catch {
+		console.log("[strategy] config source", {
+			source: "default",
+			key: MO_ACTIVE_STRATEGY_CONFIG_KEY,
+		});
+		console.log("[strategy] config loaded", {
+			configVersion: defaultConfig.configVersion,
+		});
+		return { config: defaultConfig, source: "default" };
+	}
+}
+
 async function getSystemStatus(env: Env, userId: string): Promise<SystemStatus> {
 	let d1Label: "ok" | "error" = "error";
 	try {
@@ -1548,31 +1686,51 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 			}
 		}
 
-		const twentyFourHoursMs = 24 * 60 * 60 * 1000;
-		// 第一版可解釋策略規則：三因子加權
-		const deltaMs = latestNoteMs === null ? Number.POSITIVE_INFINITY : Date.now() - latestNoteMs;
-		const dataFreshnessGood = latestNoteMs !== null && deltaMs <= twentyFourHoursMs;
+		const activeStrategyConfigResult = await readActiveStrategyConfig(env);
+		const activeStrategyConfig = activeStrategyConfigResult.config;
+		const freshnessIdleThresholdMs = activeStrategyConfig.freshnessIdleThresholdMs;
+
+		// 第一版可解釋策略規則：三因子加權（參數來源：active strategy config）
+		const deltaMs =
+			latestNoteMs === null ? Number.POSITIVE_INFINITY : Date.now() - latestNoteMs;
 		// dataFreshnessScore: 0~100（0=過久未更新；100=剛更新）
 		const dataFreshnessScore =
-			latestNoteMs === null || deltaMs >= twentyFourHoursMs ?
+			latestNoteMs === null || deltaMs >= freshnessIdleThresholdMs ?
 				0
-			:	Math.round((1 - deltaMs / twentyFourHoursMs) * 100);
+			:	Math.round((1 - deltaMs / freshnessIdleThresholdMs) * 100);
 		// dataVolumeScore: 0~100（0=無資料；>=10 筆視為滿分）
 		const dataVolumeScore = Math.round(Math.min(1, totalNotesNum / 10) * 100);
 		// simulationReadyScore: 0~100（有資料即可進行模擬）
 		const simulationReadyScore = totalNotesNum > 0 ? 100 : 0;
+		const weightSum =
+			activeStrategyConfig.freshnessWeight +
+			activeStrategyConfig.volumeWeight +
+			activeStrategyConfig.simulationWeight;
+		const fallback = getDefaultStrategyActiveConfig();
+		const freshnessWeight =
+			weightSum > 0 ? activeStrategyConfig.freshnessWeight / weightSum : fallback.freshnessWeight;
+		const volumeWeight =
+			weightSum > 0 ? activeStrategyConfig.volumeWeight / weightSum : fallback.volumeWeight;
+		const simulationWeight =
+			weightSum > 0 ? activeStrategyConfig.simulationWeight / weightSum : fallback.simulationWeight;
+
 		const scoreRaw =
-			dataFreshnessScore * 0.5 +
-			dataVolumeScore * 0.35 +
-			simulationReadyScore * 0.15;
+			dataFreshnessScore * freshnessWeight +
+			dataVolumeScore * volumeWeight +
+			simulationReadyScore * simulationWeight;
 		const score = Math.max(0, Math.min(100, Math.round(scoreRaw)));
 
 		console.log("[strategy] inputs", {
+			configVersion: activeStrategyConfig.configVersion,
 			dataFreshnessScore,
 			dataVolumeScore,
 			simulationReadyScore,
 			totalNotesNum,
 			deltaMs,
+			freshnessIdleThresholdMs,
+			freshnessWeight,
+			volumeWeight,
+			simulationWeight,
 		});
 
 		let recStatus: "active" | "idle";
@@ -1580,10 +1738,10 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 		if (latestNoteMs === null) {
 			recStatus = "idle";
 			recReason = "尚無資料";
-		} else if (deltaMs > twentyFourHoursMs) {
+		} else if (deltaMs > freshnessIdleThresholdMs) {
 			recStatus = "idle";
 			recReason = "長時間未更新";
-		} else if (!dataFreshnessGood || simulationReadyScore === 0) {
+		} else if (simulationReadyScore === 0) {
 			recStatus = "idle";
 			recReason = "無資料可模擬";
 		} else {
@@ -1599,15 +1757,20 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 			recAction = "建議新增第一筆資料";
 		}
 		let strategy: "aggressive" | "balanced" | "conservative";
-		if (score >= 80) {
+		if (score >= activeStrategyConfig.aggressiveMinScore) {
 			strategy = "aggressive";
-		} else if (score >= 60) {
+		} else if (score >= activeStrategyConfig.balancedMinScore) {
 			strategy = "balanced";
 		} else {
 			strategy = "conservative";
 		}
 		const strategyFromScore = strategy;
-		console.log("[strategy] score result", { score, strategy: strategyFromScore });
+		console.log("[strategy] score result", {
+			score,
+			strategy: strategyFromScore,
+			aggressiveMinScore: activeStrategyConfig.aggressiveMinScore,
+			balancedMinScore: activeStrategyConfig.balancedMinScore,
+		});
 		let prevTrimForReport = "";
 		// 測試模式覆寫（/report-test-change only）集中在此：確保正式 /report 不受影響
 		let testForceChangedFromEmptyPrevious = false;
