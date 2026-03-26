@@ -1693,6 +1693,9 @@ reason: ${params.currentSnapshot.reason}
 - 結合 [CurrentStatus] 解釋這樣的變化在目前資料狀態下可能造成的影響
 - 解釋為什麼目前 decision 是 keep_active（若 compareDecision 缺失，改用『目前結果未產生，先維持 active』）`;
 
+	const prompt = `SYSTEM:\n${systemPrompt}\n\nUSER:\n${userPrompt}`;
+	console.log("[strategy] review explain prompt", prompt);
+
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), params.timeoutMs);
 	try {
