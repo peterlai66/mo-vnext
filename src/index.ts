@@ -1286,6 +1286,7 @@ function extractCommand(messageText: string): string | null {
 	if (messageText === "/strategy-review-run-demo") return "/strategy-review-run-demo";
 	if (messageText === "/strategy-review-explain") return "/strategy-review-explain";
 	if (messageText === "/strategy-review-debug") return "/strategy-review-debug";
+	if (messageText === "/strategy-review-decision") return "/strategy-review-decision";
 	if (messageText === "/debug-strategy-change") return "/debug-strategy-change";
 	if (/^\/note(?:\s+|$)/.test(messageText)) return "/note";
 	return /^\/[A-Za-z0-9_]+$/.test(messageText) ? messageText : null;
@@ -1319,6 +1320,7 @@ const MO_ACTIVE_STRATEGY_CONFIG_KEY = "active_strategy_config";
 const MO_CANDIDATE_STRATEGY_CONFIG_KEY = "candidate_strategy_config";
 const MO_STRATEGY_REVIEW_STATE_KEY = "strategy_review_state";
 const MO_STRATEGY_REVIEW_RESULT_KEY = "strategy_review_result";
+const MO_STRATEGY_REVIEW_DECISION_KEY = "strategy_review_decision";
 
 type StrategyReviewStatus = "none" | "reviewing" | "ready" | "promoted";
 
@@ -1341,6 +1343,18 @@ type StrategyReviewResult = {
 	compareDecision: StrategyCompareDecision;
 	compareReason: string;
 	note: string;
+};
+
+type StrategyReviewDecisionLabel =
+	| "keep_active"
+	| "candidate_watch"
+	| "candidate_promising"
+	| "candidate_reject";
+
+type StrategyReviewDecisionRecord = {
+	decision: StrategyReviewDecisionLabel;
+	reason: string;
+	evaluatedAt: string;
 };
 
 function getDefaultStrategyActiveConfig(): StrategyActiveConfig {
@@ -1605,6 +1619,123 @@ async function writeStrategyReviewResult(env: Env, result: StrategyReviewResult)
 	} catch {
 		// scaffold：寫入失敗不影響主流程
 	}
+}
+
+function parseStrategyReviewDecisionRecord(raw: string): StrategyReviewDecisionRecord | null {
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (typeof parsed !== "object" || parsed === null) return null;
+		const obj = parsed as Record<string, unknown>;
+		if (typeof obj.decision !== "string") return null;
+		const decision = obj.decision;
+		if (
+			decision !== "keep_active" &&
+			decision !== "candidate_watch" &&
+			decision !== "candidate_promising" &&
+			decision !== "candidate_reject"
+		) {
+			return null;
+		}
+		if (typeof obj.reason !== "string") return null;
+		if (typeof obj.evaluatedAt !== "string") return null;
+		return {
+			decision,
+			reason: obj.reason,
+			evaluatedAt: obj.evaluatedAt,
+		};
+	} catch {
+		return null;
+	}
+}
+
+async function readStrategyReviewDecision(
+	env: Env
+): Promise<StrategyReviewDecisionRecord | null> {
+	try {
+		const raw = await env.MO_NOTES.get(MO_STRATEGY_REVIEW_DECISION_KEY, "text");
+		if (raw === null || raw.trim() === "") return null;
+		return parseStrategyReviewDecisionRecord(raw);
+	} catch {
+		return null;
+	}
+}
+
+async function writeStrategyReviewDecision(
+	env: Env,
+	record: StrategyReviewDecisionRecord
+): Promise<void> {
+	try {
+		await env.MO_NOTES.put(
+			MO_STRATEGY_REVIEW_DECISION_KEY,
+			JSON.stringify(record)
+		);
+	} catch {
+		// scaffold：寫入失敗不影響主流程
+	}
+}
+
+type StrategyCurrentSnapshot = {
+	dataFreshnessScore: number;
+	dataVolumeScore: number;
+	simulationReadyScore: number;
+	score: number;
+	strategy: "aggressive" | "balanced" | "conservative";
+	status: "active" | "idle";
+	reason: string;
+};
+
+function computeStrategyReviewDecision(params: {
+	snapshot: StrategyCurrentSnapshot;
+	activeConfig: StrategyActiveConfig;
+}): { decision: StrategyReviewDecisionLabel; reason: string } {
+	const s = params.snapshot;
+	const cfg = params.activeConfig;
+
+	// A
+	if (s.dataFreshnessScore === 0 && s.status === "idle") {
+		return { decision: "keep_active", reason: "資料過舊，不適合評估 candidate" };
+	}
+
+	// C（優先於 B）
+	if (s.score >= cfg.aggressiveMinScore && s.simulationReadyScore >= 80) {
+		return {
+			decision: "candidate_promising",
+			reason: "良好條件下具潛力，可納入候選觀察",
+		};
+	}
+
+	// B
+	if (s.score >= cfg.balancedMinScore && s.dataVolumeScore >= 80) {
+		return { decision: "candidate_watch", reason: "資料充足，可持續觀察 candidate" };
+	}
+
+	// D
+	if (s.score < cfg.balancedMinScore) {
+		return { decision: "candidate_reject", reason: "策略表現不足" };
+	}
+
+	return { decision: "keep_active", reason: "條件不足，先維持 active" };
+}
+
+async function computeAndRecordStrategyReviewDecision(params: {
+	env: Env;
+	activeConfig: StrategyActiveConfig;
+	snapshot: StrategyCurrentSnapshot;
+}): Promise<void> {
+	const r = computeStrategyReviewDecision({
+		snapshot: params.snapshot,
+		activeConfig: params.activeConfig,
+	});
+	const rec: StrategyReviewDecisionRecord = {
+		decision: r.decision,
+		reason: r.reason,
+		evaluatedAt: formatStatusPushAtTaipei(new Date()),
+	};
+	console.log("[strategy] review decision computed", {
+		decision: rec.decision,
+		reason: rec.reason,
+	});
+	await writeStrategyReviewDecision(params.env, rec);
 }
 
 type StrategyReviewExplainAiFailureReason =
@@ -2038,12 +2169,111 @@ reason: candidate_strategy_config 或 strategy_review_state 不存在`;
 		};
 		await writeStrategyReviewState(env, nextState);
 
+		// 同步更新 decision（僅記錄，不做 promotion）
+		const snapshot: StrategyCurrentSnapshot = {
+			dataFreshnessScore: 0,
+			dataVolumeScore: 0,
+			simulationReadyScore: 0,
+			score: 0,
+			strategy: "conservative",
+			status: "idle",
+			reason: "尚無資料",
+		};
+		try {
+			// 嘗試用目前 user 的資料狀態計算（與 explain 相同方向，失敗則維持預設）
+			const s2 = await getSystemStatus(env, userId);
+			const totalNotesNum = s2.noteCount === "error" ? 0 : s2.noteCount;
+			let latestNoteMs: number | null = null;
+			if (userId.trim() !== "" && userId !== "unknown-user") {
+				const list = await env.MO_NOTES.list({ prefix: `note:${userId}:`, limit: 20 });
+				const keyNames = list.keys.map((k) => k.name);
+				if (keyNames.length > 0) {
+					const sorted = [...keyNames].sort(
+						(a, b) => parseTimestampFromKey(b) - parseTimestampFromKey(a)
+					);
+					const latestName = sorted[0];
+					const tail =
+						latestName.startsWith(`note:${userId}:`) ?
+							latestName.slice(`note:${userId}:`.length)
+						:	latestName.split(":").pop() ?? latestName;
+					const ts = Number(tail);
+					if (Number.isFinite(ts)) latestNoteMs = ts;
+				}
+			}
+			const cfg = active.config;
+			const deltaMs =
+				latestNoteMs === null ? Number.POSITIVE_INFINITY : Date.now() - latestNoteMs;
+			const dataFreshnessScore =
+				latestNoteMs === null || deltaMs >= cfg.freshnessIdleThresholdMs ?
+					0
+				:	Math.round((1 - deltaMs / cfg.freshnessIdleThresholdMs) * 100);
+			const dataVolumeScore = Math.round(Math.min(1, totalNotesNum / 10) * 100);
+			const simulationReadyScore = totalNotesNum > 0 ? 100 : 0;
+			const weightSum = cfg.freshnessWeight + cfg.volumeWeight + cfg.simulationWeight;
+			const fallback = getDefaultStrategyActiveConfig();
+			const fw = weightSum > 0 ? cfg.freshnessWeight / weightSum : fallback.freshnessWeight;
+			const vw = weightSum > 0 ? cfg.volumeWeight / weightSum : fallback.volumeWeight;
+			const sw =
+				weightSum > 0 ? cfg.simulationWeight / weightSum : fallback.simulationWeight;
+			const scoreRaw =
+				dataFreshnessScore * fw + dataVolumeScore * vw + simulationReadyScore * sw;
+			const score = Math.max(0, Math.min(100, Math.round(scoreRaw)));
+			let strategy: "aggressive" | "balanced" | "conservative";
+			if (score >= cfg.aggressiveMinScore) strategy = "aggressive";
+			else if (score >= cfg.balancedMinScore) strategy = "balanced";
+			else strategy = "conservative";
+			let status: "active" | "idle";
+			let reason: string;
+			if (latestNoteMs === null) {
+				status = "idle";
+				reason = "尚無資料";
+			} else if (deltaMs > cfg.freshnessIdleThresholdMs) {
+				status = "idle";
+				reason = "長時間未更新";
+			} else if (simulationReadyScore === 0) {
+				status = "idle";
+				reason = "無資料可模擬";
+			} else {
+				status = "active";
+				reason = "近期有活動";
+			}
+			snapshot.dataFreshnessScore = dataFreshnessScore;
+			snapshot.dataVolumeScore = dataVolumeScore;
+			snapshot.simulationReadyScore = simulationReadyScore;
+			snapshot.score = score;
+			snapshot.strategy = strategy;
+			snapshot.status = status;
+			snapshot.reason = reason;
+		} catch {
+			// ignore
+		}
+		await computeAndRecordStrategyReviewDecision({
+			env,
+			activeConfig: active.config,
+			snapshot,
+		});
+
 		return `MO Strategy Review Run Demo
 
 reviewResultKey: ${MO_STRATEGY_REVIEW_RESULT_KEY}
 comparedAt: ${result.comparedAt}
 compareDecision: ${result.compareDecision}
 compareReason: ${result.compareReason}`;
+	  }
+	  case "/strategy-review-decision": {
+		const d = await readStrategyReviewDecision(env);
+		if (d === null) {
+			return `MO Strategy Review Decision
+
+decision: none
+reason: none
+evaluatedAt: none`;
+		}
+		return `MO Strategy Review Decision
+
+decision: ${d.decision}
+reason: ${d.reason}
+evaluatedAt: ${d.evaluatedAt}`;
 	  }
 	  case "/strategy-review-explain": {
 		console.log("[strategy] review explain start");
@@ -2557,6 +2787,20 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 			strategy: strategyFromScore,
 			aggressiveMinScore: activeStrategyConfig.aggressiveMinScore,
 			balancedMinScore: activeStrategyConfig.balancedMinScore,
+		});
+		// 每次 /report 都更新 strategy review decision（僅記錄，不做 promotion）
+		await computeAndRecordStrategyReviewDecision({
+			env,
+			activeConfig: activeStrategyConfig,
+			snapshot: {
+				dataFreshnessScore,
+				dataVolumeScore,
+				simulationReadyScore,
+				score,
+				strategy: strategyFromScore,
+				status: recStatus,
+				reason: recReason,
+			},
 		});
 		let prevTrimForReport = "";
 		// 測試模式覆寫（/report-test-change only）集中在此：確保正式 /report 不受影響
