@@ -3013,6 +3013,7 @@ at: ${at}`;
 promotedFrom: ${active.config.configVersion}
 promotedTo: ${candidate.configVersion}
 result: not_promoted
+decisionSource: ${decision.decisionSource ?? "unknown"}
 reason: current decision is not promote_candidate
 at: ${at}`;
 		}
@@ -3050,12 +3051,20 @@ at: ${at}`;
 		// promotion 後收尾：清除 demo override，避免污染後續測試
 		await clearStrategyReviewDemoOverride(env);
 
+		console.log("[strategy] promotion decision source", {
+			source: decision.decisionSource ?? "unknown",
+		});
+		const warningLine =
+			decision.decisionSource === "demo" ?
+				"\nwarning: promotion is based on demo review"
+			:	"";
 		return `MO Strategy Promote Candidate
 
 promotedFrom: ${active.config.configVersion}
 promotedTo: ${promotedActive.configVersion}
 result: promoted
 decisionSource: ${decision.decisionSource ?? "unknown"}
+${warningLine}
 at: ${at}`;
 	  }
 	  case "/strategy-review-explain": {
