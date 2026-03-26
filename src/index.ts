@@ -1675,8 +1675,8 @@ async function generateStrategyReviewExplainAi(params: {
 	}
 
 	const systemPrompt =
-		"你是 MO vNext 的策略審查解釋層。請用繁體中文輸出 2~4 行，必須是「分析」而不是「描述」。只做解釋，不要提出新的決策或修改設定。禁止使用『調整了部分』這種模糊措辭；必須至少點名一個具體欄位（例如 freshnessWeight）。";
-	const userPrompt = `請根據以下資料解釋策略 review：
+		"你是 MO vNext 的策略審查解釋層。請用繁體中文輸出 2~4 行，用「分析」語氣。只做解釋，不要提出新決策或修改設定。禁止用模糊措辭（例如：調整了部分）；必須至少點名一個具體欄位（例如 freshnessWeight）。";
+	const userPrompt = `請分析以下策略 review（不要描述，要解讀）：
 
 [Active]
 configVersion: ${params.active.configVersion}
@@ -1684,15 +1684,9 @@ configVersion: ${params.active.configVersion}
 [Candidate]
 configVersion: ${params.candidate?.configVersion ?? "(none)"}
 
-[ReviewState]
-activeConfigVersion: ${params.reviewState?.activeConfigVersion ?? "(none)"}
-candidateConfigVersion: ${params.reviewState?.candidateConfigVersion ?? "(none)"}
-reviewStatus: ${params.reviewState?.reviewStatus ?? "(none)"}
-
 [ReviewResult]
 compareDecision: ${params.reviewResult?.compareDecision ?? "(none)"}
 compareReason: ${params.reviewResult?.compareReason ?? "(none)"}
-compareSummary: ${params.reviewResult?.compareSummary ?? "(none)"}
 
 [Diff]
 ${diffLines.join("\n")}
@@ -1700,8 +1694,6 @@ ${diffLines.join("\n")}
 ${params.currentSnapshot === null ? "" : `[CurrentStatus]
 dataFreshnessScore: ${params.currentSnapshot.dataFreshnessScore}
 dataVolumeScore: ${params.currentSnapshot.dataVolumeScore}
-simulationReadyScore: ${params.currentSnapshot.simulationReadyScore}
-score: ${params.currentSnapshot.score}
 strategy: ${params.currentSnapshot.strategy}
 status: ${params.currentSnapshot.status}
 reason: ${params.currentSnapshot.reason}
@@ -2110,7 +2102,7 @@ compareReason: ${result.compareReason}`;
 			reviewResult: result,
 			currentSnapshot,
 			env,
-			timeoutMs: 1200,
+			timeoutMs: 2500,
 		});
 
 		if (ai.ok) {
