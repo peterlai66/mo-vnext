@@ -1612,33 +1612,49 @@ async function generateStrategyReviewExplainAi(params: {
 	candidate: StrategyActiveConfig | null;
 	reviewState: StrategyReviewState | null;
 	reviewResult: StrategyReviewResult | null;
+	currentSnapshot:
+		| {
+				dataFreshnessScore: number;
+				dataVolumeScore: number;
+				simulationReadyScore: number;
+				score: number;
+				strategy: "aggressive" | "balanced" | "conservative";
+				status: "active" | "idle";
+				reason: string;
+		  }
+		| null;
 	env: Env;
 	timeoutMs: number;
 }): Promise<string | null> {
 	const diffLines: string[] = [];
-	if (params.candidate !== null) {
-		const a = params.active;
-		const c = params.candidate;
-		diffLines.push(`freshnessWeight: active=${a.freshnessWeight} candidate=${c.freshnessWeight}`);
-		diffLines.push(`volumeWeight: active=${a.volumeWeight} candidate=${c.volumeWeight}`);
-		diffLines.push(
-			`simulationWeight: active=${a.simulationWeight} candidate=${c.simulationWeight}`
-		);
-		diffLines.push(
-			`aggressiveMinScore: active=${a.aggressiveMinScore} candidate=${c.aggressiveMinScore}`
-		);
-		diffLines.push(
-			`balancedMinScore: active=${a.balancedMinScore} candidate=${c.balancedMinScore}`
-		);
-		diffLines.push(
-			`freshnessIdleThresholdMs: active=${a.freshnessIdleThresholdMs} candidate=${c.freshnessIdleThresholdMs}`
-		);
+	const a = params.active;
+	const c = params.candidate;
+	const arrow = (from: number, to: number): string => `${String(from)} → ${String(to)}`;
+	if (c === null) {
+		diffLines.push("- candidate: (missing)");
 	} else {
-		diffLines.push("(candidate missing)");
+		const addIfChanged = (name: string, from: number, to: number): void => {
+			if (from === to) return;
+			diffLines.push(`- ${name}: ${arrow(from, to)}`);
+		};
+		addIfChanged("freshnessWeight", a.freshnessWeight, c.freshnessWeight);
+		addIfChanged("volumeWeight", a.volumeWeight, c.volumeWeight);
+		addIfChanged("simulationWeight", a.simulationWeight, c.simulationWeight);
+		addIfChanged("aggressiveMinScore", a.aggressiveMinScore, c.aggressiveMinScore);
+		addIfChanged("balancedMinScore", a.balancedMinScore, c.balancedMinScore);
+		addIfChanged(
+			"freshnessIdleThresholdMs",
+			a.freshnessIdleThresholdMs,
+			c.freshnessIdleThresholdMs
+		);
+		if (diffLines.length === 0) {
+			// 仍需至少提到一個具體欄位名稱，避免輸出模糊
+			diffLines.push(`- freshnessWeight: ${arrow(a.freshnessWeight, c.freshnessWeight)}`);
+		}
 	}
 
 	const systemPrompt =
-		"你是 MO vNext 的策略審查解釋層。請用繁體中文輸出 2~4 行，重點清楚、不要廢話。只做解釋，不要提出新的決策或修改設定。";
+		"你是 MO vNext 的策略審查解釋層。請用繁體中文輸出 2~4 行，必須是「分析」而不是「描述」。只做解釋，不要提出新的決策或修改設定。禁止使用『調整了部分』這種模糊措辭；必須至少點名一個具體欄位（例如 freshnessWeight）。";
 	const userPrompt = `請根據以下資料解釋策略 review：
 
 [Active]
@@ -1660,11 +1676,22 @@ compareSummary: ${params.reviewResult?.compareSummary ?? "(none)"}
 [Diff]
 ${diffLines.join("\n")}
 
+${params.currentSnapshot === null ? "" : `[CurrentStatus]
+dataFreshnessScore: ${params.currentSnapshot.dataFreshnessScore}
+dataVolumeScore: ${params.currentSnapshot.dataVolumeScore}
+simulationReadyScore: ${params.currentSnapshot.simulationReadyScore}
+score: ${params.currentSnapshot.score}
+strategy: ${params.currentSnapshot.strategy}
+status: ${params.currentSnapshot.status}
+reason: ${params.currentSnapshot.reason}
+`}
+
 輸出要求：
 - 2~4 行繁體中文
-- 說明 candidate 改了什麼
-- 說明為什麼目前 decision 是 keep_active（或目前 result 缺失時用保守說法）
-- 提到整體策略傾向（偏重 freshness / volume / 門檻的方向）`;
+- 明確指出 candidate 改了哪些欄位（直接引用 [Diff] 的欄位名，不要泛用詞）
+- 解讀方向（更積極/更保守，或更偏 freshness/volume/門檻）
+- 結合 [CurrentStatus] 解釋這樣的變化在目前資料狀態下可能造成的影響
+- 解釋為什麼目前 decision 是 keep_active（若 compareDecision 缺失，改用『目前結果未產生，先維持 active』）`;
 
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), params.timeoutMs);
@@ -1903,11 +1930,96 @@ compareReason: ${result.compareReason}`;
 			readStrategyReviewResult(env),
 		]);
 
+		let currentSnapshot:
+			| {
+					dataFreshnessScore: number;
+					dataVolumeScore: number;
+					simulationReadyScore: number;
+					score: number;
+					strategy: "aggressive" | "balanced" | "conservative";
+					status: "active" | "idle";
+					reason: string;
+			  }
+			| null = null;
+		try {
+			const s = await getSystemStatus(env, userId);
+			const totalNotesNum = s.noteCount === "error" ? 0 : s.noteCount;
+			let latestNoteMs: number | null = null;
+			if (userId.trim() !== "" && userId !== "unknown-user") {
+				const list = await env.MO_NOTES.list({
+					prefix: `note:${userId}:`,
+					limit: 20,
+				});
+				const keyNames = list.keys.map((k) => k.name);
+				if (keyNames.length > 0) {
+					const sorted = [...keyNames].sort(
+						(a, b) => parseTimestampFromKey(b) - parseTimestampFromKey(a)
+					);
+					const latestName = sorted[0];
+					const tail =
+						latestName.startsWith(`note:${userId}:`) ?
+							latestName.slice(`note:${userId}:`.length)
+						:	latestName.split(":").pop() ?? latestName;
+					const ts = Number(tail);
+					if (Number.isFinite(ts)) latestNoteMs = ts;
+				}
+			}
+			const cfg = active.config;
+			const deltaMs =
+				latestNoteMs === null ? Number.POSITIVE_INFINITY : Date.now() - latestNoteMs;
+			const dataFreshnessScore =
+				latestNoteMs === null || deltaMs >= cfg.freshnessIdleThresholdMs ?
+					0
+				:	Math.round((1 - deltaMs / cfg.freshnessIdleThresholdMs) * 100);
+			const dataVolumeScore = Math.round(Math.min(1, totalNotesNum / 10) * 100);
+			const simulationReadyScore = totalNotesNum > 0 ? 100 : 0;
+			const weightSum = cfg.freshnessWeight + cfg.volumeWeight + cfg.simulationWeight;
+			const fallback = getDefaultStrategyActiveConfig();
+			const fw = weightSum > 0 ? cfg.freshnessWeight / weightSum : fallback.freshnessWeight;
+			const vw = weightSum > 0 ? cfg.volumeWeight / weightSum : fallback.volumeWeight;
+			const sw =
+				weightSum > 0 ? cfg.simulationWeight / weightSum : fallback.simulationWeight;
+			const scoreRaw =
+				dataFreshnessScore * fw + dataVolumeScore * vw + simulationReadyScore * sw;
+			const score = Math.max(0, Math.min(100, Math.round(scoreRaw)));
+			let strategy: "aggressive" | "balanced" | "conservative";
+			if (score >= cfg.aggressiveMinScore) strategy = "aggressive";
+			else if (score >= cfg.balancedMinScore) strategy = "balanced";
+			else strategy = "conservative";
+			let status: "active" | "idle";
+			let reason: string;
+			if (latestNoteMs === null) {
+				status = "idle";
+				reason = "尚無資料";
+			} else if (deltaMs > cfg.freshnessIdleThresholdMs) {
+				status = "idle";
+				reason = "長時間未更新";
+			} else if (simulationReadyScore === 0) {
+				status = "idle";
+				reason = "無資料可模擬";
+			} else {
+				status = "active";
+				reason = "近期有活動";
+			}
+			currentSnapshot = {
+				dataFreshnessScore,
+				dataVolumeScore,
+				simulationReadyScore,
+				score,
+				strategy,
+				status,
+				reason,
+			};
+		} catch {
+			currentSnapshot = null;
+		}
+
 		const ai = await generateStrategyReviewExplainAi({
 			active: active.config,
 			candidate,
 			reviewState: state,
 			reviewResult: result,
+			currentSnapshot,
 			env,
 			timeoutMs: 1200,
 		});
