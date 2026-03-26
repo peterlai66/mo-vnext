@@ -1296,6 +1296,7 @@ function extractCommand(messageText: string): string | null {
 	if (/^\/strategy-candidate-patch(?:\s+|$)/u.test(messageText)) {
 		return "/strategy-candidate-patch";
 	}
+	if (messageText === "/strategy-candidate-show") return "/strategy-candidate-show";
 	if (messageText === "/debug-strategy-change") return "/debug-strategy-change";
 	if (/^\/note(?:\s+|$)/.test(messageText)) return "/note";
 	return /^\/[A-Za-z0-9_]+$/.test(messageText) ? messageText : null;
@@ -2840,6 +2841,53 @@ candidateConfigVersion: ${updated.configVersion}
 result: updated
 updatedField: ${field}
 updatedValue: ${String(valueNum)}`;
+	  }
+	  case "/strategy-candidate-show": {
+		const [active, candidate] = await Promise.all([
+			readActiveStrategyConfig(env),
+			readCandidateStrategyConfig(env),
+		]);
+		if (candidate === null) {
+			return `MO Strategy Candidate Show
+
+activeConfigVersion: ${active.config.configVersion}
+candidateConfigVersion: (none)
+result: failed
+reason: candidate config not found`;
+		}
+
+		const a = active.config;
+		const c = candidate;
+		const lines: string[] = [
+			"MO Strategy Candidate Show",
+			"",
+			`activeConfigVersion: ${a.configVersion}`,
+			`candidateConfigVersion: ${c.configVersion}`,
+			"result: ok",
+			"",
+		];
+		const diffs: string[] = [];
+		const add = (name: string, av: number, cv: number): void => {
+			lines.push(`${name}: active=${av} candidate=${cv}`);
+			if (av !== cv) diffs.push(name);
+		};
+		add("aggressiveMinScore", a.aggressiveMinScore, c.aggressiveMinScore);
+		add("balancedMinScore", a.balancedMinScore, c.balancedMinScore);
+		add("freshnessWeight", a.freshnessWeight, c.freshnessWeight);
+		add("volumeWeight", a.volumeWeight, c.volumeWeight);
+		add("simulationWeight", a.simulationWeight, c.simulationWeight);
+		add(
+			"freshnessIdleThresholdMs",
+			a.freshnessIdleThresholdMs,
+			c.freshnessIdleThresholdMs
+		);
+		lines.push("");
+		lines.push(`diff: ${diffs.length === 0 ? "none" : diffs.join(", ")}`);
+		console.log("[strategy] candidate inspect loaded", {
+			hasDiff: diffs.length === 0 ? "no" : "yes",
+			diffFields: diffs,
+		});
+		return lines.join("\n");
 	  }
 	  case "/strategy-promote-candidate": {
 		const [active, candidate, state, decision] = await Promise.all([
