@@ -1283,6 +1283,7 @@ function extractCommand(messageText: string): string | null {
 	if (messageText === "/strategy-config-promote-demo-candidate") {
 		return "/strategy-config-promote-demo-candidate";
 	}
+	if (messageText === "/strategy-review-run-demo") return "/strategy-review-run-demo";
 	if (messageText === "/strategy-review-debug") return "/strategy-review-debug";
 	if (messageText === "/debug-strategy-change") return "/debug-strategy-change";
 	if (/^\/note(?:\s+|$)/.test(messageText)) return "/note";
@@ -1316,6 +1317,7 @@ type StrategyActiveConfig = {
 const MO_ACTIVE_STRATEGY_CONFIG_KEY = "active_strategy_config";
 const MO_CANDIDATE_STRATEGY_CONFIG_KEY = "candidate_strategy_config";
 const MO_STRATEGY_REVIEW_STATE_KEY = "strategy_review_state";
+const MO_STRATEGY_REVIEW_RESULT_KEY = "strategy_review_result";
 
 type StrategyReviewStatus = "none" | "reviewing" | "ready" | "promoted";
 
@@ -1325,6 +1327,18 @@ type StrategyReviewState = {
 	reviewStatus: StrategyReviewStatus;
 	reviewStartedAt: string;
 	lastReviewedAt: string;
+	note: string;
+};
+
+type StrategyCompareDecision = "keep_active" | "promote_candidate";
+
+type StrategyReviewResult = {
+	activeConfigVersion: string;
+	candidateConfigVersion: string;
+	comparedAt: string;
+	compareSummary: string;
+	compareDecision: StrategyCompareDecision;
+	compareReason: string;
 	note: string;
 };
 
@@ -1534,6 +1548,64 @@ async function writeStrategyReviewState(env: Env, state: StrategyReviewState): P
 	}
 }
 
+function isStrategyCompareDecision(v: string): v is StrategyCompareDecision {
+	return v === "keep_active" || v === "promote_candidate";
+}
+
+function parseStrategyReviewResultRecord(raw: string): StrategyReviewResult | null {
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (typeof parsed !== "object" || parsed === null) return null;
+		const obj = parsed as Record<string, unknown>;
+		if (typeof obj.activeConfigVersion !== "string") return null;
+		if (typeof obj.candidateConfigVersion !== "string") return null;
+		if (typeof obj.comparedAt !== "string") return null;
+		if (typeof obj.compareSummary !== "string") return null;
+		if (
+			typeof obj.compareDecision !== "string" ||
+			!isStrategyCompareDecision(obj.compareDecision)
+		) {
+			return null;
+		}
+		if (typeof obj.compareReason !== "string") return null;
+		if (typeof obj.note !== "string") return null;
+		return {
+			activeConfigVersion: obj.activeConfigVersion,
+			candidateConfigVersion: obj.candidateConfigVersion,
+			comparedAt: obj.comparedAt,
+			compareSummary: obj.compareSummary,
+			compareDecision: obj.compareDecision,
+			compareReason: obj.compareReason,
+			note: obj.note,
+		};
+	} catch {
+		return null;
+	}
+}
+
+async function readStrategyReviewResult(env: Env): Promise<StrategyReviewResult | null> {
+	try {
+		const raw = await env.MO_NOTES.get(MO_STRATEGY_REVIEW_RESULT_KEY, "text");
+		if (raw === null || raw.trim() === "") return null;
+		return parseStrategyReviewResultRecord(raw);
+	} catch {
+		return null;
+	}
+}
+
+async function writeStrategyReviewResult(env: Env, result: StrategyReviewResult): Promise<void> {
+	try {
+		await env.MO_NOTES.put(MO_STRATEGY_REVIEW_RESULT_KEY, JSON.stringify(result));
+		console.log("[strategy] review result saved", {
+			activeConfigVersion: result.activeConfigVersion,
+			candidateConfigVersion: result.candidateConfigVersion,
+			compareDecision: result.compareDecision,
+		});
+	} catch {
+		// scaffold：寫入失敗不影響主流程
+	}
+}
+
 async function getSystemStatus(env: Env, userId: string): Promise<SystemStatus> {
 	let d1Label: "ok" | "error" = "error";
 	try {
@@ -1667,6 +1739,64 @@ activeConfigVersion: ${activeCfg.configVersion}
 candidateConfigVersion: ${candidate.configVersion}
 reviewStatus: ${reviewState.reviewStatus}`;
 	  }
+	  case "/strategy-review-run-demo": {
+		const active = await readActiveStrategyConfig(env);
+		const candidate = await readCandidateStrategyConfig(env);
+		const state = await readStrategyReviewState(env);
+
+		if (candidate === null || state === null) {
+			return `MO Strategy Review Run Demo
+
+result: skipped
+reason: candidate_strategy_config 或 strategy_review_state 不存在`;
+		}
+
+		const a = active.config;
+		const c = candidate;
+		const diffs: string[] = [];
+		if (a.freshnessWeight !== c.freshnessWeight) diffs.push("freshnessWeight");
+		if (a.volumeWeight !== c.volumeWeight) diffs.push("volumeWeight");
+		if (a.simulationWeight !== c.simulationWeight) diffs.push("simulationWeight");
+		if (a.aggressiveMinScore !== c.aggressiveMinScore) diffs.push("aggressiveMinScore");
+		if (a.balancedMinScore !== c.balancedMinScore) diffs.push("balancedMinScore");
+		if (a.freshnessIdleThresholdMs !== c.freshnessIdleThresholdMs) {
+			diffs.push("freshnessIdleThresholdMs");
+		}
+
+		const compareDecision: StrategyCompareDecision = "keep_active";
+		const compareReason =
+			diffs.length === 0 ?
+				"no_config_diff"
+			:	`candidate changes: ${diffs.join(", ")}`;
+		const compareSummary =
+			diffs.length === 0 ? "active and candidate are identical" : "active vs candidate differ";
+
+		const nowIso = new Date().toISOString();
+		const result: StrategyReviewResult = {
+			activeConfigVersion: a.configVersion,
+			candidateConfigVersion: c.configVersion,
+			comparedAt: nowIso,
+			compareSummary,
+			compareDecision,
+			compareReason,
+			note: "demo compare result",
+		};
+		await writeStrategyReviewResult(env, result);
+
+		const nextState: StrategyReviewState = {
+			...state,
+			lastReviewedAt: nowIso,
+			note: "demo review run completed",
+		};
+		await writeStrategyReviewState(env, nextState);
+
+		return `MO Strategy Review Run Demo
+
+reviewResultKey: ${MO_STRATEGY_REVIEW_RESULT_KEY}
+comparedAt: ${result.comparedAt}
+compareDecision: ${result.compareDecision}
+compareReason: ${result.compareReason}`;
+	  }
 	  case "/strategy-review-debug": {
 		const s = await readStrategyReviewState(env);
 		if (s === null) {
@@ -1675,10 +1805,20 @@ reviewStatus: ${reviewState.reviewStatus}`;
 reviewKey: ${MO_STRATEGY_REVIEW_STATE_KEY}
 reviewState: none`;
 		}
-		const active = await readActiveStrategyConfig(env);
-		const candidate = await readCandidateStrategyConfig(env);
+		const [active, candidate, rr] = await Promise.all([
+			readActiveStrategyConfig(env),
+			readCandidateStrategyConfig(env),
+			readStrategyReviewResult(env),
+		]);
+		if (rr !== null) {
+			console.log("[strategy] review debug result loaded", {
+				activeConfigVersion: rr.activeConfigVersion,
+				candidateConfigVersion: rr.candidateConfigVersion,
+				compareDecision: rr.compareDecision,
+			});
+		}
 		if (candidate === null) {
-			return `MO Strategy Review Debug
+			const base = `MO Strategy Review Debug
 
 reviewKey: ${MO_STRATEGY_REVIEW_STATE_KEY}
 activeConfigVersion: ${s.activeConfigVersion}
@@ -1687,6 +1827,14 @@ reviewStatus: ${s.reviewStatus}
 reviewStartedAt: ${s.reviewStartedAt}
 lastReviewedAt: ${s.lastReviewedAt}
 note: ${s.note}`;
+			if (rr === null) return base;
+			return `${base}
+
+[LastCompare]
+comparedAt: ${rr.comparedAt}
+compareDecision: ${rr.compareDecision}
+compareReason: ${rr.compareReason}
+compareSummary: ${rr.compareSummary}`;
 		}
 		console.log("[strategy] review debug diff", {
 			activeConfigVersion: active.config.configVersion,
@@ -1694,7 +1842,7 @@ note: ${s.note}`;
 		});
 		const a = active.config;
 		const c = candidate;
-		return `MO Strategy Review Debug
+		const base = `MO Strategy Review Debug
 
 reviewKey: ${MO_STRATEGY_REVIEW_STATE_KEY}
 activeConfigVersion: ${s.activeConfigVersion}
@@ -1711,6 +1859,14 @@ simulationWeight: active=${a.simulationWeight} candidate=${c.simulationWeight}
 aggressiveMinScore: active=${a.aggressiveMinScore} candidate=${c.aggressiveMinScore}
 balancedMinScore: active=${a.balancedMinScore} candidate=${c.balancedMinScore}
 freshnessIdleThresholdMs: active=${a.freshnessIdleThresholdMs} candidate=${c.freshnessIdleThresholdMs}`;
+		if (rr === null) return base;
+		return `${base}
+
+[LastCompare]
+comparedAt: ${rr.comparedAt}
+compareDecision: ${rr.compareDecision}
+compareReason: ${rr.compareReason}
+compareSummary: ${rr.compareSummary}`;
 	  }
 	  case "/debug-strategy-change": {
 		const hasLineUser =
