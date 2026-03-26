@@ -1853,7 +1853,7 @@ async function writeStrategyReviewDemoOverride(
 
 async function clearStrategyReviewDemoOverride(
 	env: Env,
-	context: "promotion" | "reset" | "discard" | "manual_clear"
+	context: "promotion" | "reset" | "discard" | "manual_clear" | "real_review" | "new_cycle"
 ): Promise<void> {
 	try {
 		await env.MO_NOTES.delete(MO_STRATEGY_REVIEW_DEMO_OVERRIDE_KEY);
@@ -1861,6 +1861,8 @@ async function clearStrategyReviewDemoOverride(
 			context === "promotion" ? "after promotion"
 			: context === "reset" ? "after review reset"
 			: context === "discard" ? "after candidate discard"
+			: context === "real_review" ? "after real review"
+			: context === "new_cycle" ? "after new cycle"
 			: "manually";
 		console.log(`[strategy] review demo override cleared: ${suffix}`, {
 			key: MO_STRATEGY_REVIEW_DEMO_OVERRIDE_KEY,
@@ -2133,6 +2135,11 @@ async function runStrategyReview(params: {
 			:	(params.source === "demo" ? "demo review run completed" : "real review run completed"),
 	};
 	await writeStrategyReviewState(params.env, nextState);
+	console.log("[strategy] review state saved", {
+		source: params.source,
+		reviewStatus: nextState.reviewStatus,
+		demoOverride: params.source === "demo" && demoOverride !== null ? "on" : "off",
+	});
 
 	// decision：demo 可用 override snapshot；real 用真實 snapshot；兩者都會落盤
 	let decisionSnapshot: StrategyCurrentSnapshot | null = null;
@@ -2742,6 +2749,8 @@ compareDecision: ${r.compareDecision}
 compareReason: ${r.compareReason}`;
 	  }
 	  case "/strategy-review-run": {
+		// real review 不應繼承舊的 demo override（避免 stale state 影響 auto promote）
+		await clearStrategyReviewDemoOverride(env, "real_review");
 		const r = await runStrategyReview({
 			env,
 			userId,
@@ -2855,6 +2864,7 @@ result: cleared`;
 		await Promise.all([
 			clearStrategyReviewResult(env),
 			clearStrategyReviewDecision(env),
+			clearStrategyReviewDemoOverride(env, "new_cycle"),
 			writeStrategyReviewStateNewCycle({
 				env,
 				activeConfigVersion: active.config.configVersion,
