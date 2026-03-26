@@ -2021,6 +2021,20 @@ async function runStrategyReview(params: {
 		snapshot.dataFreshnessScore >= 80 &&
 		snapshot.dataVolumeScore >= 80 &&
 		snapshot.simulationReadyScore >= 80;
+	// real compare rule（安全特例）：僅 balancedMinScore 單欄位差異時，允許在較保守的真實條件下 promote_candidate
+	// - 不放寬到多欄位 diff
+	// - 仍需真實資料新鮮且量足夠，且避免 simulationReady 太低
+	const isBalancedMinScoreOnlyDiff = diffs.length === 1 && diffs[0] === "balancedMinScore";
+	const balancedMinScoreDelta = Math.abs(a.balancedMinScore - c.balancedMinScore);
+	const isSafeBalancedMinScoreOnlyReal =
+		params.source === "real" &&
+		isBalancedMinScoreOnlyDiff &&
+		balancedMinScoreDelta >= 5 &&
+		snapshot !== null &&
+		snapshot.status === "active" &&
+		snapshot.dataFreshnessScore >= 80 &&
+		snapshot.dataVolumeScore >= 80 &&
+		snapshot.simulationReadyScore >= 60;
 
 	let compareDecision: StrategyCompareDecision;
 	let compareReason: string;
@@ -2030,16 +2044,24 @@ async function runStrategyReview(params: {
 		compareDecision = "keep_active";
 		compareReason = "no_material_diff";
 		compareSummary = "active vs candidate same";
-	} else if ((params.source === "demo" && isStrongDemo) || (params.source === "real" && isStrongReal)) {
+	} else if (
+		(params.source === "demo" && isStrongDemo) ||
+		(params.source === "real" && (isStrongReal || isSafeBalancedMinScoreOnlyReal))
+	) {
 		compareDecision = "promote_candidate";
 		compareReason =
 			params.source === "demo" ?
 				`candidate changes validated under demo review conditions: ${diffs.join(", ")}`
-			:	`candidate changes validated under real review conditions: ${diffs.join(", ")}`;
+			:	(isSafeBalancedMinScoreOnlyReal && !isStrongReal) ?
+					`candidate balancedMinScore change validated under safe real review conditions: ${diffs.join(", ")}`
+				:	`candidate changes validated under real review conditions: ${diffs.join(", ")}`;
 		compareSummary = "candidate validated for promotion";
 	} else {
 		compareDecision = "hold_review";
-		compareReason = `candidate changes but review conditions not strong enough: ${diffs.join(", ")}`;
+		compareReason =
+			params.source === "real" && isBalancedMinScoreOnlyDiff ?
+				`candidate balancedMinScore change but real review conditions not strong enough (delta=${balancedMinScoreDelta})`
+			:	`candidate changes but review conditions not strong enough: ${diffs.join(", ")}`;
 		compareSummary = "active vs candidate differ";
 	}
 
@@ -2048,6 +2070,9 @@ async function runStrategyReview(params: {
 		compareDecision,
 		compareReason,
 		demoOverride: demoOverride === null ? "off" : "on",
+		isStrongReal: params.source === "real" ? isStrongReal : undefined,
+		isSafeBalancedMinScoreOnlyReal: params.source === "real" ? isSafeBalancedMinScoreOnlyReal : undefined,
+		balancedMinScoreDelta: isBalancedMinScoreOnlyDiff ? balancedMinScoreDelta : undefined,
 	});
 
 	const nowIso = new Date().toISOString();
