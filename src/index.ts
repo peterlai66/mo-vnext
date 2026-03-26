@@ -1287,6 +1287,8 @@ function extractCommand(messageText: string): string | null {
 	if (messageText === "/strategy-review-explain") return "/strategy-review-explain";
 	if (messageText === "/strategy-review-debug") return "/strategy-review-debug";
 	if (messageText === "/strategy-review-decision") return "/strategy-review-decision";
+	if (messageText === "/strategy-review-demo-promote") return "/strategy-review-demo-promote";
+	if (messageText === "/strategy-review-demo-clear") return "/strategy-review-demo-clear";
 	if (messageText === "/strategy-promote-candidate") return "/strategy-promote-candidate";
 	if (messageText === "/debug-strategy-change") return "/debug-strategy-change";
 	if (/^\/note(?:\s+|$)/.test(messageText)) return "/note";
@@ -1322,6 +1324,7 @@ const MO_CANDIDATE_STRATEGY_CONFIG_KEY = "candidate_strategy_config";
 const MO_STRATEGY_REVIEW_STATE_KEY = "strategy_review_state";
 const MO_STRATEGY_REVIEW_RESULT_KEY = "strategy_review_result";
 const MO_STRATEGY_REVIEW_DECISION_KEY = "strategy_review_decision";
+const MO_STRATEGY_REVIEW_DEMO_OVERRIDE_KEY = "strategy_review_demo_override";
 
 type StrategyReviewStatus = "none" | "reviewing" | "ready" | "promoted";
 
@@ -1359,6 +1362,15 @@ type StrategyReviewDecisionRecord = {
 	decision: StrategyReviewDecisionLabel;
 	reason: string;
 	evaluatedAt: string;
+};
+
+type StrategyReviewDemoOverride = {
+	dataFreshnessScore: number;
+	dataVolumeScore: number;
+	simulationReadyScore: number;
+	status: "active" | "idle";
+	note: string;
+	updatedAt: string;
 };
 
 function getDefaultStrategyActiveConfig(): StrategyActiveConfig {
@@ -1678,6 +1690,83 @@ async function writeStrategyReviewDecision(
 		);
 	} catch {
 		// scaffold：寫入失敗不影響主流程
+	}
+}
+
+function parseStrategyReviewDemoOverrideRecord(
+	raw: string
+): StrategyReviewDemoOverride | null {
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (typeof parsed !== "object" || parsed === null) return null;
+		const obj = parsed as Record<string, unknown>;
+		if (
+			typeof obj.dataFreshnessScore !== "number" ||
+			!Number.isFinite(obj.dataFreshnessScore)
+		) {
+			return null;
+		}
+		if (
+			typeof obj.dataVolumeScore !== "number" ||
+			!Number.isFinite(obj.dataVolumeScore)
+		) {
+			return null;
+		}
+		if (
+			typeof obj.simulationReadyScore !== "number" ||
+			!Number.isFinite(obj.simulationReadyScore)
+		) {
+			return null;
+		}
+		if (typeof obj.status !== "string") return null;
+		if (obj.status !== "active" && obj.status !== "idle") return null;
+		if (typeof obj.note !== "string") return null;
+		if (typeof obj.updatedAt !== "string") return null;
+		const clamp = (n: number): number => Math.max(0, Math.min(100, Math.round(n)));
+		return {
+			dataFreshnessScore: clamp(obj.dataFreshnessScore),
+			dataVolumeScore: clamp(obj.dataVolumeScore),
+			simulationReadyScore: clamp(obj.simulationReadyScore),
+			status: obj.status,
+			note: obj.note,
+			updatedAt: obj.updatedAt,
+		};
+	} catch {
+		return null;
+	}
+}
+
+async function readStrategyReviewDemoOverride(
+	env: Env
+): Promise<StrategyReviewDemoOverride | null> {
+	try {
+		const raw = await env.MO_NOTES.get(MO_STRATEGY_REVIEW_DEMO_OVERRIDE_KEY, "text");
+		if (raw === null || raw.trim() === "") return null;
+		return parseStrategyReviewDemoOverrideRecord(raw);
+	} catch {
+		return null;
+	}
+}
+
+async function writeStrategyReviewDemoOverride(
+	env: Env,
+	override: StrategyReviewDemoOverride
+): Promise<void> {
+	try {
+		await env.MO_NOTES.put(
+			MO_STRATEGY_REVIEW_DEMO_OVERRIDE_KEY,
+			JSON.stringify(override)
+		);
+	} catch {
+		// demo only
+	}
+}
+
+async function clearStrategyReviewDemoOverride(env: Env): Promise<void> {
+	try {
+		await env.MO_NOTES.delete(MO_STRATEGY_REVIEW_DEMO_OVERRIDE_KEY);
+	} catch {
+		// demo only
 	}
 }
 
@@ -2242,6 +2331,35 @@ reason: candidate_strategy_config 或 strategy_review_state 不存在`;
 			status: "idle",
 			reason: "尚無資料",
 		};
+		const demoOverride = await readStrategyReviewDemoOverride(env);
+		if (demoOverride !== null) {
+			console.log("[strategy] review demo override enabled", {
+				note: demoOverride.note,
+				updatedAt: demoOverride.updatedAt,
+			});
+			const cfg = active.config;
+			const weightSum = cfg.freshnessWeight + cfg.volumeWeight + cfg.simulationWeight;
+			const fallback = getDefaultStrategyActiveConfig();
+			const fw = weightSum > 0 ? cfg.freshnessWeight / weightSum : fallback.freshnessWeight;
+			const vw = weightSum > 0 ? cfg.volumeWeight / weightSum : fallback.volumeWeight;
+			const sw = weightSum > 0 ? cfg.simulationWeight / weightSum : fallback.simulationWeight;
+			const scoreRaw =
+				demoOverride.dataFreshnessScore * fw +
+				demoOverride.dataVolumeScore * vw +
+				demoOverride.simulationReadyScore * sw;
+			const score = Math.max(0, Math.min(100, Math.round(scoreRaw)));
+			let strategy: "aggressive" | "balanced" | "conservative";
+			if (score >= cfg.aggressiveMinScore) strategy = "aggressive";
+			else if (score >= cfg.balancedMinScore) strategy = "balanced";
+			else strategy = "conservative";
+			snapshot.dataFreshnessScore = demoOverride.dataFreshnessScore;
+			snapshot.dataVolumeScore = demoOverride.dataVolumeScore;
+			snapshot.simulationReadyScore = demoOverride.simulationReadyScore;
+			snapshot.score = score;
+			snapshot.strategy = strategy;
+			snapshot.status = demoOverride.status;
+			snapshot.reason = `demo override: ${demoOverride.note}`;
+		} else {
 		try {
 			// 嘗試用目前 user 的資料狀態計算（與 explain 相同方向，失敗則維持預設）
 			const s2 = await getSystemStatus(env, userId);
@@ -2310,6 +2428,7 @@ reason: candidate_strategy_config 或 strategy_review_state 不存在`;
 		} catch {
 			// ignore
 		}
+		}
 		await computeAndRecordStrategyReviewDecision({
 			env,
 			activeConfig: active.config,
@@ -2337,6 +2456,30 @@ evaluatedAt: none`;
 decision: ${d.decision}
 reason: ${d.reason}
 evaluatedAt: ${d.evaluatedAt}`;
+	  }
+	  case "/strategy-review-demo-promote": {
+		const demo: StrategyReviewDemoOverride = {
+			dataFreshnessScore: 100,
+			dataVolumeScore: 100,
+			simulationReadyScore: 100,
+			status: "active",
+			note: "demo promote conditions",
+			updatedAt: new Date().toISOString(),
+		};
+		await writeStrategyReviewDemoOverride(env, demo);
+		return `MO Strategy Review Demo Override
+
+key: ${MO_STRATEGY_REVIEW_DEMO_OVERRIDE_KEY}
+result: written
+note: ${demo.note}
+updatedAt: ${demo.updatedAt}`;
+	  }
+	  case "/strategy-review-demo-clear": {
+		await clearStrategyReviewDemoOverride(env);
+		return `MO Strategy Review Demo Override
+
+key: ${MO_STRATEGY_REVIEW_DEMO_OVERRIDE_KEY}
+result: cleared`;
 	  }
 	  case "/strategy-promote-candidate": {
 		const [active, candidate, state, decision] = await Promise.all([
@@ -2563,11 +2706,17 @@ candidate 調整了部分策略權重與門檻，目前系統仍維持 active �
 reviewKey: ${MO_STRATEGY_REVIEW_STATE_KEY}
 reviewState: none`;
 		}
-		const [active, candidate, rr] = await Promise.all([
+		const [active, candidate, rr, demoOverride] = await Promise.all([
 			readActiveStrategyConfig(env),
 			readCandidateStrategyConfig(env),
 			readStrategyReviewResult(env),
+			readStrategyReviewDemoOverride(env),
 		]);
+		const demoLine =
+			demoOverride === null ?
+				"demoOverride: off"
+			:	`demoOverride: on\n` +
+				`demoOverrideNote: ${demoOverride.note}`;
 		if (rr !== null) {
 			console.log("[strategy] review debug result loaded", {
 				activeConfigVersion: rr.activeConfigVersion,
@@ -2579,6 +2728,7 @@ reviewState: none`;
 			const base = `MO Strategy Review Debug
 
 reviewKey: ${MO_STRATEGY_REVIEW_STATE_KEY}
+${demoLine}
 activeConfigVersion: ${s.activeConfigVersion}
 candidateConfigVersion: ${s.candidateConfigVersion}
 reviewStatus: ${s.reviewStatus}
@@ -2603,6 +2753,7 @@ compareSummary: ${rr.compareSummary}`;
 		const base = `MO Strategy Review Debug
 
 reviewKey: ${MO_STRATEGY_REVIEW_STATE_KEY}
+${demoLine}
 activeConfigVersion: ${s.activeConfigVersion}
 candidateConfigVersion: ${s.candidateConfigVersion}
 reviewStatus: ${s.reviewStatus}
