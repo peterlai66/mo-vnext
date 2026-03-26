@@ -1971,8 +1971,6 @@ async function runStrategyReview(params: {
 	userId: string;
 	source: "demo" | "real";
 	allowDemoOverride: boolean;
-	// 僅供 /admin/strategy/test-auto-promote 驗證鏈路用；不可影響一般 real review
-	adminTestBaseline?: boolean;
 }): Promise<{
 	comparedAt: string;
 	compareDecision: StrategyCompareDecision;
@@ -2028,9 +2026,9 @@ async function runStrategyReview(params: {
 	// - 仍需真實資料新鮮且量足夠，且避免 simulationReady 太低
 	const isBalancedMinScoreOnlyDiff = diffs.length === 1 && diffs[0] === "balancedMinScore";
 	const balancedMinScoreDelta = Math.abs(a.balancedMinScore - c.balancedMinScore);
-	const isAdminTestBaselineMatched =
-		params.adminTestBaseline === true &&
+	const isSafeRealPromoteBalancedMinScoreOnly =
 		params.source === "real" &&
+		demoOverride === null &&
 		isBalancedMinScoreOnlyDiff &&
 		balancedMinScoreDelta >= 10;
 	const isSafeBalancedMinScoreOnlyReal =
@@ -2051,12 +2049,12 @@ async function runStrategyReview(params: {
 		compareDecision = "keep_active";
 		compareReason = "no_material_diff";
 		compareSummary = "active vs candidate same";
-	} else if (isAdminTestBaselineMatched) {
+	} else if (isSafeRealPromoteBalancedMinScoreOnly) {
 		compareDecision = "promote_candidate";
-		compareReason =
-			`admin test baseline matched: balancedMinScore delta>=10 (${balancedMinScoreDelta})`;
-		compareSummary = "admin test baseline promotion";
-		console.log("[strategy] admin strategy test baseline matched", {
+		compareReason = `real promote condition matched: balancedMinScore delta>=10 (${balancedMinScoreDelta})`;
+		compareSummary = "real safe promotion baseline";
+		console.log("[strategy] real promote condition matched", {
+			field: "balancedMinScore",
 			delta: balancedMinScoreDelta,
 			compareDecision,
 		});
@@ -2086,7 +2084,7 @@ async function runStrategyReview(params: {
 		compareDecision,
 		compareReason,
 		demoOverride: demoOverride === null ? "off" : "on",
-		adminTestBaseline: params.adminTestBaseline === true ? "on" : "off",
+		safeRealPromoteBaseline: isSafeRealPromoteBalancedMinScoreOnly ? "matched" : "not_matched",
 		isStrongReal: params.source === "real" ? isStrongReal : undefined,
 		isSafeBalancedMinScoreOnlyReal: params.source === "real" ? isSafeBalancedMinScoreOnlyReal : undefined,
 		balancedMinScoreDelta: isBalancedMinScoreOnlyDiff ? balancedMinScoreDelta : undefined,
@@ -4208,7 +4206,6 @@ async function getReplyText(
 					userId: "admin",
 					source: "real",
 					allowDemoOverride: false,
-					adminTestBaseline: true,
 				});
 
 				const [rr, rd] = await Promise.all([
