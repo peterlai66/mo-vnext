@@ -1377,11 +1377,12 @@ type StrategyReviewDecisionLabel =
 	| "candidate_promising"
 	| "candidate_reject"
 	| "promote_candidate"
+	| "auto_promote_candidate"
 	| "promoted";
 
 type StrategyReviewDecisionRecord = {
 	decision: StrategyReviewDecisionLabel;
-	decisionSource?: "demo" | "real" | "manual";
+	decisionSource?: "demo" | "real" | "manual" | "auto";
 	reason: string;
 	evaluatedAt: string;
 };
@@ -1694,6 +1695,7 @@ function parseStrategyReviewDecisionRecord(raw: string): StrategyReviewDecisionR
 			decision !== "candidate_promising" &&
 			decision !== "candidate_reject" &&
 			decision !== "promote_candidate" &&
+			decision !== "auto_promote_candidate" &&
 			decision !== "promoted"
 		) {
 			return null;
@@ -1702,7 +1704,8 @@ function parseStrategyReviewDecisionRecord(raw: string): StrategyReviewDecisionR
 			typeof obj.decisionSource === "string" &&
 			(obj.decisionSource === "demo" ||
 				obj.decisionSource === "real" ||
-				obj.decisionSource === "manual") ?
+				obj.decisionSource === "manual" ||
+				obj.decisionSource === "auto") ?
 				obj.decisionSource
 			:	undefined;
 		if (typeof obj.reason !== "string") return null;
@@ -2169,6 +2172,13 @@ function computeStrategyReviewDecision(params: {
 	// 1) compare layer 優先：review_result 存在就先對齊（避免被後續 fallback 覆蓋）
 	switch (reviewResult.compareDecision) {
 		case "promote_candidate": {
+			// auto promote 建議層（v1）：real review 通過時改回傳 auto_promote_candidate（不自動 promotion）
+			if (reviewResult.source === "real") {
+				return {
+					decision: "auto_promote_candidate",
+					reason: "real review indicates candidate can be promoted",
+				};
+			}
 			const r = reviewResult.compareReason.trim();
 			const reason =
 				r === "" ?
@@ -2273,8 +2283,16 @@ async function computeAndRecordStrategyReviewDecision(params: {
 		decision: r.decision,
 		reason: r.reason,
 		evaluatedAt: formatStatusPushAtTaipei(new Date()),
-		...(params.decisionSource ? { decisionSource: params.decisionSource } : {}),
+		...(r.decision === "auto_promote_candidate" ? { decisionSource: "auto" } : {}),
+		...(r.decision !== "auto_promote_candidate" && params.decisionSource ?
+			{ decisionSource: params.decisionSource }
+		:	{}),
 	};
+	if (rec.decision === "auto_promote_candidate") {
+		console.log("[strategy] auto promote suggested", {
+			source: reviewResult?.source ?? "unknown",
+		});
+	}
 	console.log("[strategy] review decision resolved from review_result", {
 		compareDecision: compareDecision ?? "(none)",
 		finalDecision: rec.decision,
