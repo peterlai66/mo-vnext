@@ -1777,8 +1777,15 @@ async function writeStrategyReviewDemoOverride(
 async function clearStrategyReviewDemoOverride(env: Env): Promise<void> {
 	try {
 		await env.MO_NOTES.delete(MO_STRATEGY_REVIEW_DEMO_OVERRIDE_KEY);
-	} catch {
-		// demo only
+		console.log("[strategy] review demo override cleared after promotion", {
+			key: MO_STRATEGY_REVIEW_DEMO_OVERRIDE_KEY,
+		});
+	} catch (err: unknown) {
+		const message = err instanceof Error ? err.message : String(err);
+		console.log("[strategy] review demo override clear failed", {
+			key: MO_STRATEGY_REVIEW_DEMO_OVERRIDE_KEY,
+			message,
+		});
 	}
 }
 
@@ -3121,19 +3128,12 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 			aggressiveMinScore: activeStrategyConfig.aggressiveMinScore,
 			balancedMinScore: activeStrategyConfig.balancedMinScore,
 		});
-		// 每次 /report 都更新 strategy review decision（僅記錄，不做 promotion）
-		await computeAndRecordStrategyReviewDecision({
-			env,
-			activeConfig: activeStrategyConfig,
-			snapshot: {
-				dataFreshnessScore,
-				dataVolumeScore,
-				simulationReadyScore,
-				score,
-				strategy: strategyFromScore,
-				status: recStatus,
-				reason: recReason,
-			},
+		// /report 僅做報表計算，不落盤覆寫 strategy_review_decision（避免污染 promotion/review 狀態）
+		console.log("[strategy] report computed without persisting review decision", {
+			score,
+			strategy: strategyFromScore,
+			status: recStatus,
+			dataFreshnessScore,
 		});
 		let prevTrimForReport = "";
 		// 測試模式覆寫（/report-test-change only）集中在此：確保正式 /report 不受影響
