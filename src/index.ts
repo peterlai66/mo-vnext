@@ -1848,8 +1848,8 @@ async function writeStrategyReviewDemoOverride(
 }
 
 async function clearStrategyReviewDemoOverride(
-\tenv: Env,
-\tcontext: "promotion" | "reset" | "discard" | "manual_clear"
+	env: Env,
+	context: "promotion" | "reset" | "discard" | "manual_clear"
 ): Promise<void> {
 	try {
 		await env.MO_NOTES.delete(MO_STRATEGY_REVIEW_DEMO_OVERRIDE_KEY);
