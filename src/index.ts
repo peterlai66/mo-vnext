@@ -1607,6 +1607,27 @@ async function writeStrategyReviewResult(env: Env, result: StrategyReviewResult)
 	}
 }
 
+type StrategyReviewExplainAiFailureReason =
+	| "http_error"
+	| "invalid_json"
+	| "invalid_response_shape"
+	| "empty_content"
+	| "timeout"
+	| "thrown_error"
+	| "unknown";
+
+type StrategyReviewExplainAiResult =
+	| { ok: true; text: string }
+	| {
+			ok: false;
+			reason: StrategyReviewExplainAiFailureReason;
+			rawResponseSnippet?: string;
+			parsedContentSnippet?: string;
+			errorName?: string;
+			errorMessage?: string;
+			errorStack?: string;
+	  };
+
 async function generateStrategyReviewExplainAi(params: {
 	active: StrategyActiveConfig;
 	candidate: StrategyActiveConfig | null;
@@ -1625,7 +1646,7 @@ async function generateStrategyReviewExplainAi(params: {
 		| null;
 	env: Env;
 	timeoutMs: number;
-}): Promise<string | null> {
+}): Promise<StrategyReviewExplainAiResult> {
 	const diffLines: string[] = [];
 	const a = params.active;
 	const c = params.candidate;
@@ -1698,9 +1719,6 @@ reason: ${params.currentSnapshot.reason}
 
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), params.timeoutMs);
-	let didTimeout = false;
-	let responseWasEmpty = false;
-	let parseFailed = false;
 	try {
 		const response = await fetch("https://api.openai.com/v1/chat/completions", {
 			method: "POST",
@@ -1719,53 +1737,83 @@ reason: ${params.currentSnapshot.reason}
 				],
 			}),
 		});
+		const rawText = await response.text();
+		const rawResponseSnippet = rawText.slice(0, 2000);
+		console.log("[strategy] review explain raw response", rawResponseSnippet);
+
 		if (!response.ok) {
 			console.log("[strategy] review explain error", {
 				reason: "http_error",
 				status: response.status,
 				statusText: response.statusText,
-				isTimeout: false,
 			});
-			return null;
+			return { ok: false, reason: "http_error", rawResponseSnippet };
 		}
-		const responseJson = (await response.json()) as unknown;
+
+		let responseJson: unknown;
+		try {
+			responseJson = JSON.parse(rawText) as unknown;
+		} catch {
+			console.log("[strategy] review explain invalid response", {
+				reason: "invalid_json",
+			});
+			return { ok: false, reason: "invalid_json", rawResponseSnippet };
+		}
+
 		const text = extractAiSummaryText(responseJson);
 		if (text === null) {
-			parseFailed = true;
+			const hasChoices =
+				typeof responseJson === "object" && responseJson !== null && "choices" in responseJson;
+			const choicesLen =
+				hasChoices && Array.isArray((responseJson as Record<string, unknown>).choices) ?
+					((responseJson as Record<string, unknown>).choices as unknown[]).length
+				:	undefined;
 			console.log("[strategy] review explain invalid response", {
-				reason: "parse_failed",
-				isTimeout: false,
+				reason: "invalid_response_shape",
+				hasChoices,
+				choicesLen,
 			});
-			return null;
+			return { ok: false, reason: "invalid_response_shape", rawResponseSnippet };
 		}
+		console.log("[strategy] review explain parsed content", text.slice(0, 800));
+
 		const lines = text
 			.split(/\r?\n/u)
 			.map((l) => l.trim())
 			.filter((l) => l !== "");
 		if (lines.length === 0) {
-			responseWasEmpty = true;
 			console.log("[strategy] review explain invalid response", {
-				reason: "empty_text",
-				isTimeout: false,
+				reason: "empty_content",
 			});
-			return null;
+			return {
+				ok: false,
+				reason: "empty_content",
+				rawResponseSnippet,
+				parsedContentSnippet: text.slice(0, 800),
+			};
 		}
-		return lines.slice(0, 4).join("\n");
+		return { ok: true, text: lines.slice(0, 4).join("\n") };
 	} catch (err: unknown) {
-		const name =
+		const errorName =
 			typeof err === "object" && err !== null && "name" in err ?
 				String((err as Record<string, unknown>).name)
-			:	"";
-		didTimeout = name === "AbortError";
-		const message = err instanceof Error ? err.message : String(err);
+			:	undefined;
+		const didTimeout = errorName === "AbortError";
+		const errorMessage = err instanceof Error ? err.message : String(err);
+		const errorStack = err instanceof Error ? err.stack : undefined;
 		console.log("[strategy] review explain error", {
-			reason: didTimeout ? "timeout" : "exception",
-			message,
-			isTimeout: didTimeout,
-			responseWasEmpty,
-			parseFailed,
+			reason: didTimeout ? "timeout" : "thrown_error",
+			name: errorName,
+			message: errorMessage,
+			stack: errorStack,
 		});
-		return null;
+		return {
+			ok: false,
+			reason: didTimeout ? "timeout" : "thrown_error",
+			errorName,
+			errorMessage,
+			errorStack,
+		};
 	} finally {
 		clearTimeout(timer);
 	}
@@ -2065,12 +2113,19 @@ compareReason: ${result.compareReason}`;
 			timeoutMs: 1200,
 		});
 
-		if (ai !== null) {
+		if (ai.ok) {
 			console.log("[strategy] review explain success");
 			return `MO Strategy Review Explain
 
-${ai}`;
+${ai.text}`;
 		}
+		console.log("[strategy] review explain fallback reason", {
+			reason: ai.reason,
+			rawResponseSnippet: ai.rawResponseSnippet,
+			parsedContentSnippet: ai.parsedContentSnippet,
+			errorName: ai.errorName,
+			errorMessage: ai.errorMessage,
+		});
 		console.log("[strategy] review explain fallback");
 		return `MO Strategy Review Explain
 
