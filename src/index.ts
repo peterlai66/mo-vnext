@@ -4115,6 +4115,104 @@ async function getReplyText(
 		debugLog(env, "[fetch] hit");
 		debugLog(env, "[fetch] path", new URL(request.url).pathname);
 		const url = new URL(request.url);
+
+		if (url.pathname === "/admin/strategy/test-auto-promote") {
+			console.log("[strategy] admin strategy test start");
+			try {
+				const activeRes = await readActiveStrategyConfig(env);
+				if (activeRes.source !== "kv") {
+					return new Response(
+						JSON.stringify({
+							ok: false,
+							error: "active strategy config not found in KV",
+							source: activeRes.source,
+							configVersion: activeRes.config.configVersion,
+						}),
+						{ headers: { "Content-Type": "application/json" } }
+					);
+				}
+				const active = activeRes.config;
+
+				const nowIso = new Date().toISOString();
+				const candidateVersion = `candidate-admin-test-${Date.now()}`;
+				const patchedField = "balancedMinScore";
+				const patchedValue = 40;
+				const candidate: StrategyActiveConfig = {
+					...active,
+					configVersion: candidateVersion,
+					balancedMinScore: patchedValue,
+					updatedAt: nowIso,
+				};
+
+				await env.MO_NOTES.put(
+					MO_CANDIDATE_STRATEGY_CONFIG_KEY,
+					JSON.stringify(candidate)
+				);
+
+				// 初始化 review cycle，避免沿用舊結果
+				await Promise.all([
+					clearStrategyReviewResult(env),
+					clearStrategyReviewDecision(env),
+					writeStrategyReviewStateNewCycle({
+						env,
+						activeConfigVersion: active.configVersion,
+						candidateConfigVersion: candidate.configVersion,
+						note: "admin test auto promote",
+					}),
+				]);
+
+				const review = await runStrategyReview({
+					env,
+					userId: "admin",
+					source: "real",
+					allowDemoOverride: false,
+				});
+
+				const [rr, rd] = await Promise.all([
+					readStrategyReviewResult(env),
+					readStrategyReviewDecision(env),
+				]);
+				if (rr === null) {
+					return new Response(
+						JSON.stringify({ ok: false, error: "strategy_review_result not found" }),
+						{ headers: { "Content-Type": "application/json" } }
+					);
+				}
+				if (rd === null) {
+					return new Response(
+						JSON.stringify({ ok: false, error: "strategy_review_decision not found" }),
+						{ headers: { "Content-Type": "application/json" } }
+					);
+				}
+
+				const payload = {
+					ok: true,
+					activeConfigVersion: active.configVersion,
+					candidateConfigVersion: candidate.configVersion,
+					patchedField,
+					patchedValue,
+					compareDecision: rr.compareDecision,
+					compareReason: rr.compareReason,
+					decision: rd.decision,
+					decisionSource: rd.decisionSource ?? "unknown",
+					evaluatedAt: rd.evaluatedAt,
+				};
+				console.log("[strategy] admin strategy test result", {
+					ok: true,
+					compareDecision: payload.compareDecision,
+					decision: payload.decision,
+				});
+				return new Response(JSON.stringify(payload), {
+					headers: { "Content-Type": "application/json" },
+				});
+			} catch (err: unknown) {
+				const message = err instanceof Error ? err.message : String(err);
+				console.log("[strategy] admin strategy test result", { ok: false, message });
+				return new Response(JSON.stringify({ ok: false, error: message }), {
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+		}
   
 	  if (
 		(url.pathname === "/api/line/webhook" || url.pathname === "/line/webhook") &&
