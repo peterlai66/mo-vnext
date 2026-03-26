@@ -1863,6 +1863,16 @@ function computeStrategyReviewDecision(params: {
 		};
 	}
 
+	// 1) compare layer 優先：若 compareDecision 已明確 promote_candidate，則 decision 直接對齊
+	if (reviewResult.compareDecision === "promote_candidate") {
+		const r = reviewResult.compareReason.trim();
+		const reason =
+			r === "" ?
+				"review_result 已驗證 candidate 可人工 promotion"
+			:	`review_result 驗證通過：${r}`;
+		return { decision: "promote_candidate", reason };
+	}
+
 	// A
 	if (s.dataFreshnessScore === 0 && s.status === "idle") {
 		return { decision: "keep_active", reason: "資料過舊，不適合評估 candidate" };
@@ -1933,6 +1943,11 @@ async function computeAndRecordStrategyReviewDecision(params: {
 		readStrategyReviewState(params.env),
 		readStrategyReviewResult(params.env),
 	]);
+	if (reviewResult !== null) {
+		console.log("[strategy] review decision resolved from review_result", {
+			compareDecision: reviewResult.compareDecision,
+		});
+	}
 	const r = computeStrategyReviewDecision({
 		snapshot: params.snapshot,
 		activeConfig: params.activeConfig,
