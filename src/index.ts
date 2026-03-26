@@ -1279,6 +1279,7 @@ function extractCommand(messageText: string): string | null {
 	if (messageText === "/push-test") return "/push-test";
 	if (messageText === "/report-test-change") return "/report-test-change";
 	if (messageText === "/strategy-config-debug") return "/strategy-config-debug";
+	if (messageText === "/strategy-config-set-demo") return "/strategy-config-set-demo";
 	if (messageText === "/debug-strategy-change") return "/debug-strategy-change";
 	if (/^\/note(?:\s+|$)/.test(messageText)) return "/note";
 	return /^\/[A-Za-z0-9_]+$/.test(messageText) ? messageText : null;
@@ -1490,6 +1491,25 @@ simulationWeight: ${c.simulationWeight}
 aggressiveMinScore: ${c.aggressiveMinScore}
 balancedMinScore: ${c.balancedMinScore}
 freshnessIdleThresholdMs: ${c.freshnessIdleThresholdMs}`;
+	  }
+	  case "/strategy-config-set-demo": {
+		const demo: StrategyActiveConfig = {
+			// demo-v1：刻意與 default-v1 明顯不同，方便驗證是否讀到 KV
+			freshnessWeight: 0.2,
+			volumeWeight: 0.7,
+			simulationWeight: 0.1,
+			aggressiveMinScore: 90,
+			balancedMinScore: 40,
+			freshnessIdleThresholdMs: 6 * 60 * 60 * 1000,
+			configVersion: "demo-v1",
+			updatedAt: new Date().toISOString(),
+		};
+		await env.MO_NOTES.put(MO_ACTIVE_STRATEGY_CONFIG_KEY, JSON.stringify(demo));
+		return `MO Strategy Config Set Demo
+
+key: ${MO_ACTIVE_STRATEGY_CONFIG_KEY}
+configVersion: ${demo.configVersion}
+result: demo config 已寫入`;
 	  }
 	  case "/debug-strategy-change": {
 		const hasLineUser =
