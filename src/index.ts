@@ -1698,6 +1698,9 @@ reason: ${params.currentSnapshot.reason}
 
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), params.timeoutMs);
+	let didTimeout = false;
+	let responseWasEmpty = false;
+	let parseFailed = false;
 	try {
 		const response = await fetch("https://api.openai.com/v1/chat/completions", {
 			method: "POST",
@@ -1716,17 +1719,52 @@ reason: ${params.currentSnapshot.reason}
 				],
 			}),
 		});
-		if (!response.ok) return null;
+		if (!response.ok) {
+			console.log("[strategy] review explain error", {
+				reason: "http_error",
+				status: response.status,
+				statusText: response.statusText,
+				isTimeout: false,
+			});
+			return null;
+		}
 		const responseJson = (await response.json()) as unknown;
 		const text = extractAiSummaryText(responseJson);
-		if (text === null) return null;
+		if (text === null) {
+			parseFailed = true;
+			console.log("[strategy] review explain invalid response", {
+				reason: "parse_failed",
+				isTimeout: false,
+			});
+			return null;
+		}
 		const lines = text
 			.split(/\r?\n/u)
 			.map((l) => l.trim())
 			.filter((l) => l !== "");
-		if (lines.length === 0) return null;
+		if (lines.length === 0) {
+			responseWasEmpty = true;
+			console.log("[strategy] review explain invalid response", {
+				reason: "empty_text",
+				isTimeout: false,
+			});
+			return null;
+		}
 		return lines.slice(0, 4).join("\n");
-	} catch {
+	} catch (err: unknown) {
+		const name =
+			typeof err === "object" && err !== null && "name" in err ?
+				String((err as Record<string, unknown>).name)
+			:	"";
+		didTimeout = name === "AbortError";
+		const message = err instanceof Error ? err.message : String(err);
+		console.log("[strategy] review explain error", {
+			reason: didTimeout ? "timeout" : "exception",
+			message,
+			isTimeout: didTimeout,
+			responseWasEmpty,
+			parseFailed,
+		});
 		return null;
 	} finally {
 		clearTimeout(timer);
