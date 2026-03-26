@@ -1292,6 +1292,7 @@ function extractCommand(messageText: string): string | null {
 	if (messageText === "/strategy-promote-candidate") return "/strategy-promote-candidate";
 	if (messageText === "/strategy-candidate-clone-active") return "/strategy-candidate-clone-active";
 	if (messageText === "/strategy-candidate-set-balanced30") return "/strategy-candidate-set-balanced30";
+	if (messageText === "/strategy-candidate-set-balanced20") return "/strategy-candidate-set-balanced20";
 	if (messageText === "/debug-strategy-change") return "/debug-strategy-change";
 	if (/^\/note(?:\s+|$)/.test(messageText)) return "/note";
 	return /^\/[A-Za-z0-9_]+$/.test(messageText) ? messageText : null;
@@ -2660,6 +2661,52 @@ activeConfigVersion: ${active.config.configVersion}
 candidateConfigVersion: ${updated.configVersion}
 result: updated
 updatedField: balancedMinScore=30`;
+	  }
+	  case "/strategy-candidate-set-balanced20": {
+		const active = await readActiveStrategyConfig(env);
+		const candidate = await readCandidateStrategyConfig(env);
+		if (candidate === null) {
+			return `MO Strategy Candidate Update
+
+activeConfigVersion: ${active.config.configVersion}
+candidateConfigVersion: (none)
+result: failed
+reason: candidate config not found`;
+		}
+		const nowIso = new Date().toISOString();
+		const updated: StrategyActiveConfig = {
+			...candidate,
+			balancedMinScore: 20,
+			updatedAt: nowIso,
+		};
+		await env.MO_NOTES.put(
+			MO_CANDIDATE_STRATEGY_CONFIG_KEY,
+			JSON.stringify(updated)
+		);
+		console.log("[strategy] candidate field updated", {
+			candidateConfigVersion: updated.configVersion,
+			field: "balancedMinScore",
+			value: 20,
+		});
+		// 盡量標記本次調整（不改結構、不中斷流程）
+		try {
+			const s = await readStrategyReviewState(env);
+			if (s !== null) {
+				await writeStrategyReviewState(env, {
+					...s,
+					lastReviewedAt: nowIso,
+					note: "candidate field updated: balancedMinScore",
+				});
+			}
+		} catch {
+			// ignore
+		}
+		return `MO Strategy Candidate Update
+
+activeConfigVersion: ${active.config.configVersion}
+candidateConfigVersion: ${updated.configVersion}
+result: updated
+updatedField: balancedMinScore=20`;
 	  }
 	  case "/strategy-promote-candidate": {
 		const [active, candidate, state, decision] = await Promise.all([
