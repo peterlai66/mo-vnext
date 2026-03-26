@@ -1292,6 +1292,7 @@ function extractCommand(messageText: string): string | null {
 	if (messageText === "/strategy-review-demo-promote") return "/strategy-review-demo-promote";
 	if (messageText === "/strategy-review-demo-clear") return "/strategy-review-demo-clear";
 	if (messageText === "/strategy-promote-candidate") return "/strategy-promote-candidate";
+	if (messageText === "/strategy-auto-promote-run") return "/strategy-auto-promote-run";
 	if (messageText === "/strategy-candidate-clone-active") return "/strategy-candidate-clone-active";
 	if (messageText === "/strategy-candidate-set-balanced30") return "/strategy-candidate-set-balanced30";
 	if (messageText === "/strategy-candidate-set-balanced20") return "/strategy-candidate-set-balanced20";
