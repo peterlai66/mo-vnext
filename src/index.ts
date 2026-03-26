@@ -1549,20 +1549,46 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 		}
 
 		const twentyFourHoursMs = 24 * 60 * 60 * 1000;
+		// 第一版可解釋策略規則：三因子加權
+		const deltaMs = latestNoteMs === null ? Number.POSITIVE_INFINITY : Date.now() - latestNoteMs;
+		const dataFreshnessGood = latestNoteMs !== null && deltaMs <= twentyFourHoursMs;
+		// dataFreshnessScore: 0~100（0=過久未更新；100=剛更新）
+		const dataFreshnessScore =
+			latestNoteMs === null || deltaMs >= twentyFourHoursMs ?
+				0
+			:	Math.round((1 - deltaMs / twentyFourHoursMs) * 100);
+		// dataVolumeScore: 0~100（0=無資料；>=10 筆視為滿分）
+		const dataVolumeScore = Math.round(Math.min(1, totalNotesNum / 10) * 100);
+		// simulationReadyScore: 0~100（有資料即可進行模擬）
+		const simulationReadyScore = totalNotesNum > 0 ? 100 : 0;
+		const scoreRaw =
+			dataFreshnessScore * 0.5 +
+			dataVolumeScore * 0.35 +
+			simulationReadyScore * 0.15;
+		const score = Math.max(0, Math.min(100, Math.round(scoreRaw)));
+
+		console.log("[strategy] inputs", {
+			dataFreshnessScore,
+			dataVolumeScore,
+			simulationReadyScore,
+			totalNotesNum,
+			deltaMs,
+		});
+
 		let recStatus: "active" | "idle";
 		let recReason: string;
 		if (latestNoteMs === null) {
 			recStatus = "idle";
 			recReason = "尚無資料";
+		} else if (deltaMs > twentyFourHoursMs) {
+			recStatus = "idle";
+			recReason = "長時間未更新";
+		} else if (!dataFreshnessGood || simulationReadyScore === 0) {
+			recStatus = "idle";
+			recReason = "無資料可模擬";
 		} else {
-			const deltaMs = Date.now() - latestNoteMs;
-			if (deltaMs <= twentyFourHoursMs) {
-				recStatus = "active";
-				recReason = "近期有活動";
-			} else {
-				recStatus = "idle";
-				recReason = "長時間未更新";
-			}
+			recStatus = "active";
+			recReason = "近期有活動";
 		}
 		let recAction: string;
 		if (totalNotesNum >= 10) {
@@ -1572,22 +1598,16 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 		} else {
 			recAction = "建議新增第一筆資料";
 		}
-		const baseScore = Math.min(50, totalNotesNum * 5);
-		const timeBonus =
-			latestNoteMs !== null && Date.now() - latestNoteMs <= twentyFourHoursMs ?
-				30
-			:	0;
-		const activityBonus = totalNotesNum >= 10 ? 20 : 0;
-		const score = Math.min(100, baseScore + timeBonus + activityBonus);
 		let strategy: "aggressive" | "balanced" | "conservative";
 		if (score >= 80) {
 			strategy = "aggressive";
-		} else if (score >= 50) {
+		} else if (score >= 60) {
 			strategy = "balanced";
 		} else {
 			strategy = "conservative";
 		}
 		const strategyFromScore = strategy;
+		console.log("[strategy] score result", { score, strategy: strategyFromScore });
 		let prevTrimForReport = "";
 		// 測試模式覆寫（/report-test-change only）集中在此：確保正式 /report 不受影響
 		let testForceChangedFromEmptyPrevious = false;
