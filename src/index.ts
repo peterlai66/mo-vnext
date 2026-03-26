@@ -3308,6 +3308,122 @@ decisionSource: ${decision.decisionSource ?? "unknown"}
 ${warningLine}
 at: ${at}`;
 	  }
+	  case "/strategy-auto-promote-run": {
+		console.log("[strategy] auto promote run start");
+		const [active, candidate, reviewState, reviewResult, reviewDecision, demoOverride] =
+			await Promise.all([
+				readActiveStrategyConfig(env),
+				readCandidateStrategyConfig(env),
+				readStrategyReviewState(env),
+				readStrategyReviewResult(env),
+				readStrategyReviewDecision(env),
+				readStrategyReviewDemoOverride(env),
+			]);
+
+		const at = formatStatusPushAtTaipei(new Date());
+		const decisionSource = reviewDecision?.decisionSource ?? "unknown";
+
+		const blocked = (reason: string): string => {
+			console.log("[strategy] auto promote run blocked", { reason });
+			return `MO Strategy Auto Promote Run
+
+result: blocked
+reason: ${reason}
+decisionSource: ${decisionSource}
+at: ${at}`;
+		};
+
+		if (candidate === null) return blocked("candidate config not found");
+		if (reviewResult === null) return blocked("strategy_review_result not found");
+		if (reviewDecision === null) return blocked("strategy_review_decision not found");
+
+		// 安全條件 1) 必須是 real review
+		if (reviewResult.source !== "real") {
+			return blocked(`review_result.source is not real (source=${reviewResult.source ?? "unknown"})`);
+		}
+		// 安全條件 2) decision 必須是 auto_promote_candidate（v1 mapping）
+		if (reviewDecision.decision !== "auto_promote_candidate") {
+			return blocked(`decision is not auto_promote_candidate (decision=${reviewDecision.decision})`);
+		}
+		// 安全條件 3) demo override 必須為 off
+		if (demoOverride !== null) {
+			return blocked("demoOverride is on");
+		}
+
+		// 安全條件 4) diff 必須只包含 balancedMinScore
+		const a = active.config;
+		const c = candidate;
+		const diffs: string[] = [];
+		if (a.freshnessWeight !== c.freshnessWeight) diffs.push("freshnessWeight");
+		if (a.volumeWeight !== c.volumeWeight) diffs.push("volumeWeight");
+		if (a.simulationWeight !== c.simulationWeight) diffs.push("simulationWeight");
+		if (a.aggressiveMinScore !== c.aggressiveMinScore) diffs.push("aggressiveMinScore");
+		if (a.balancedMinScore !== c.balancedMinScore) diffs.push("balancedMinScore");
+		if (a.freshnessIdleThresholdMs !== c.freshnessIdleThresholdMs) diffs.push("freshnessIdleThresholdMs");
+
+		if (diffs.length !== 1 || diffs[0] !== "balancedMinScore") {
+			return blocked(
+				diffs.length === 0 ? "diff not found" : `diff must be balancedMinScore only (diff=${diffs.join(",")})`
+			);
+		}
+
+		// 安全條件 5) delta >= 10（candidate - active）
+		if (typeof a.balancedMinScore !== "number" || typeof c.balancedMinScore !== "number") {
+			return blocked("balancedMinScore is not a number");
+		}
+		const delta = c.balancedMinScore - a.balancedMinScore;
+		if (delta < 10) return blocked(`balancedMinScore delta < 10 (delta=${delta})`);
+
+		console.log("[strategy] auto promote run conditions matched", {
+			field: "balancedMinScore",
+			delta,
+			compareDecision: reviewResult.compareDecision,
+			decision: reviewDecision.decision,
+		});
+
+		// promotion 寫入（沿用手動 promotion 的最小流程）
+		const nowIso = new Date().toISOString();
+		const promotedActive: StrategyActiveConfig = {
+			...candidate,
+			updatedAt: nowIso,
+		};
+		await env.MO_NOTES.put(MO_ACTIVE_STRATEGY_CONFIG_KEY, JSON.stringify(promotedActive));
+
+		const nextState: StrategyReviewState = {
+			activeConfigVersion: promotedActive.configVersion,
+			candidateConfigVersion: candidate.configVersion,
+			reviewStatus: "promoted",
+			reviewStartedAt: reviewState?.reviewStartedAt ?? nowIso,
+			lastReviewedAt: nowIso,
+			note: "candidate promoted to active automatically",
+			promotedAt: at,
+			promotedFrom: active.config.configVersion,
+			promotedTo: promotedActive.configVersion,
+		};
+		await writeStrategyReviewState(env, nextState);
+
+		await writeStrategyReviewDecision(env, {
+			decision: "promoted",
+			decisionSource: "auto",
+			reason: "auto promotion completed",
+			evaluatedAt: at,
+		});
+
+		await clearStrategyReviewDemoOverride(env, "promotion");
+
+		console.log("[strategy] auto promote run promoted", {
+			promotedFrom: active.config.configVersion,
+			promotedTo: promotedActive.configVersion,
+		});
+
+		return `MO Strategy Auto Promote Run
+
+result: promoted
+decisionSource: auto
+promotedFrom: ${active.config.configVersion}
+promotedTo: ${promotedActive.configVersion}
+at: ${at}`;
+	  }
 	  case "/strategy-review-explain": {
 		console.log("[strategy] review explain start");
 		const [active, candidate, state, result] = await Promise.all([
