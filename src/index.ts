@@ -1551,12 +1551,15 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 		}
 		const strategyFromScore = strategy;
 		let prevTrimForReport = "";
+		// 測試模式覆寫（/report-test-change only）集中在此：確保正式 /report 不受影響
+		let testForceChangedFromEmptyPrevious = false;
 		let strategyFinal: "aggressive" | "balanced" | "conservative" = strategyFromScore;
 		if (hasUserId) {
 			const strategyKeyRead = `strategy:${userId}`;
 			const prevRawRead = await env.MO_NOTES.get(strategyKeyRead, "text");
 			prevTrimForReport = prevRawRead !== null ? prevRawRead.trim() : "";
 			if (isReportTestChange && userId !== "unknown-user") {
+				testForceChangedFromEmptyPrevious = prevTrimForReport === "";
 				strategyFinal = pickForcedStrategyForReportTest(
 					prevTrimForReport,
 					strategyFromScore
@@ -1618,11 +1621,8 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 			const prevTrim = prevTrimForReport;
 			const previousDisplay = prevTrim === "" ? "none" : prevTrim;
 			const changed: "yes" | "no" =
-				isReportTestChange && userId !== "unknown-user" && prevTrim === "" ?
-					"yes"
-				:	prevTrim !== "" && prevTrim !== strategyFinal ?
-					"yes"
-				:	"no";
+				testForceChangedFromEmptyPrevious && prevTrim === "" ? "yes" :
+					prevTrim !== "" && prevTrim !== strategyFinal ? "yes" : "no";
 			const shouldNotify: "yes" | "no" = changed === "yes" ? "yes" : "no";
 			reportPreviousStrategy = previousDisplay;
 			reportChanged = changed === "yes";
