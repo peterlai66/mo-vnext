@@ -1847,16 +1847,25 @@ async function writeStrategyReviewDemoOverride(
 	}
 }
 
-async function clearStrategyReviewDemoOverride(env: Env): Promise<void> {
+async function clearStrategyReviewDemoOverride(
+\tenv: Env,
+\tcontext: "promotion" | "reset" | "discard" | "manual_clear"
+): Promise<void> {
 	try {
 		await env.MO_NOTES.delete(MO_STRATEGY_REVIEW_DEMO_OVERRIDE_KEY);
-		console.log("[strategy] review demo override cleared after promotion", {
+		const suffix =
+			context === "promotion" ? "after promotion"
+			: context === "reset" ? "after review reset"
+			: context === "discard" ? "after candidate discard"
+			: "manually";
+		console.log(`[strategy] review demo override cleared: ${suffix}`, {
 			key: MO_STRATEGY_REVIEW_DEMO_OVERRIDE_KEY,
 		});
 	} catch (err: unknown) {
 		const message = err instanceof Error ? err.message : String(err);
 		console.log("[strategy] review demo override clear failed", {
 			key: MO_STRATEGY_REVIEW_DEMO_OVERRIDE_KEY,
+			context,
 			message,
 		});
 	}
@@ -2713,7 +2722,7 @@ evaluatedAt: ${d.evaluatedAt}`;
 		await Promise.all([
 			clearStrategyReviewResult(env),
 			clearStrategyReviewDecision(env),
-			clearStrategyReviewDemoOverride(env),
+			clearStrategyReviewDemoOverride(env, "reset"),
 		]);
 
 		const state: StrategyReviewState = {
@@ -2759,7 +2768,7 @@ note: ${demo.note}
 updatedAt: ${demo.updatedAt}`;
 	  }
 	  case "/strategy-review-demo-clear": {
-		await clearStrategyReviewDemoOverride(env);
+		await clearStrategyReviewDemoOverride(env, "manual_clear");
 		return `MO Strategy Review Demo Override
 
 key: ${MO_STRATEGY_REVIEW_DEMO_OVERRIDE_KEY}
@@ -3052,7 +3061,7 @@ result: no_candidate`;
 		await Promise.all([
 			clearStrategyReviewResult(env),
 			clearStrategyReviewDecision(env),
-			clearStrategyReviewDemoOverride(env),
+			clearStrategyReviewDemoOverride(env, "discard"),
 		]);
 
 		const state: StrategyReviewState = {
@@ -3223,7 +3232,7 @@ at: ${at}`;
 		});
 
 		// promotion 後收尾：清除 demo override，避免污染後續測試
-		await clearStrategyReviewDemoOverride(env);
+		await clearStrategyReviewDemoOverride(env, "promotion");
 
 		console.log("[strategy] promotion decision source", {
 			source: decision.decisionSource ?? "unknown",
