@@ -1699,12 +1699,7 @@ status: ${params.currentSnapshot.status}
 reason: ${params.currentSnapshot.reason}
 `}
 
-輸出要求：
-- 2~4 行繁體中文
-- 明確指出 candidate 改了哪些欄位（直接引用 [Diff] 的欄位名，不要泛用詞）
-- 解讀方向（更積極/更保守，或更偏 freshness/volume/門檻）
-- 結合 [CurrentStatus] 解釋這樣的變化在目前資料狀態下可能造成的影響
-- 解釋為什麼目前 decision 是 keep_active（若 compareDecision 缺失，改用『目前結果未產生，先維持 active』）`;
+輸出要求：2~4 行繁體中文；必須點名至少 1 個欄位（例 freshnessWeight）；要解讀方向與影響；要解釋 keep_active（缺值則說結果未產生先維持 active）。`;
 
 	const prompt = `SYSTEM:\n${systemPrompt}\n\nUSER:\n${userPrompt}`;
 	console.log("[strategy] review explain prompt", prompt);
@@ -1722,7 +1717,7 @@ reason: ${params.currentSnapshot.reason}
 			body: JSON.stringify({
 				model: "gpt-4o-mini",
 				temperature: 0.2,
-				max_completion_tokens: 120,
+				max_completion_tokens: 90,
 				messages: [
 					{ role: "system", content: systemPrompt },
 					{ role: "user", content: userPrompt },
@@ -2102,7 +2097,7 @@ compareReason: ${result.compareReason}`;
 			reviewResult: result,
 			currentSnapshot,
 			env,
-			timeoutMs: 2500,
+			timeoutMs: 6000,
 		});
 
 		if (ai.ok) {
