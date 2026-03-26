@@ -1290,6 +1290,8 @@ function extractCommand(messageText: string): string | null {
 	if (messageText === "/strategy-review-demo-promote") return "/strategy-review-demo-promote";
 	if (messageText === "/strategy-review-demo-clear") return "/strategy-review-demo-clear";
 	if (messageText === "/strategy-promote-candidate") return "/strategy-promote-candidate";
+	if (messageText === "/strategy-candidate-clone-active") return "/strategy-candidate-clone-active";
+	if (messageText === "/strategy-candidate-set-balanced30") return "/strategy-candidate-set-balanced30";
 	if (messageText === "/debug-strategy-change") return "/debug-strategy-change";
 	if (/^\/note(?:\s+|$)/.test(messageText)) return "/note";
 	return /^\/[A-Za-z0-9_]+$/.test(messageText) ? messageText : null;
@@ -1709,6 +1711,40 @@ async function writeStrategyReviewDecision(
 	} catch {
 		// scaffold：寫入失敗不影響主流程
 	}
+}
+
+async function clearStrategyReviewResult(env: Env): Promise<void> {
+	try {
+		await env.MO_NOTES.delete(MO_STRATEGY_REVIEW_RESULT_KEY);
+	} catch {
+		// scaffold：清除失敗不影響主流程
+	}
+}
+
+async function clearStrategyReviewDecision(env: Env): Promise<void> {
+	try {
+		await env.MO_NOTES.delete(MO_STRATEGY_REVIEW_DECISION_KEY);
+	} catch {
+		// scaffold：清除失敗不影響主流程
+	}
+}
+
+async function writeStrategyReviewStateNewCycle(params: {
+	env: Env;
+	activeConfigVersion: string;
+	candidateConfigVersion: string;
+	note: string;
+}): Promise<void> {
+	const nowIso = new Date().toISOString();
+	const s: StrategyReviewState = {
+		activeConfigVersion: params.activeConfigVersion,
+		candidateConfigVersion: params.candidateConfigVersion,
+		reviewStatus: "reviewing",
+		reviewStartedAt: nowIso,
+		lastReviewedAt: nowIso,
+		note: params.note,
+	};
+	await writeStrategyReviewState(params.env, s);
 }
 
 function parseStrategyReviewDemoOverrideRecord(
@@ -2555,6 +2591,75 @@ updatedAt: ${demo.updatedAt}`;
 
 key: ${MO_STRATEGY_REVIEW_DEMO_OVERRIDE_KEY}
 result: cleared`;
+	  }
+	  case "/strategy-candidate-clone-active": {
+		const active = await readActiveStrategyConfig(env);
+		const nowIso = new Date().toISOString();
+		const newCandidateVersion = `candidate-manual-${Date.now()}`;
+		const candidate: StrategyActiveConfig = {
+			...active.config,
+			configVersion: newCandidateVersion,
+			updatedAt: nowIso,
+		};
+		await env.MO_NOTES.put(
+			MO_CANDIDATE_STRATEGY_CONFIG_KEY,
+			JSON.stringify(candidate)
+		);
+		console.log("[strategy] candidate cloned from active", {
+			activeConfigVersion: active.config.configVersion,
+			candidateConfigVersion: candidate.configVersion,
+		});
+
+		// 新 candidate 產生後：初始化新一輪 review，避免沿用舊 review 結果
+		await Promise.all([
+			clearStrategyReviewResult(env),
+			clearStrategyReviewDecision(env),
+			writeStrategyReviewStateNewCycle({
+				env,
+				activeConfigVersion: active.config.configVersion,
+				candidateConfigVersion: candidate.configVersion,
+				note: "candidate cloned from active",
+			}),
+		]);
+
+		return `MO Strategy Candidate Clone Active
+
+activeConfigVersion: ${active.config.configVersion}
+candidateConfigVersion: ${candidate.configVersion}
+result: cloned`;
+	  }
+	  case "/strategy-candidate-set-balanced30": {
+		const active = await readActiveStrategyConfig(env);
+		const candidate = await readCandidateStrategyConfig(env);
+		if (candidate === null) {
+			return `MO Strategy Candidate Update
+
+activeConfigVersion: ${active.config.configVersion}
+candidateConfigVersion: (none)
+result: failed
+reason: candidate config not found`;
+		}
+		const nowIso = new Date().toISOString();
+		const updated: StrategyActiveConfig = {
+			...candidate,
+			balancedMinScore: 30,
+			updatedAt: nowIso,
+		};
+		await env.MO_NOTES.put(
+			MO_CANDIDATE_STRATEGY_CONFIG_KEY,
+			JSON.stringify(updated)
+		);
+		console.log("[strategy] candidate field updated", {
+			candidateConfigVersion: updated.configVersion,
+			field: "balancedMinScore",
+			value: 30,
+		});
+		return `MO Strategy Candidate Update
+
+activeConfigVersion: ${active.config.configVersion}
+candidateConfigVersion: ${updated.configVersion}
+result: updated
+updatedField: balancedMinScore=30`;
 	  }
 	  case "/strategy-promote-candidate": {
 		const [active, candidate, state, decision] = await Promise.all([
