@@ -1866,14 +1866,37 @@ function computeStrategyReviewDecision(params: {
 		};
 	}
 
-	// 1) compare layer 優先：若 compareDecision 已明確 promote_candidate，則 decision 直接對齊
-	if (reviewResult.compareDecision === "promote_candidate") {
-		const r = reviewResult.compareReason.trim();
-		const reason =
-			r === "" ?
-				"review_result 已驗證 candidate 可人工 promotion"
-			:	`review_result 驗證通過：${r}`;
-		return { decision: "promote_candidate", reason };
+	// 1) compare layer 優先：review_result 存在就先對齊（避免被後續 fallback 覆蓋）
+	switch (reviewResult.compareDecision) {
+		case "promote_candidate": {
+			const r = reviewResult.compareReason.trim();
+			const reason =
+				r === "" ?
+					"review_result 已驗證 candidate 可人工 promotion"
+				:	`review_result 驗證通過：${r}`;
+			return { decision: "promote_candidate", reason };
+		}
+		case "hold_review": {
+			const r = reviewResult.compareReason.trim();
+			const reason =
+				r === "" ?
+					"review_result: hold_review"
+				:	`review_result: ${r}`;
+			return { decision: "hold_review", reason };
+		}
+		case "keep_active": {
+			const r = reviewResult.compareReason.trim();
+			if (r === "no_material_diff") {
+				return {
+					decision: "hold_review",
+					reason: "active 與 candidate 幾乎無差異，暫不評估 promotion",
+				};
+			}
+			return {
+				decision: "keep_active",
+				reason: r === "" ? "review_result: keep_active" : `review_result: ${r}`,
+			};
+		}
 	}
 
 	// A
@@ -1901,15 +1924,6 @@ function computeStrategyReviewDecision(params: {
 			decision: "hold_review",
 			reason: "active 與 candidate 幾乎無差異，暫不評估 promotion",
 		};
-	}
-
-	// 2) 若 compareDecision 不是 promote_candidate：先 hold_review（沿用 review 結果，不做平行決策）
-	if (reviewResult.compareDecision !== "promote_candidate") {
-		const why =
-			reviewResult.compareReason.trim() === "" ?
-				`review_result: ${reviewResult.compareDecision}`
-			:	`review_result: ${reviewResult.compareReason.trim()}`;
-		return { decision: "hold_review", reason: why };
 	}
 
 	// 3) score 明顯偏低：keep_active
@@ -1946,11 +1960,7 @@ async function computeAndRecordStrategyReviewDecision(params: {
 		readStrategyReviewState(params.env),
 		readStrategyReviewResult(params.env),
 	]);
-	if (reviewResult !== null) {
-		console.log("[strategy] review decision resolved from review_result", {
-			compareDecision: reviewResult.compareDecision,
-		});
-	}
+	const compareDecision = reviewResult?.compareDecision;
 	const r = computeStrategyReviewDecision({
 		snapshot: params.snapshot,
 		activeConfig: params.activeConfig,
@@ -1963,6 +1973,11 @@ async function computeAndRecordStrategyReviewDecision(params: {
 		reason: r.reason,
 		evaluatedAt: formatStatusPushAtTaipei(new Date()),
 	};
+	console.log("[strategy] review decision resolved from review_result", {
+		compareDecision: compareDecision ?? "(none)",
+		finalDecision: rec.decision,
+		fallbackUsed: reviewResult === null ? "yes" : "no",
+	});
 	console.log("[strategy] review decision computed", {
 		decision: rec.decision,
 		reason: rec.reason,
