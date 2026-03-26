@@ -1300,6 +1300,7 @@ function extractCommand(messageText: string): string | null {
 	}
 	if (messageText === "/strategy-candidate-show") return "/strategy-candidate-show";
 	if (messageText === "/strategy-candidate-discard") return "/strategy-candidate-discard";
+	if (messageText === "/strategy-status") return "/strategy-status";
 	if (messageText === "/debug-strategy-change") return "/debug-strategy-change";
 	if (/^\/note(?:\s+|$)/.test(messageText)) return "/note";
 	return /^\/[A-Za-z0-9_]+$/.test(messageText) ? messageText : null;
@@ -3080,6 +3081,78 @@ candidateConfigVersion: (none)
 result: discarded
 clearedKeys: ${MO_CANDIDATE_STRATEGY_CONFIG_KEY}, ${MO_STRATEGY_REVIEW_RESULT_KEY}, ${MO_STRATEGY_REVIEW_DECISION_KEY}, ${MO_STRATEGY_REVIEW_DEMO_OVERRIDE_KEY}
 reviewStatus: ${state.reviewStatus}`;
+	  }
+	  case "/strategy-status": {
+		const [active, candidate, reviewState, reviewResult, reviewDecision, demoOverride] =
+			await Promise.all([
+				readActiveStrategyConfig(env),
+				readCandidateStrategyConfig(env),
+				readStrategyReviewState(env),
+				readStrategyReviewResult(env),
+				readStrategyReviewDecision(env),
+				readStrategyReviewDemoOverride(env),
+			]);
+
+		const hasCandidate = candidate !== null;
+		const activeVersion = active.config.configVersion;
+		const candidateVersion = candidate?.configVersion ?? "none";
+		const reviewStatus = reviewState?.reviewStatus ?? "none";
+		const demo = demoOverride === null ? "off" : "on";
+
+		const lines: string[] = [
+			"MO Strategy Status",
+			"",
+			`activeConfigVersion: ${activeVersion}`,
+			`candidateConfigVersion: ${candidateVersion}`,
+			`hasCandidate: ${hasCandidate ? "yes" : "no"}`,
+			`reviewStatus: ${reviewStatus}`,
+			`demoOverride: ${demo}`,
+		];
+
+		if (reviewState?.reviewStatus === "promoted") {
+			if (reviewState.promotedFrom) lines.push(`promotedFrom: ${reviewState.promotedFrom}`);
+			if (reviewState.promotedTo) lines.push(`promotedTo: ${reviewState.promotedTo}`);
+			if (reviewState.promotedAt) lines.push(`promotedAt: ${reviewState.promotedAt}`);
+		}
+
+		lines.push("");
+		lines.push("[LastCompare]");
+		if (reviewResult === null) {
+			lines.push("compareDecision: none");
+			lines.push("compareReason: none");
+			lines.push("source: none");
+			lines.push("comparedAt: none");
+		} else {
+			lines.push(`compareDecision: ${reviewResult.compareDecision}`);
+			lines.push(`compareReason: ${reviewResult.compareReason === "" ? "none" : reviewResult.compareReason}`);
+			lines.push(`source: ${reviewResult.source ?? "unknown"}`);
+			lines.push(`comparedAt: ${reviewResult.comparedAt}`);
+		}
+
+		lines.push("");
+		lines.push("[LastDecision]");
+		if (reviewDecision === null) {
+			lines.push("decision: none");
+			lines.push("reason: none");
+			lines.push("decisionSource: none");
+			lines.push("evaluatedAt: none");
+		} else {
+			lines.push(`decision: ${reviewDecision.decision}`);
+			lines.push(`reason: ${reviewDecision.reason === "" ? "none" : reviewDecision.reason}`);
+			lines.push(`decisionSource: ${reviewDecision.decisionSource ?? "unknown"}`);
+			lines.push(`evaluatedAt: ${reviewDecision.evaluatedAt}`);
+		}
+
+		console.log("[strategy] strategy status loaded", {
+			activeConfigVersion: activeVersion,
+			hasCandidate: hasCandidate ? "yes" : "no",
+			reviewStatus,
+			demoOverride: demo,
+			compareDecision: reviewResult?.compareDecision ?? "none",
+			decision: reviewDecision?.decision ?? "none",
+		});
+
+		return lines.join("\n");
 	  }
 	  case "/strategy-promote-candidate": {
 		const [active, candidate, state, decision] = await Promise.all([
