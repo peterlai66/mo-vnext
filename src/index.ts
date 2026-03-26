@@ -1280,6 +1280,10 @@ function extractCommand(messageText: string): string | null {
 	if (messageText === "/report-test-change") return "/report-test-change";
 	if (messageText === "/strategy-config-debug") return "/strategy-config-debug";
 	if (messageText === "/strategy-config-set-demo") return "/strategy-config-set-demo";
+	if (messageText === "/strategy-config-promote-demo-candidate") {
+		return "/strategy-config-promote-demo-candidate";
+	}
+	if (messageText === "/strategy-review-debug") return "/strategy-review-debug";
 	if (messageText === "/debug-strategy-change") return "/debug-strategy-change";
 	if (/^\/note(?:\s+|$)/.test(messageText)) return "/note";
 	return /^\/[A-Za-z0-9_]+$/.test(messageText) ? messageText : null;
@@ -1310,6 +1314,19 @@ type StrategyActiveConfig = {
 };
 
 const MO_ACTIVE_STRATEGY_CONFIG_KEY = "active_strategy_config";
+const MO_CANDIDATE_STRATEGY_CONFIG_KEY = "candidate_strategy_config";
+const MO_STRATEGY_REVIEW_STATE_KEY = "strategy_review_state";
+
+type StrategyReviewStatus = "none" | "reviewing" | "ready" | "promoted";
+
+type StrategyReviewState = {
+	activeConfigVersion: string;
+	candidateConfigVersion: string;
+	reviewStatus: StrategyReviewStatus;
+	reviewStartedAt: string;
+	lastReviewedAt: string;
+	note: string;
+};
 
 function getDefaultStrategyActiveConfig(): StrategyActiveConfig {
 	return {
@@ -1402,6 +1419,10 @@ async function readActiveStrategyConfig(
 			console.log("[strategy] config loaded", {
 				configVersion: defaultConfig.configVersion,
 			});
+			console.log("[strategy] active config loaded", {
+				source: "default",
+				configVersion: defaultConfig.configVersion,
+			});
 			return { config: defaultConfig, source: "default" };
 		}
 		const parsed = parseStrategyActiveConfigRecord(raw);
@@ -1411,6 +1432,10 @@ async function readActiveStrategyConfig(
 				key: MO_ACTIVE_STRATEGY_CONFIG_KEY,
 			});
 			console.log("[strategy] config loaded", {
+				configVersion: defaultConfig.configVersion,
+			});
+			console.log("[strategy] active config loaded", {
+				source: "default_invalid",
 				configVersion: defaultConfig.configVersion,
 			});
 			return { config: defaultConfig, source: "default" };
@@ -1423,6 +1448,10 @@ async function readActiveStrategyConfig(
 			configVersion: parsed.configVersion,
 			updatedAt: parsed.updatedAt,
 		});
+		console.log("[strategy] active config loaded", {
+			source: "kv",
+			configVersion: parsed.configVersion,
+		});
 		return { config: parsed, source: "kv" };
 	} catch {
 		console.log("[strategy] config source", {
@@ -1432,7 +1461,64 @@ async function readActiveStrategyConfig(
 		console.log("[strategy] config loaded", {
 			configVersion: defaultConfig.configVersion,
 		});
+		console.log("[strategy] active config loaded", {
+			source: "default",
+			configVersion: defaultConfig.configVersion,
+		});
 		return { config: defaultConfig, source: "default" };
+	}
+}
+
+function isStrategyReviewStatus(v: string): v is StrategyReviewStatus {
+	return v === "none" || v === "reviewing" || v === "ready" || v === "promoted";
+}
+
+function parseStrategyReviewStateRecord(raw: string): StrategyReviewState | null {
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (typeof parsed !== "object" || parsed === null) return null;
+		const obj = parsed as Record<string, unknown>;
+		if (typeof obj.activeConfigVersion !== "string") return null;
+		if (typeof obj.candidateConfigVersion !== "string") return null;
+		if (typeof obj.reviewStatus !== "string" || !isStrategyReviewStatus(obj.reviewStatus)) {
+			return null;
+		}
+		if (typeof obj.reviewStartedAt !== "string") return null;
+		if (typeof obj.lastReviewedAt !== "string") return null;
+		if (typeof obj.note !== "string") return null;
+		return {
+			activeConfigVersion: obj.activeConfigVersion,
+			candidateConfigVersion: obj.candidateConfigVersion,
+			reviewStatus: obj.reviewStatus,
+			reviewStartedAt: obj.reviewStartedAt,
+			lastReviewedAt: obj.lastReviewedAt,
+			note: obj.note,
+		};
+	} catch {
+		return null;
+	}
+}
+
+async function readStrategyReviewState(env: Env): Promise<StrategyReviewState | null> {
+	try {
+		const raw = await env.MO_NOTES.get(MO_STRATEGY_REVIEW_STATE_KEY, "text");
+		if (raw === null || raw.trim() === "") return null;
+		return parseStrategyReviewStateRecord(raw);
+	} catch {
+		return null;
+	}
+}
+
+async function writeStrategyReviewState(env: Env, state: StrategyReviewState): Promise<void> {
+	try {
+		await env.MO_NOTES.put(MO_STRATEGY_REVIEW_STATE_KEY, JSON.stringify(state));
+		console.log("[strategy] review state saved", {
+			activeConfigVersion: state.activeConfigVersion,
+			candidateConfigVersion: state.candidateConfigVersion,
+			reviewStatus: state.reviewStatus,
+		});
+	} catch {
+		// scaffold：寫入失敗不影響主流程
 	}
 }
 
@@ -1510,6 +1596,82 @@ freshnessIdleThresholdMs: ${c.freshnessIdleThresholdMs}`;
 key: ${MO_ACTIVE_STRATEGY_CONFIG_KEY}
 configVersion: ${demo.configVersion}
 result: demo config 已寫入`;
+	  }
+	  case "/strategy-config-promote-demo-candidate": {
+		// scaffold：建立 demo candidate + review state（不影響正式 /report 計算）
+		const active = await readActiveStrategyConfig(env);
+		const activeCfg = active.config;
+
+		const candidate: StrategyActiveConfig = {
+			...activeCfg,
+			// candidate-v1：示範候選配置（刻意不同）
+			freshnessWeight: Math.max(0, activeCfg.freshnessWeight - 0.15),
+			volumeWeight: activeCfg.volumeWeight + 0.2,
+			simulationWeight: activeCfg.simulationWeight,
+			balancedMinScore: Math.max(0, activeCfg.balancedMinScore - 10),
+			configVersion: "candidate-v1",
+			updatedAt: new Date().toISOString(),
+		};
+
+		// 權重總和維持為正；若不慎歸零則回退到 demo 值
+		const wSum =
+			candidate.freshnessWeight + candidate.volumeWeight + candidate.simulationWeight;
+		if (wSum <= 0) {
+			candidate.freshnessWeight = 0.2;
+			candidate.volumeWeight = 0.7;
+			candidate.simulationWeight = 0.1;
+		}
+
+		try {
+			await env.MO_NOTES.put(
+				MO_CANDIDATE_STRATEGY_CONFIG_KEY,
+				JSON.stringify(candidate)
+			);
+			console.log("[strategy] candidate config saved", {
+				configVersion: candidate.configVersion,
+				key: MO_CANDIDATE_STRATEGY_CONFIG_KEY,
+			});
+		} catch {
+			// scaffold：寫入失敗不影響 reply
+		}
+
+		const nowIso = new Date().toISOString();
+		const reviewState: StrategyReviewState = {
+			activeConfigVersion: activeCfg.configVersion,
+			candidateConfigVersion: candidate.configVersion,
+			reviewStatus: "reviewing",
+			reviewStartedAt: nowIso,
+			lastReviewedAt: nowIso,
+			note: "demo candidate created",
+		};
+		await writeStrategyReviewState(env, reviewState);
+
+		return `MO Strategy Candidate Demo Created
+
+activeKey: ${MO_ACTIVE_STRATEGY_CONFIG_KEY}
+candidateKey: ${MO_CANDIDATE_STRATEGY_CONFIG_KEY}
+reviewKey: ${MO_STRATEGY_REVIEW_STATE_KEY}
+activeConfigVersion: ${activeCfg.configVersion}
+candidateConfigVersion: ${candidate.configVersion}
+reviewStatus: ${reviewState.reviewStatus}`;
+	  }
+	  case "/strategy-review-debug": {
+		const s = await readStrategyReviewState(env);
+		if (s === null) {
+			return `MO Strategy Review Debug
+
+reviewKey: ${MO_STRATEGY_REVIEW_STATE_KEY}
+reviewState: none`;
+		}
+		return `MO Strategy Review Debug
+
+reviewKey: ${MO_STRATEGY_REVIEW_STATE_KEY}
+activeConfigVersion: ${s.activeConfigVersion}
+candidateConfigVersion: ${s.candidateConfigVersion}
+reviewStatus: ${s.reviewStatus}
+reviewStartedAt: ${s.reviewStartedAt}
+lastReviewedAt: ${s.lastReviewedAt}
+note: ${s.note}`;
 	  }
 	  case "/debug-strategy-change": {
 		const hasLineUser =
