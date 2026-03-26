@@ -1284,6 +1284,7 @@ function extractCommand(messageText: string): string | null {
 		return "/strategy-config-promote-demo-candidate";
 	}
 	if (messageText === "/strategy-review-run-demo") return "/strategy-review-run-demo";
+	if (messageText === "/strategy-review-run") return "/strategy-review-run";
 	if (messageText === "/strategy-review-explain") return "/strategy-review-explain";
 	if (messageText === "/strategy-review-debug") return "/strategy-review-debug";
 	if (messageText === "/strategy-review-decision") return "/strategy-review-decision";
@@ -1846,6 +1847,266 @@ type StrategyCurrentSnapshot = {
 	reason: string;
 };
 
+async function computeStrategyCurrentSnapshotFromRealData(params: {
+	env: Env;
+	userId: string;
+	activeConfig: StrategyActiveConfig;
+}): Promise<StrategyCurrentSnapshot | null> {
+	try {
+		const s = await getSystemStatus(params.env, params.userId);
+		const totalNotesNum = s.noteCount === "error" ? 0 : s.noteCount;
+		let latestNoteMs: number | null = null;
+		if (params.userId.trim() !== "" && params.userId !== "unknown-user") {
+			const list = await params.env.MO_NOTES.list({
+				prefix: `note:${params.userId}:`,
+				limit: 20,
+			});
+			const keyNames = list.keys.map((k) => k.name);
+			if (keyNames.length > 0) {
+				const sorted = [...keyNames].sort(
+					(a, b) => parseTimestampFromKey(b) - parseTimestampFromKey(a)
+				);
+				const latestName = sorted[0];
+				const tail =
+					latestName.startsWith(`note:${params.userId}:`) ?
+						latestName.slice(`note:${params.userId}:`.length)
+					:	latestName.split(":").pop() ?? latestName;
+				const ts = Number(tail);
+				if (Number.isFinite(ts)) latestNoteMs = ts;
+			}
+		}
+
+		const cfg = params.activeConfig;
+		const deltaMs =
+			latestNoteMs === null ? Number.POSITIVE_INFINITY : Date.now() - latestNoteMs;
+		const dataFreshnessScore =
+			latestNoteMs === null || deltaMs >= cfg.freshnessIdleThresholdMs ?
+				0
+			:	Math.round((1 - deltaMs / cfg.freshnessIdleThresholdMs) * 100);
+		const dataVolumeScore = Math.round(Math.min(1, totalNotesNum / 10) * 100);
+		const simulationReadyScore = totalNotesNum > 0 ? 100 : 0;
+		const weightSum = cfg.freshnessWeight + cfg.volumeWeight + cfg.simulationWeight;
+		const fallback = getDefaultStrategyActiveConfig();
+		const fw = weightSum > 0 ? cfg.freshnessWeight / weightSum : fallback.freshnessWeight;
+		const vw = weightSum > 0 ? cfg.volumeWeight / weightSum : fallback.volumeWeight;
+		const sw =
+			weightSum > 0 ? cfg.simulationWeight / weightSum : fallback.simulationWeight;
+		const scoreRaw =
+			dataFreshnessScore * fw + dataVolumeScore * vw + simulationReadyScore * sw;
+		const score = Math.max(0, Math.min(100, Math.round(scoreRaw)));
+		let strategy: "aggressive" | "balanced" | "conservative";
+		if (score >= cfg.aggressiveMinScore) strategy = "aggressive";
+		else if (score >= cfg.balancedMinScore) strategy = "balanced";
+		else strategy = "conservative";
+
+		let status: "active" | "idle";
+		let reason: string;
+		if (latestNoteMs === null) {
+			status = "idle";
+			reason = "尚無資料";
+		} else if (deltaMs > cfg.freshnessIdleThresholdMs) {
+			status = "idle";
+			reason = "長時間未更新";
+		} else if (simulationReadyScore === 0) {
+			status = "idle";
+			reason = "無資料可模擬";
+		} else {
+			status = "active";
+			reason = "近期有活動";
+		}
+
+		return {
+			dataFreshnessScore,
+			dataVolumeScore,
+			simulationReadyScore,
+			score,
+			strategy,
+			status,
+			reason,
+		};
+	} catch {
+		return null;
+	}
+}
+
+async function runStrategyReview(params: {
+	env: Env;
+	userId: string;
+	source: "demo" | "real";
+	allowDemoOverride: boolean;
+}): Promise<{
+	comparedAt: string;
+	compareDecision: StrategyCompareDecision;
+	compareReason: string;
+}> {
+	const active = await readActiveStrategyConfig(params.env);
+	const candidate = await readCandidateStrategyConfig(params.env);
+	const state = await readStrategyReviewState(params.env);
+
+	if (candidate === null || state === null) {
+		return {
+			comparedAt: "",
+			compareDecision: "hold_review",
+			compareReason: "skipped: candidate_strategy_config 或 strategy_review_state 不存在",
+		};
+	}
+
+	console.log("[strategy] review run start", { source: params.source });
+	const a = active.config;
+	const c = candidate;
+
+	const diffs: string[] = [];
+	if (a.freshnessWeight !== c.freshnessWeight) diffs.push("freshnessWeight");
+	if (a.volumeWeight !== c.volumeWeight) diffs.push("volumeWeight");
+	if (a.simulationWeight !== c.simulationWeight) diffs.push("simulationWeight");
+	if (a.aggressiveMinScore !== c.aggressiveMinScore) diffs.push("aggressiveMinScore");
+	if (a.balancedMinScore !== c.balancedMinScore) diffs.push("balancedMinScore");
+	if (a.freshnessIdleThresholdMs !== c.freshnessIdleThresholdMs) diffs.push("freshnessIdleThresholdMs");
+
+	const demoOverride =
+		params.allowDemoOverride ? await readStrategyReviewDemoOverride(params.env) : null;
+	const snapshot =
+		params.source === "real" ? await computeStrategyCurrentSnapshotFromRealData({
+			env: params.env,
+			userId: params.userId,
+			activeConfig: a,
+		}) : null;
+
+	const isStrongDemo =
+		demoOverride !== null &&
+		demoOverride.status === "active" &&
+		demoOverride.dataFreshnessScore >= 80 &&
+		demoOverride.dataVolumeScore >= 80 &&
+		demoOverride.simulationReadyScore >= 80;
+	const isStrongReal =
+		snapshot !== null &&
+		snapshot.status === "active" &&
+		snapshot.dataFreshnessScore >= 80 &&
+		snapshot.dataVolumeScore >= 80 &&
+		snapshot.simulationReadyScore >= 80;
+
+	let compareDecision: StrategyCompareDecision;
+	let compareReason: string;
+	let compareSummary: string;
+
+	if (diffs.length === 0) {
+		compareDecision = "keep_active";
+		compareReason = "no_material_diff";
+		compareSummary = "active vs candidate same";
+	} else if ((params.source === "demo" && isStrongDemo) || (params.source === "real" && isStrongReal)) {
+		compareDecision = "promote_candidate";
+		compareReason =
+			params.source === "demo" ?
+				`candidate changes validated under demo review conditions: ${diffs.join(", ")}`
+			:	`candidate changes validated under real review conditions: ${diffs.join(", ")}`;
+		compareSummary = "candidate validated for promotion";
+	} else {
+		compareDecision = "hold_review";
+		compareReason = `candidate changes but review conditions not strong enough: ${diffs.join(", ")}`;
+		compareSummary = "active vs candidate differ";
+	}
+
+	console.log("[strategy] review compare computed", {
+		source: params.source,
+		compareDecision,
+		compareReason,
+		demoOverride: demoOverride === null ? "off" : "on",
+	});
+
+	const nowIso = new Date().toISOString();
+	const result: StrategyReviewResult = {
+		activeConfigVersion: a.configVersion,
+		candidateConfigVersion: c.configVersion,
+		comparedAt: nowIso,
+		compareSummary,
+		compareDecision,
+		compareReason,
+		note: params.source === "demo" ? "demo compare result" : "real compare result",
+	};
+	await writeStrategyReviewResult(params.env, result);
+
+	// 寫入本輪 state（normalize）
+	const wasPromoted =
+		state.reviewStatus === "promoted" ||
+		state.promotedAt !== undefined ||
+		state.promotedFrom !== undefined ||
+		state.promotedTo !== undefined;
+	if (wasPromoted) {
+		console.log("[strategy] review state normalized for new cycle", {
+			previousReviewStatus: state.reviewStatus,
+			cleared: "promotion_state",
+		});
+	}
+	const nextReviewStatus: StrategyReviewStatus =
+		compareDecision === "keep_active" && compareReason === "no_material_diff" ?
+			"reviewed"
+		:	"reviewing";
+	const nextState: StrategyReviewState = {
+		activeConfigVersion: a.configVersion,
+		candidateConfigVersion: c.configVersion,
+		reviewStatus: nextReviewStatus,
+		reviewStartedAt: nowIso,
+		lastReviewedAt: nowIso,
+		note:
+			nextReviewStatus === "reviewed" ?
+				"no material diff"
+			:	(params.source === "demo" ? "demo review run completed" : "real review run completed"),
+	};
+	await writeStrategyReviewState(params.env, nextState);
+
+	// decision：demo 可用 override snapshot；real 用真實 snapshot；兩者都會落盤
+	let decisionSnapshot: StrategyCurrentSnapshot | null = null;
+	if (params.source === "demo" && demoOverride !== null) {
+		const weightSum = a.freshnessWeight + a.volumeWeight + a.simulationWeight;
+		const fallback = getDefaultStrategyActiveConfig();
+		const fw = weightSum > 0 ? a.freshnessWeight / weightSum : fallback.freshnessWeight;
+		const vw = weightSum > 0 ? a.volumeWeight / weightSum : fallback.volumeWeight;
+		const sw = weightSum > 0 ? a.simulationWeight / weightSum : fallback.simulationWeight;
+		const scoreRaw =
+			demoOverride.dataFreshnessScore * fw +
+			demoOverride.dataVolumeScore * vw +
+			demoOverride.simulationReadyScore * sw;
+		const score = Math.max(0, Math.min(100, Math.round(scoreRaw)));
+		let strategy: "aggressive" | "balanced" | "conservative";
+		if (score >= a.aggressiveMinScore) strategy = "aggressive";
+		else if (score >= a.balancedMinScore) strategy = "balanced";
+		else strategy = "conservative";
+		decisionSnapshot = {
+			dataFreshnessScore: demoOverride.dataFreshnessScore,
+			dataVolumeScore: demoOverride.dataVolumeScore,
+			simulationReadyScore: demoOverride.simulationReadyScore,
+			score,
+			strategy,
+			status: demoOverride.status,
+			reason: `demo override: ${demoOverride.note}`,
+		};
+		console.log("[strategy] review demo override enabled", {
+			note: demoOverride.note,
+			updatedAt: demoOverride.updatedAt,
+		});
+	} else if (snapshot !== null) {
+		decisionSnapshot = snapshot;
+	}
+	if (decisionSnapshot === null) {
+		decisionSnapshot = {
+			dataFreshnessScore: 0,
+			dataVolumeScore: 0,
+			simulationReadyScore: 0,
+			score: 0,
+			strategy: "conservative",
+			status: "idle",
+			reason: "尚無資料",
+		};
+	}
+	await computeAndRecordStrategyReviewDecision({
+		env: params.env,
+		activeConfig: a,
+		snapshot: decisionSnapshot,
+	});
+
+	return { comparedAt: nowIso, compareDecision, compareReason };
+}
+
 function computeStrategyReviewDecision(params: {
 	snapshot: StrategyCurrentSnapshot;
 	activeConfig: StrategyActiveConfig;
@@ -2367,226 +2628,32 @@ candidateConfigVersion: ${candidate.configVersion}
 reviewStatus: ${reviewState.reviewStatus}`;
 	  }
 	  case "/strategy-review-run-demo": {
-		const active = await readActiveStrategyConfig(env);
-		const candidate = await readCandidateStrategyConfig(env);
-		const state = await readStrategyReviewState(env);
-
-		if (candidate === null || state === null) {
-			return `MO Strategy Review Run Demo
-
-result: skipped
-reason: candidate_strategy_config 或 strategy_review_state 不存在`;
-		}
-
-		const a = active.config;
-		const c = candidate;
-		const diffs: string[] = [];
-		if (a.freshnessWeight !== c.freshnessWeight) diffs.push("freshnessWeight");
-		if (a.volumeWeight !== c.volumeWeight) diffs.push("volumeWeight");
-		if (a.simulationWeight !== c.simulationWeight) diffs.push("simulationWeight");
-		if (a.aggressiveMinScore !== c.aggressiveMinScore) diffs.push("aggressiveMinScore");
-		if (a.balancedMinScore !== c.balancedMinScore) diffs.push("balancedMinScore");
-		if (a.freshnessIdleThresholdMs !== c.freshnessIdleThresholdMs) {
-			diffs.push("freshnessIdleThresholdMs");
-		}
-
-		const demoOverrideForCompare = await readStrategyReviewDemoOverride(env);
-		const isDemoStrong =
-			demoOverrideForCompare !== null &&
-			demoOverrideForCompare.status === "active" &&
-			demoOverrideForCompare.dataFreshnessScore >= 80 &&
-			demoOverrideForCompare.dataVolumeScore >= 80 &&
-			demoOverrideForCompare.simulationReadyScore >= 80;
-
-		let compareDecision: StrategyCompareDecision;
-		let compareReason: string;
-		let compareSummary: string;
-		if (diffs.length === 0) {
-			compareDecision = "keep_active";
-			compareReason = "no_material_diff";
-			compareSummary = "active vs candidate same";
-		} else if (isDemoStrong) {
-			compareDecision = "promote_candidate";
-			compareReason = `candidate changes validated under demo review conditions: ${diffs.join(", ")}`;
-			compareSummary = "candidate validated for promotion";
-		} else {
-			compareDecision = "hold_review";
-			compareReason = `candidate changes but review conditions not strong enough: ${diffs.join(", ")}`;
-			compareSummary = "active vs candidate differ";
-		}
-		console.log("[strategy] review compare computed", {
-			compareDecision,
-			compareReason,
-			demoOverride: demoOverrideForCompare === null ? "off" : "on",
-		});
-
-		const nowIso = new Date().toISOString();
-		const result: StrategyReviewResult = {
-			activeConfigVersion: a.configVersion,
-			candidateConfigVersion: c.configVersion,
-			comparedAt: nowIso,
-			compareSummary,
-			compareDecision,
-			compareReason,
-			note: "demo compare result",
-		};
-		await writeStrategyReviewResult(env, result);
-
-		const wasPromoted =
-			state.reviewStatus === "promoted" ||
-			state.promotedAt !== undefined ||
-			state.promotedFrom !== undefined ||
-			state.promotedTo !== undefined;
-		if (wasPromoted) {
-			console.log("[strategy] review state normalized for new cycle", {
-				previousReviewStatus: state.reviewStatus,
-				cleared: "promotion_state",
-			});
-		}
-		const nextReviewStatus: StrategyReviewStatus =
-			compareDecision === "keep_active" && compareReason === "no_material_diff" ?
-				"reviewed"
-			:	"reviewing";
-		if (nextReviewStatus === "reviewed") {
-			console.log("[strategy] review state normalized for new cycle", {
-				reviewStatus: "reviewed",
-				reason: "no_material_diff",
-			});
-		}
-		// 新一輪 run-demo：不沿用舊 state（避免殘留 promoted*）
-		const nextState: StrategyReviewState = {
-			activeConfigVersion: a.configVersion,
-			candidateConfigVersion: c.configVersion,
-			reviewStatus: nextReviewStatus,
-			reviewStartedAt: nowIso,
-			lastReviewedAt: nowIso,
-			note:
-				nextReviewStatus === "reviewed" ?
-					"no material diff"
-				:	"demo review run completed",
-		};
-		await writeStrategyReviewState(env, nextState);
-
-		// 同步更新 decision（僅記錄，不做 promotion）
-		const snapshot: StrategyCurrentSnapshot = {
-			dataFreshnessScore: 0,
-			dataVolumeScore: 0,
-			simulationReadyScore: 0,
-			score: 0,
-			strategy: "conservative",
-			status: "idle",
-			reason: "尚無資料",
-		};
-		const demoOverride = await readStrategyReviewDemoOverride(env);
-		if (demoOverride !== null) {
-			console.log("[strategy] review demo override enabled", {
-				note: demoOverride.note,
-				updatedAt: demoOverride.updatedAt,
-			});
-			const cfg = active.config;
-			const weightSum = cfg.freshnessWeight + cfg.volumeWeight + cfg.simulationWeight;
-			const fallback = getDefaultStrategyActiveConfig();
-			const fw = weightSum > 0 ? cfg.freshnessWeight / weightSum : fallback.freshnessWeight;
-			const vw = weightSum > 0 ? cfg.volumeWeight / weightSum : fallback.volumeWeight;
-			const sw = weightSum > 0 ? cfg.simulationWeight / weightSum : fallback.simulationWeight;
-			const scoreRaw =
-				demoOverride.dataFreshnessScore * fw +
-				demoOverride.dataVolumeScore * vw +
-				demoOverride.simulationReadyScore * sw;
-			const score = Math.max(0, Math.min(100, Math.round(scoreRaw)));
-			let strategy: "aggressive" | "balanced" | "conservative";
-			if (score >= cfg.aggressiveMinScore) strategy = "aggressive";
-			else if (score >= cfg.balancedMinScore) strategy = "balanced";
-			else strategy = "conservative";
-			snapshot.dataFreshnessScore = demoOverride.dataFreshnessScore;
-			snapshot.dataVolumeScore = demoOverride.dataVolumeScore;
-			snapshot.simulationReadyScore = demoOverride.simulationReadyScore;
-			snapshot.score = score;
-			snapshot.strategy = strategy;
-			snapshot.status = demoOverride.status;
-			snapshot.reason = `demo override: ${demoOverride.note}`;
-		} else {
-		try {
-			// 嘗試用目前 user 的資料狀態計算（與 explain 相同方向，失敗則維持預設）
-			const s2 = await getSystemStatus(env, userId);
-			const totalNotesNum = s2.noteCount === "error" ? 0 : s2.noteCount;
-			let latestNoteMs: number | null = null;
-			if (userId.trim() !== "" && userId !== "unknown-user") {
-				const list = await env.MO_NOTES.list({ prefix: `note:${userId}:`, limit: 20 });
-				const keyNames = list.keys.map((k) => k.name);
-				if (keyNames.length > 0) {
-					const sorted = [...keyNames].sort(
-						(a, b) => parseTimestampFromKey(b) - parseTimestampFromKey(a)
-					);
-					const latestName = sorted[0];
-					const tail =
-						latestName.startsWith(`note:${userId}:`) ?
-							latestName.slice(`note:${userId}:`.length)
-						:	latestName.split(":").pop() ?? latestName;
-					const ts = Number(tail);
-					if (Number.isFinite(ts)) latestNoteMs = ts;
-				}
-			}
-			const cfg = active.config;
-			const deltaMs =
-				latestNoteMs === null ? Number.POSITIVE_INFINITY : Date.now() - latestNoteMs;
-			const dataFreshnessScore =
-				latestNoteMs === null || deltaMs >= cfg.freshnessIdleThresholdMs ?
-					0
-				:	Math.round((1 - deltaMs / cfg.freshnessIdleThresholdMs) * 100);
-			const dataVolumeScore = Math.round(Math.min(1, totalNotesNum / 10) * 100);
-			const simulationReadyScore = totalNotesNum > 0 ? 100 : 0;
-			const weightSum = cfg.freshnessWeight + cfg.volumeWeight + cfg.simulationWeight;
-			const fallback = getDefaultStrategyActiveConfig();
-			const fw = weightSum > 0 ? cfg.freshnessWeight / weightSum : fallback.freshnessWeight;
-			const vw = weightSum > 0 ? cfg.volumeWeight / weightSum : fallback.volumeWeight;
-			const sw =
-				weightSum > 0 ? cfg.simulationWeight / weightSum : fallback.simulationWeight;
-			const scoreRaw =
-				dataFreshnessScore * fw + dataVolumeScore * vw + simulationReadyScore * sw;
-			const score = Math.max(0, Math.min(100, Math.round(scoreRaw)));
-			let strategy: "aggressive" | "balanced" | "conservative";
-			if (score >= cfg.aggressiveMinScore) strategy = "aggressive";
-			else if (score >= cfg.balancedMinScore) strategy = "balanced";
-			else strategy = "conservative";
-			let status: "active" | "idle";
-			let reason: string;
-			if (latestNoteMs === null) {
-				status = "idle";
-				reason = "尚無資料";
-			} else if (deltaMs > cfg.freshnessIdleThresholdMs) {
-				status = "idle";
-				reason = "長時間未更新";
-			} else if (simulationReadyScore === 0) {
-				status = "idle";
-				reason = "無資料可模擬";
-			} else {
-				status = "active";
-				reason = "近期有活動";
-			}
-			snapshot.dataFreshnessScore = dataFreshnessScore;
-			snapshot.dataVolumeScore = dataVolumeScore;
-			snapshot.simulationReadyScore = simulationReadyScore;
-			snapshot.score = score;
-			snapshot.strategy = strategy;
-			snapshot.status = status;
-			snapshot.reason = reason;
-		} catch {
-			// ignore
-		}
-		}
-		await computeAndRecordStrategyReviewDecision({
+		const r = await runStrategyReview({
 			env,
-			activeConfig: active.config,
-			snapshot,
+			userId,
+			source: "demo",
+			allowDemoOverride: true,
 		});
-
 		return `MO Strategy Review Run Demo
 
 reviewResultKey: ${MO_STRATEGY_REVIEW_RESULT_KEY}
-comparedAt: ${result.comparedAt}
-compareDecision: ${result.compareDecision}
-compareReason: ${result.compareReason}`;
+comparedAt: ${r.comparedAt}
+compareDecision: ${r.compareDecision}
+compareReason: ${r.compareReason}`;
+	  }
+	  case "/strategy-review-run": {
+		const r = await runStrategyReview({
+			env,
+			userId,
+			source: "real",
+			allowDemoOverride: false,
+		});
+		return `MO Strategy Review Run
+
+reviewResultKey: ${MO_STRATEGY_REVIEW_RESULT_KEY}
+comparedAt: ${r.comparedAt}
+compareDecision: ${r.compareDecision}
+compareReason: ${r.compareReason}`;
 	  }
 	  case "/strategy-review-decision": {
 		const d = await readStrategyReviewDecision(env);
