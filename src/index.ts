@@ -1299,6 +1299,7 @@ function extractCommand(messageText: string): string | null {
 		return "/strategy-candidate-patch";
 	}
 	if (messageText === "/strategy-candidate-show") return "/strategy-candidate-show";
+	if (messageText === "/strategy-candidate-discard") return "/strategy-candidate-discard";
 	if (messageText === "/debug-strategy-change") return "/debug-strategy-change";
 	if (/^\/note(?:\s+|$)/.test(messageText)) return "/note";
 	return /^\/[A-Za-z0-9_]+$/.test(messageText) ? messageText : null;
@@ -3024,6 +3025,61 @@ reason: candidate config not found`;
 			diffFields: diffs,
 		});
 		return lines.join("\n");
+	  }
+	  case "/strategy-candidate-discard": {
+		const [active, candidate] = await Promise.all([
+			readActiveStrategyConfig(env),
+			readCandidateStrategyConfig(env),
+		]);
+		const now = formatStatusPushAtTaipei(new Date());
+
+		if (candidate === null) {
+			return `MO Strategy Candidate Discard
+
+activeConfigVersion: ${active.config.configVersion}
+candidateConfigVersion: (none)
+result: no_candidate`;
+		}
+
+		// 刪除 candidate（不動 active）
+		try {
+			await env.MO_NOTES.delete(MO_CANDIDATE_STRATEGY_CONFIG_KEY);
+		} catch {
+			// delete 失敗仍嘗試清理 review 狀態，避免半套
+		}
+
+		await Promise.all([
+			clearStrategyReviewResult(env),
+			clearStrategyReviewDecision(env),
+			clearStrategyReviewDemoOverride(env),
+		]);
+
+		const state: StrategyReviewState = {
+			activeConfigVersion: active.config.configVersion,
+			candidateConfigVersion: "none",
+			reviewStatus: "idle",
+			reviewStartedAt: now,
+			lastReviewedAt: now,
+			note: "candidate discarded manually",
+		};
+		await writeStrategyReviewState(env, state);
+
+		console.log("[strategy] candidate discarded", {
+			cleared: [
+				MO_CANDIDATE_STRATEGY_CONFIG_KEY,
+				MO_STRATEGY_REVIEW_RESULT_KEY,
+				MO_STRATEGY_REVIEW_DECISION_KEY,
+				MO_STRATEGY_REVIEW_DEMO_OVERRIDE_KEY,
+			],
+		});
+
+		return `MO Strategy Candidate Discard
+
+activeConfigVersion: ${active.config.configVersion}
+candidateConfigVersion: (none)
+result: discarded
+clearedKeys: ${MO_CANDIDATE_STRATEGY_CONFIG_KEY}, ${MO_STRATEGY_REVIEW_RESULT_KEY}, ${MO_STRATEGY_REVIEW_DECISION_KEY}, ${MO_STRATEGY_REVIEW_DEMO_OVERRIDE_KEY}
+reviewStatus: ${state.reviewStatus}`;
 	  }
 	  case "/strategy-promote-candidate": {
 		const [active, candidate, state, decision] = await Promise.all([
