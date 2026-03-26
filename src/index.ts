@@ -1612,6 +1612,7 @@ type StrategyReviewExplainAiFailureReason =
 	| "invalid_json"
 	| "invalid_response_shape"
 	| "empty_content"
+	| "truncated"
 	| "timeout"
 	| "thrown_error"
 	| "unknown";
@@ -1717,7 +1718,7 @@ reason: ${params.currentSnapshot.reason}
 			body: JSON.stringify({
 				model: "gpt-4o-mini",
 				temperature: 0.2,
-				max_completion_tokens: 90,
+				max_completion_tokens: 160,
 				messages: [
 					{ role: "system", content: systemPrompt },
 					{ role: "user", content: userPrompt },
@@ -1747,6 +1748,24 @@ reason: ${params.currentSnapshot.reason}
 			return { ok: false, reason: "invalid_json", rawResponseSnippet };
 		}
 
+		const finishReason = (() => {
+			if (
+				typeof responseJson !== "object" ||
+				responseJson === null ||
+				!("choices" in responseJson) ||
+				!Array.isArray((responseJson as Record<string, unknown>).choices) ||
+				(responseJson as Record<string, unknown>).choices.length === 0
+			) {
+				return null;
+			}
+			const first = (responseJson as Record<string, unknown>).choices[0];
+			if (typeof first !== "object" || first === null) return null;
+			if (!("finish_reason" in first) || typeof first.finish_reason !== "string") {
+				return null;
+			}
+			return first.finish_reason;
+		})();
+
 		const text = extractAiSummaryText(responseJson);
 		if (text === null) {
 			const hasChoices =
@@ -1763,6 +1782,16 @@ reason: ${params.currentSnapshot.reason}
 			return { ok: false, reason: "invalid_response_shape", rawResponseSnippet };
 		}
 		console.log("[strategy] review explain parsed content", text.slice(0, 800));
+
+		if (finishReason === "length") {
+			console.log("[strategy] review explain truncated", { finishReason });
+			return {
+				ok: false,
+				reason: "truncated",
+				rawResponseSnippet,
+				parsedContentSnippet: text.slice(0, 800),
+			};
+		}
 
 		const lines = text
 			.split(/\r?\n/u)
@@ -2113,6 +2142,32 @@ ${ai.text}`;
 			errorName: ai.errorName,
 			errorMessage: ai.errorMessage,
 		});
+		if (ai.reason === "truncated") {
+			const fieldHint =
+				result?.compareReason && result.compareReason.trim() !== "" ?
+					result.compareReason.trim()
+				:	"請參考 Diff";
+			const statusHint =
+				currentSnapshot === null ?
+					"目前狀態未知"
+				:	`目前狀態為 ${currentSnapshot.status}（${currentSnapshot.reason}），dataFreshnessScore=${currentSnapshot.dataFreshnessScore}。`;
+			const decisionHint =
+				result?.compareDecision === "keep_active" ?
+					"因目前決策為 keep_active，先維持 active 設定並持續觀察。"
+				:	"因目前 compareDecision 未明確，先維持 active 設定並持續觀察。";
+			const ruleExplain = [
+				`candidate 變更欄位：${fieldHint}（例如 freshnessWeight）。`,
+				`方向解讀：更偏向以 volumeWeight/門檻驅動策略判讀，對 freshnessWeight 的敏感度降低。`,
+				`${statusHint}`,
+				decisionHint,
+			]
+				.slice(0, 4)
+				.join("\n");
+			console.log("[strategy] review explain fallback");
+			return `MO Strategy Review Explain
+
+${ruleExplain}`;
+		}
 		console.log("[strategy] review explain fallback");
 		return `MO Strategy Review Explain
 
