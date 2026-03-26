@@ -1287,6 +1287,7 @@ function extractCommand(messageText: string): string | null {
 	if (messageText === "/strategy-review-explain") return "/strategy-review-explain";
 	if (messageText === "/strategy-review-debug") return "/strategy-review-debug";
 	if (messageText === "/strategy-review-decision") return "/strategy-review-decision";
+	if (messageText === "/strategy-promote-candidate") return "/strategy-promote-candidate";
 	if (messageText === "/debug-strategy-change") return "/debug-strategy-change";
 	if (/^\/note(?:\s+|$)/.test(messageText)) return "/note";
 	return /^\/[A-Za-z0-9_]+$/.test(messageText) ? messageText : null;
@@ -1349,7 +1350,9 @@ type StrategyReviewDecisionLabel =
 	| "keep_active"
 	| "candidate_watch"
 	| "candidate_promising"
-	| "candidate_reject";
+	| "candidate_reject"
+	| "promote_candidate"
+	| "promoted";
 
 type StrategyReviewDecisionRecord = {
 	decision: StrategyReviewDecisionLabel;
@@ -1632,7 +1635,9 @@ function parseStrategyReviewDecisionRecord(raw: string): StrategyReviewDecisionR
 			decision !== "keep_active" &&
 			decision !== "candidate_watch" &&
 			decision !== "candidate_promising" &&
-			decision !== "candidate_reject"
+			decision !== "candidate_reject" &&
+			decision !== "promote_candidate" &&
+			decision !== "promoted"
 		) {
 			return null;
 		}
@@ -2274,6 +2279,76 @@ evaluatedAt: none`;
 decision: ${d.decision}
 reason: ${d.reason}
 evaluatedAt: ${d.evaluatedAt}`;
+	  }
+	  case "/strategy-promote-candidate": {
+		const [active, candidate, state, decision] = await Promise.all([
+			readActiveStrategyConfig(env),
+			readCandidateStrategyConfig(env),
+			readStrategyReviewState(env),
+			readStrategyReviewDecision(env),
+		]);
+
+		const at = formatStatusPushAtTaipei(new Date());
+		if (candidate === null) {
+			return `MO Strategy Promote Candidate
+
+promotedFrom: ${active.config.configVersion}
+promotedTo: (none)
+result: not_promoted
+reason: candidate config not found
+at: ${at}`;
+		}
+		if (decision === null) {
+			return `MO Strategy Promote Candidate
+
+promotedFrom: ${active.config.configVersion}
+promotedTo: ${candidate.configVersion}
+result: not_promoted
+reason: review decision not found
+at: ${at}`;
+		}
+		if (decision.decision !== "promote_candidate") {
+			return `MO Strategy Promote Candidate
+
+promotedFrom: ${active.config.configVersion}
+promotedTo: ${candidate.configVersion}
+result: not_promoted
+reason: current decision is not promote_candidate
+at: ${at}`;
+		}
+
+		const nowIso = new Date().toISOString();
+		const promotedActive: StrategyActiveConfig = {
+			...candidate,
+			updatedAt: nowIso,
+		};
+		await env.MO_NOTES.put(
+			MO_ACTIVE_STRATEGY_CONFIG_KEY,
+			JSON.stringify(promotedActive)
+		);
+
+		const nextState: StrategyReviewState = {
+			activeConfigVersion: promotedActive.configVersion,
+			candidateConfigVersion: candidate.configVersion,
+			reviewStatus: "promoted",
+			reviewStartedAt: state?.reviewStartedAt ?? nowIso,
+			lastReviewedAt: nowIso,
+			note: "candidate promoted to active manually",
+		};
+		await writeStrategyReviewState(env, nextState);
+
+		await writeStrategyReviewDecision(env, {
+			decision: "promoted",
+			reason: "manual promotion completed",
+			evaluatedAt: at,
+		});
+
+		return `MO Strategy Promote Candidate
+
+promotedFrom: ${active.config.configVersion}
+promotedTo: ${promotedActive.configVersion}
+result: promoted
+at: ${at}`;
 	  }
 	  case "/strategy-review-explain": {
 		console.log("[strategy] review explain start");
