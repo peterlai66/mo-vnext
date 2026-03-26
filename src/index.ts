@@ -1284,6 +1284,7 @@ function extractCommand(messageText: string): string | null {
 		return "/strategy-config-promote-demo-candidate";
 	}
 	if (messageText === "/strategy-review-run-demo") return "/strategy-review-run-demo";
+	if (messageText === "/strategy-review-explain") return "/strategy-review-explain";
 	if (messageText === "/strategy-review-debug") return "/strategy-review-debug";
 	if (messageText === "/debug-strategy-change") return "/debug-strategy-change";
 	if (/^\/note(?:\s+|$)/.test(messageText)) return "/note";
@@ -1606,6 +1607,102 @@ async function writeStrategyReviewResult(env: Env, result: StrategyReviewResult)
 	}
 }
 
+async function generateStrategyReviewExplainAi(params: {
+	active: StrategyActiveConfig;
+	candidate: StrategyActiveConfig | null;
+	reviewState: StrategyReviewState | null;
+	reviewResult: StrategyReviewResult | null;
+	env: Env;
+	timeoutMs: number;
+}): Promise<string | null> {
+	const diffLines: string[] = [];
+	if (params.candidate !== null) {
+		const a = params.active;
+		const c = params.candidate;
+		diffLines.push(`freshnessWeight: active=${a.freshnessWeight} candidate=${c.freshnessWeight}`);
+		diffLines.push(`volumeWeight: active=${a.volumeWeight} candidate=${c.volumeWeight}`);
+		diffLines.push(
+			`simulationWeight: active=${a.simulationWeight} candidate=${c.simulationWeight}`
+		);
+		diffLines.push(
+			`aggressiveMinScore: active=${a.aggressiveMinScore} candidate=${c.aggressiveMinScore}`
+		);
+		diffLines.push(
+			`balancedMinScore: active=${a.balancedMinScore} candidate=${c.balancedMinScore}`
+		);
+		diffLines.push(
+			`freshnessIdleThresholdMs: active=${a.freshnessIdleThresholdMs} candidate=${c.freshnessIdleThresholdMs}`
+		);
+	} else {
+		diffLines.push("(candidate missing)");
+	}
+
+	const systemPrompt =
+		"你是 MO vNext 的策略審查解釋層。請用繁體中文輸出 2~4 行，重點清楚、不要廢話。只做解釋，不要提出新的決策或修改設定。";
+	const userPrompt = `請根據以下資料解釋策略 review：
+
+[Active]
+configVersion: ${params.active.configVersion}
+
+[Candidate]
+configVersion: ${params.candidate?.configVersion ?? "(none)"}
+
+[ReviewState]
+activeConfigVersion: ${params.reviewState?.activeConfigVersion ?? "(none)"}
+candidateConfigVersion: ${params.reviewState?.candidateConfigVersion ?? "(none)"}
+reviewStatus: ${params.reviewState?.reviewStatus ?? "(none)"}
+
+[ReviewResult]
+compareDecision: ${params.reviewResult?.compareDecision ?? "(none)"}
+compareReason: ${params.reviewResult?.compareReason ?? "(none)"}
+compareSummary: ${params.reviewResult?.compareSummary ?? "(none)"}
+
+[Diff]
+${diffLines.join("\n")}
+
+輸出要求：
+- 2~4 行繁體中文
+- 說明 candidate 改了什麼
+- 說明為什麼目前 decision 是 keep_active（或目前 result 缺失時用保守說法）
+- 提到整體策略傾向（偏重 freshness / volume / 門檻的方向）`;
+
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), params.timeoutMs);
+	try {
+		const response = await fetch("https://api.openai.com/v1/chat/completions", {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: `Bearer ${params.env.OPENAI_API_KEY}`,
+			},
+			signal: controller.signal,
+			body: JSON.stringify({
+				model: "gpt-4o-mini",
+				temperature: 0.2,
+				max_completion_tokens: 120,
+				messages: [
+					{ role: "system", content: systemPrompt },
+					{ role: "user", content: userPrompt },
+				],
+			}),
+		});
+		if (!response.ok) return null;
+		const responseJson = (await response.json()) as unknown;
+		const text = extractAiSummaryText(responseJson);
+		if (text === null) return null;
+		const lines = text
+			.split(/\r?\n/u)
+			.map((l) => l.trim())
+			.filter((l) => l !== "");
+		if (lines.length === 0) return null;
+		return lines.slice(0, 4).join("\n");
+	} catch {
+		return null;
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 async function getSystemStatus(env: Env, userId: string): Promise<SystemStatus> {
 	let d1Label: "ok" | "error" = "error";
 	try {
@@ -1796,6 +1893,35 @@ reviewResultKey: ${MO_STRATEGY_REVIEW_RESULT_KEY}
 comparedAt: ${result.comparedAt}
 compareDecision: ${result.compareDecision}
 compareReason: ${result.compareReason}`;
+	  }
+	  case "/strategy-review-explain": {
+		console.log("[strategy] review explain start");
+		const [active, candidate, state, result] = await Promise.all([
+			readActiveStrategyConfig(env),
+			readCandidateStrategyConfig(env),
+			readStrategyReviewState(env),
+			readStrategyReviewResult(env),
+		]);
+
+		const ai = await generateStrategyReviewExplainAi({
+			active: active.config,
+			candidate,
+			reviewState: state,
+			reviewResult: result,
+			env,
+			timeoutMs: 1200,
+		});
+
+		if (ai !== null) {
+			console.log("[strategy] review explain success");
+			return `MO Strategy Review Explain
+
+${ai}`;
+		}
+		console.log("[strategy] review explain fallback");
+		return `MO Strategy Review Explain
+
+candidate 調整了部分策略權重與門檻，目前系統仍維持 active 設定，持續觀察中。`;
 	  }
 	  case "/strategy-review-debug": {
 		const s = await readStrategyReviewState(env);
