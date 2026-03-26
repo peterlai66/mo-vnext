@@ -1335,6 +1335,9 @@ type StrategyReviewState = {
 	reviewStartedAt: string;
 	lastReviewedAt: string;
 	note: string;
+	promotedAt?: string;
+	promotedFrom?: string;
+	promotedTo?: string;
 };
 
 type StrategyCompareDecision = "keep_active" | "hold_review" | "promote_candidate";
@@ -1543,6 +1546,12 @@ function parseStrategyReviewStateRecord(raw: string): StrategyReviewState | null
 		if (typeof obj.reviewStartedAt !== "string") return null;
 		if (typeof obj.lastReviewedAt !== "string") return null;
 		if (typeof obj.note !== "string") return null;
+		const promotedAt =
+			typeof obj.promotedAt === "string" ? obj.promotedAt : undefined;
+		const promotedFrom =
+			typeof obj.promotedFrom === "string" ? obj.promotedFrom : undefined;
+		const promotedTo =
+			typeof obj.promotedTo === "string" ? obj.promotedTo : undefined;
 		return {
 			activeConfigVersion: obj.activeConfigVersion,
 			candidateConfigVersion: obj.candidateConfigVersion,
@@ -1550,6 +1559,9 @@ function parseStrategyReviewStateRecord(raw: string): StrategyReviewState | null
 			reviewStartedAt: obj.reviewStartedAt,
 			lastReviewedAt: obj.lastReviewedAt,
 			note: obj.note,
+			...(promotedAt !== undefined ? { promotedAt } : {}),
+			...(promotedFrom !== undefined ? { promotedFrom } : {}),
+			...(promotedTo !== undefined ? { promotedTo } : {}),
 		};
 	} catch {
 		return null;
@@ -2557,6 +2569,9 @@ at: ${at}`;
 			reviewStartedAt: state?.reviewStartedAt ?? nowIso,
 			lastReviewedAt: nowIso,
 			note: "candidate promoted to active manually",
+			promotedAt: at,
+			promotedFrom: active.config.configVersion,
+			promotedTo: promotedActive.configVersion,
 		};
 		await writeStrategyReviewState(env, nextState);
 
@@ -2565,6 +2580,9 @@ at: ${at}`;
 			reason: "manual promotion completed",
 			evaluatedAt: at,
 		});
+
+		// promotion 後收尾：清除 demo override，避免污染後續測試
+		await clearStrategyReviewDemoOverride(env);
 
 		return `MO Strategy Promote Candidate
 
@@ -2739,6 +2757,13 @@ reviewState: none`;
 				"demoOverride: off"
 			:	`demoOverride: on\n` +
 				`demoOverrideNote: ${demoOverride.note}`;
+		const promotionLine =
+			s.reviewStatus === "promoted" ?
+				`promotionState: completed` +
+				(s.promotedAt ? `\npromotedAt: ${s.promotedAt}` : "") +
+				(s.promotedFrom ? `\npromotedFrom: ${s.promotedFrom}` : "") +
+				(s.promotedTo ? `\npromotedTo: ${s.promotedTo}` : "")
+			:	"";
 		if (rr !== null) {
 			console.log("[strategy] review debug result loaded", {
 				activeConfigVersion: rr.activeConfigVersion,
@@ -2751,6 +2776,7 @@ reviewState: none`;
 
 reviewKey: ${MO_STRATEGY_REVIEW_STATE_KEY}
 ${demoLine}
+${promotionLine}
 activeConfigVersion: ${s.activeConfigVersion}
 candidateConfigVersion: ${s.candidateConfigVersion}
 reviewStatus: ${s.reviewStatus}
@@ -2776,6 +2802,7 @@ compareSummary: ${rr.compareSummary}`;
 
 reviewKey: ${MO_STRATEGY_REVIEW_STATE_KEY}
 ${demoLine}
+${promotionLine}
 activeConfigVersion: ${s.activeConfigVersion}
 candidateConfigVersion: ${s.candidateConfigVersion}
 reviewStatus: ${s.reviewStatus}
