@@ -1353,6 +1353,7 @@ type StrategyCompareDecision = "keep_active" | "hold_review" | "promote_candidat
 type StrategyReviewResult = {
 	activeConfigVersion: string;
 	candidateConfigVersion: string;
+	source?: "demo" | "real";
 	comparedAt: string;
 	compareSummary: string;
 	compareDecision: StrategyCompareDecision;
@@ -1371,6 +1372,7 @@ type StrategyReviewDecisionLabel =
 
 type StrategyReviewDecisionRecord = {
 	decision: StrategyReviewDecisionLabel;
+	decisionSource?: "demo" | "real" | "manual";
 	reason: string;
 	evaluatedAt: string;
 };
@@ -1626,9 +1628,14 @@ function parseStrategyReviewResultRecord(raw: string): StrategyReviewResult | nu
 		}
 		if (typeof obj.compareReason !== "string") return null;
 		if (typeof obj.note !== "string") return null;
+		const source =
+			typeof obj.source === "string" && (obj.source === "demo" || obj.source === "real") ?
+				obj.source
+			:	undefined;
 		return {
 			activeConfigVersion: obj.activeConfigVersion,
 			candidateConfigVersion: obj.candidateConfigVersion,
+			...(source !== undefined ? { source } : {}),
 			comparedAt: obj.comparedAt,
 			compareSummary: obj.compareSummary,
 			compareDecision: obj.compareDecision,
@@ -1681,10 +1688,18 @@ function parseStrategyReviewDecisionRecord(raw: string): StrategyReviewDecisionR
 		) {
 			return null;
 		}
+		const decisionSource =
+			typeof obj.decisionSource === "string" &&
+			(obj.decisionSource === "demo" ||
+				obj.decisionSource === "real" ||
+				obj.decisionSource === "manual") ?
+				obj.decisionSource
+			:	undefined;
 		if (typeof obj.reason !== "string") return null;
 		if (typeof obj.evaluatedAt !== "string") return null;
 		return {
 			decision,
+			...(decisionSource !== undefined ? { decisionSource } : {}),
 			reason: obj.reason,
 			evaluatedAt: obj.evaluatedAt,
 		};
@@ -2017,6 +2032,7 @@ async function runStrategyReview(params: {
 	const result: StrategyReviewResult = {
 		activeConfigVersion: a.configVersion,
 		candidateConfigVersion: c.configVersion,
+		source: params.source,
 		comparedAt: nowIso,
 		compareSummary,
 		compareDecision,
@@ -2024,6 +2040,7 @@ async function runStrategyReview(params: {
 		note: params.source === "demo" ? "demo compare result" : "real compare result",
 	};
 	await writeStrategyReviewResult(params.env, result);
+	console.log("[strategy] review source persisted", { source: params.source });
 
 	// 寫入本輪 state（normalize）
 	const wasPromoted =
@@ -2102,7 +2119,9 @@ async function runStrategyReview(params: {
 		env: params.env,
 		activeConfig: a,
 		snapshot: decisionSnapshot,
+		decisionSource: params.source,
 	});
+	console.log("[strategy] decision source persisted", { source: params.source });
 
 	return { comparedAt: nowIso, compareDecision, compareReason };
 }
@@ -2215,6 +2234,7 @@ async function computeAndRecordStrategyReviewDecision(params: {
 	env: Env;
 	activeConfig: StrategyActiveConfig;
 	snapshot: StrategyCurrentSnapshot;
+	decisionSource?: "demo" | "real";
 }): Promise<void> {
 	// decision 規則只依賴現有資料；讀取失敗不阻擋主流程
 	const [candidate, reviewState, reviewResult] = await Promise.all([
@@ -2234,6 +2254,7 @@ async function computeAndRecordStrategyReviewDecision(params: {
 		decision: r.decision,
 		reason: r.reason,
 		evaluatedAt: formatStatusPushAtTaipei(new Date()),
+		...(params.decisionSource ? { decisionSource: params.decisionSource } : {}),
 	};
 	console.log("[strategy] review decision resolved from review_result", {
 		compareDecision: compareDecision ?? "(none)",
@@ -2637,6 +2658,7 @@ reviewStatus: ${reviewState.reviewStatus}`;
 		return `MO Strategy Review Run Demo
 
 reviewResultKey: ${MO_STRATEGY_REVIEW_RESULT_KEY}
+source: demo
 comparedAt: ${r.comparedAt}
 compareDecision: ${r.compareDecision}
 compareReason: ${r.compareReason}`;
@@ -2651,6 +2673,7 @@ compareReason: ${r.compareReason}`;
 		return `MO Strategy Review Run
 
 reviewResultKey: ${MO_STRATEGY_REVIEW_RESULT_KEY}
+source: real
 comparedAt: ${r.comparedAt}
 compareDecision: ${r.compareDecision}
 compareReason: ${r.compareReason}`;
@@ -2667,6 +2690,7 @@ evaluatedAt: none`;
 		return `MO Strategy Review Decision
 
 decision: ${d.decision}
+source: ${d.decisionSource ?? "unknown"}
 reason: ${d.reason}
 evaluatedAt: ${d.evaluatedAt}`;
 	  }
@@ -3018,6 +3042,7 @@ at: ${at}`;
 
 		await writeStrategyReviewDecision(env, {
 			decision: "promoted",
+			decisionSource: "manual",
 			reason: "manual promotion completed",
 			evaluatedAt: at,
 		});
@@ -3030,6 +3055,7 @@ at: ${at}`;
 promotedFrom: ${active.config.configVersion}
 promotedTo: ${promotedActive.configVersion}
 result: promoted
+decisionSource: ${decision.decisionSource ?? "unknown"}
 at: ${at}`;
 	  }
 	  case "/strategy-review-explain": {
@@ -3228,6 +3254,7 @@ note: ${s.note}`;
 			return `${base}
 
 [LastCompare]
+source: ${rr.source ?? "unknown"}
 comparedAt: ${rr.comparedAt}
 compareDecision: ${rr.compareDecision}
 compareReason: ${rr.compareReason}
@@ -3262,6 +3289,7 @@ freshnessIdleThresholdMs: active=${a.freshnessIdleThresholdMs} candidate=${c.fre
 		return `${base}
 
 [LastCompare]
+source: ${rr.source ?? "unknown"}
 comparedAt: ${rr.comparedAt}
 compareDecision: ${rr.compareDecision}
 compareReason: ${rr.compareReason}
