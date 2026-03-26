@@ -58,6 +58,7 @@ export interface Env {
 	MO_NOTES: KVNamespace;
 	MO_DB: D1Database;
 	OPENAI_API_KEY: string;
+	LINE_MODE?: "normal" | "reply_only";
 	DEBUG_LOG?: string;
 }
 
@@ -76,7 +77,8 @@ type LinePushResult =
 	| "success"
 	| "failed"
 	| "blocked_by_monthly_limit"
-	| "network_error";
+	| "network_error"
+	| "skipped";
 
 /** push 結果 + 呼叫端判讀用 HTTP 資訊（network_error 時無 http*） */
 type LinePushOutcome = {
@@ -100,6 +102,16 @@ async function lineBotPushTextMessage(
 ): Promise<LinePushOutcome> {
 	try {
 		console.log("[push] start", { userId, message: text });
+		if (env.LINE_MODE === "reply_only") {
+			console.log("[push] skipped: reply_only_mode");
+			await recordStrategyNotifyOutcomeForStatus(
+				env,
+				userId,
+				"skipped",
+				"reply_only_mode_enabled"
+			);
+			return { result: "skipped" };
+		}
 		const response = await fetch(LINE_MESSAGE_PUSH_URL, {
 			method: "POST",
 			headers: {
@@ -150,7 +162,8 @@ type LastPushDisplayKind =
 	| "success"
 	| "failed"
 	| "blocked_monthly_limit"
-	| "network_error";
+	| "network_error"
+	| "skipped";
 
 type LastPushNotifyRecord = {
 	kind: LastPushDisplayKind;
@@ -169,6 +182,8 @@ function linePushResultToDisplayKind(result: LinePushResult): LastPushDisplayKin
 			return "blocked_monthly_limit";
 		case "network_error":
 			return "network_error";
+		case "skipped":
+			return "skipped";
 	}
 }
 
@@ -451,6 +466,7 @@ type StrategyNotifyResultLabel =
 	| "cooldown"
 	| "in_progress"
 	| "blocked_monthly_limit"
+	| "skipped"
 	| "success"
 	| "failed";
 
@@ -466,6 +482,7 @@ function isStrategyNotifyResultLabel(value: string): value is StrategyNotifyResu
 		value === "cooldown" ||
 		value === "in_progress" ||
 		value === "blocked_monthly_limit" ||
+		value === "skipped" ||
 		value === "success" ||
 		value === "failed"
 	);
@@ -518,6 +535,8 @@ function normalizeStrategyNotifyReason(
 			return "parallel_notify_lock_active";
 		case "blocked_monthly_limit":
 			return "line_monthly_push_quota_exceeded";
+		case "skipped":
+			return "reply_only_mode_enabled";
 		case "success":
 			return "line_push_accepted";
 		case "failed":
@@ -529,6 +548,14 @@ function linePushOutcomeToStrategyNotifyStatus(
 	outcome: LinePushOutcome
 ): Pick<StrategyNotifyStatusRecord, "lastNotifyResult" | "lastNotifyReason"> {
 	switch (outcome.result) {
+		case "skipped":
+			return {
+				lastNotifyResult: "skipped",
+				lastNotifyReason: normalizeStrategyNotifyReason(
+					"skipped",
+					"reply_only_mode_enabled"
+				),
+			};
 		case "success":
 			return {
 				lastNotifyResult: "success",
@@ -597,7 +624,8 @@ function isLastPushDisplayKind(value: string): value is LastPushDisplayKind {
 		value === "success" ||
 		value === "failed" ||
 		value === "blocked_monthly_limit" ||
-		value === "network_error"
+		value === "network_error" ||
+		value === "skipped"
 	);
 }
 
@@ -638,6 +666,7 @@ async function recordLinePushOutcomeForStatus(
 	userId: string,
 	outcome: LinePushOutcome
 ): Promise<void> {
+	if (outcome.result === "skipped") return; // reply_only mode 不更新 lastPush
 	const kind = linePushResultToDisplayKind(outcome.result);
 	const pushAt = formatStatusPushAtTaipei(new Date());
 	const pushStatus = outcome.httpStatus;
@@ -662,7 +691,16 @@ async function formatLastPushStatusBlock(
 	env: Env,
 	userId: string
 ): Promise<string> {
-	if (!hasMoStatusUserId(userId)) return MO_STATUS_DEFAULT_BLOCK.lastPush;
+	const lineMode = env.LINE_MODE === "reply_only" ? "reply_only" : "normal";
+	if (!hasMoStatusUserId(userId)) {
+		return [
+			`lineMode: ${lineMode}`,
+			"lastNotifyResult: none",
+			"lastNotifyReason: none",
+			"lastNotifyAt: none",
+			"lastPush: none",
+		].join("\n");
+	}
 	const [n, r] = await Promise.all([
 		readMoUserKvJson(
 			env,
@@ -677,7 +715,7 @@ async function formatLastPushStatusBlock(
 			parseLastPushNotifyRecord
 		),
 	]);
-	const lines: string[] = [];
+	const lines: string[] = [`lineMode: ${lineMode}`];
 	if (n === null) {
 		lines.push(
 			"lastNotifyResult: none",

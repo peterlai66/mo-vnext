@@ -5,6 +5,9 @@
 	"observability": {
 		"enabled": true,
 	},
+	"vars":{
+		"LINE_MODE":"reply_only"
+	},
 	"kv_namespaces": [
 		{
 			"binding": "MO_NOTES",
