@@ -1613,6 +1613,7 @@ type StrategyReviewExplainAiFailureReason =
 	| "invalid_response_shape"
 	| "empty_content"
 	| "truncated"
+	| "missing_current_status"
 	| "timeout"
 	| "thrown_error"
 	| "unknown";
@@ -1700,7 +1701,7 @@ status: ${params.currentSnapshot.status}
 reason: ${params.currentSnapshot.reason}
 `}
 
-輸出要求：2~4 行繁體中文；必須點名至少 1 個欄位（例 freshnessWeight）；要解讀方向與影響；要解釋 keep_active（缺值則說結果未產生先維持 active）。`;
+輸出要求：2~4 行繁體中文；必須點名至少 1 個欄位（例 freshnessWeight）；必須引用至少 1 個 CurrentStatus 欄位名稱（dataFreshnessScore/status/reason）；要解讀方向與影響；要解釋 keep_active（缺值則說結果未產生先維持 active）。`;
 
 	const prompt = `SYSTEM:\n${systemPrompt}\n\nUSER:\n${userPrompt}`;
 	console.log("[strategy] review explain prompt", prompt);
@@ -1808,7 +1809,25 @@ reason: ${params.currentSnapshot.reason}
 				parsedContentSnippet: text.slice(0, 800),
 			};
 		}
-		return { ok: true, text: lines.slice(0, 4).join("\n") };
+		const out = lines.slice(0, 4).join("\n");
+		if (params.currentSnapshot !== null) {
+			const hasCurrentStatusRef =
+				out.includes("dataFreshnessScore") ||
+				out.includes("status") ||
+				out.includes("reason") ||
+				out.includes(String(params.currentSnapshot.status)) ||
+				out.includes(params.currentSnapshot.reason);
+			if (!hasCurrentStatusRef) {
+				console.log("[strategy] review explain missing current status");
+				return {
+					ok: false,
+					reason: "missing_current_status",
+					rawResponseSnippet,
+					parsedContentSnippet: out,
+				};
+			}
+		}
+		return { ok: true, text: out };
 	} catch (err: unknown) {
 		const errorName =
 			typeof err === "object" && err !== null && "name" in err ?
@@ -2142,7 +2161,7 @@ ${ai.text}`;
 			errorName: ai.errorName,
 			errorMessage: ai.errorMessage,
 		});
-		if (ai.reason === "truncated") {
+		if (ai.reason === "truncated" || ai.reason === "missing_current_status") {
 			const fieldHint =
 				result?.compareReason && result.compareReason.trim() !== "" ?
 					result.compareReason.trim()
