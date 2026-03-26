@@ -1326,7 +1326,7 @@ const MO_STRATEGY_REVIEW_RESULT_KEY = "strategy_review_result";
 const MO_STRATEGY_REVIEW_DECISION_KEY = "strategy_review_decision";
 const MO_STRATEGY_REVIEW_DEMO_OVERRIDE_KEY = "strategy_review_demo_override";
 
-type StrategyReviewStatus = "none" | "reviewing" | "ready" | "promoted";
+type StrategyReviewStatus = "none" | "reviewing" | "ready" | "reviewed" | "promoted";
 
 type StrategyReviewState = {
 	activeConfigVersion: string;
@@ -1530,7 +1530,13 @@ async function readCandidateStrategyConfig(
 }
 
 function isStrategyReviewStatus(v: string): v is StrategyReviewStatus {
-	return v === "none" || v === "reviewing" || v === "ready" || v === "promoted";
+	return (
+		v === "none" ||
+		v === "reviewing" ||
+		v === "ready" ||
+		v === "reviewed" ||
+		v === "promoted"
+	);
 }
 
 function parseStrategyReviewStateRecord(raw: string): StrategyReviewState | null {
@@ -2355,10 +2361,38 @@ reason: candidate_strategy_config 或 strategy_review_state 不存在`;
 		};
 		await writeStrategyReviewResult(env, result);
 
+		const wasPromoted =
+			state.reviewStatus === "promoted" ||
+			state.promotedAt !== undefined ||
+			state.promotedFrom !== undefined ||
+			state.promotedTo !== undefined;
+		if (wasPromoted) {
+			console.log("[strategy] review state normalized for new cycle", {
+				previousReviewStatus: state.reviewStatus,
+				cleared: "promotion_state",
+			});
+		}
+		const nextReviewStatus: StrategyReviewStatus =
+			compareDecision === "keep_active" && compareReason === "no_material_diff" ?
+				"reviewed"
+			:	"reviewing";
+		if (nextReviewStatus === "reviewed") {
+			console.log("[strategy] review state normalized for new cycle", {
+				reviewStatus: "reviewed",
+				reason: "no_material_diff",
+			});
+		}
+		// 新一輪 run-demo：不沿用舊 state（避免殘留 promoted*）
 		const nextState: StrategyReviewState = {
-			...state,
+			activeConfigVersion: a.configVersion,
+			candidateConfigVersion: c.configVersion,
+			reviewStatus: nextReviewStatus,
+			reviewStartedAt: nowIso,
 			lastReviewedAt: nowIso,
-			note: "demo review run completed",
+			note:
+				nextReviewStatus === "reviewed" ?
+					"no material diff"
+				:	"demo review run completed",
 		};
 		await writeStrategyReviewState(env, nextState);
 
