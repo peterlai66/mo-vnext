@@ -1278,6 +1278,7 @@ function extractCommand(messageText: string): string | null {
 	if (messageText === "/notes") return "/notes";
 	if (messageText === "/push-test") return "/push-test";
 	if (messageText === "/report-test-change") return "/report-test-change";
+	if (messageText === "/strategy-config-debug") return "/strategy-config-debug";
 	if (messageText === "/debug-strategy-change") return "/debug-strategy-change";
 	if (/^\/note(?:\s+|$)/.test(messageText)) return "/note";
 	return /^\/[A-Za-z0-9_]+$/.test(messageText) ? messageText : null;
@@ -1476,6 +1477,20 @@ async function handleCommand(
 	  case "/ping":
 		debugLog(env, "/ping hit");
 		return "pong";
+	  case "/strategy-config-debug": {
+		const r = await readActiveStrategyConfig(env);
+		const c = r.config;
+		return `MO Strategy Config Debug
+
+source: ${r.source}
+configVersion: ${c.configVersion}
+freshnessWeight: ${c.freshnessWeight}
+volumeWeight: ${c.volumeWeight}
+simulationWeight: ${c.simulationWeight}
+aggressiveMinScore: ${c.aggressiveMinScore}
+balancedMinScore: ${c.balancedMinScore}
+freshnessIdleThresholdMs: ${c.freshnessIdleThresholdMs}`;
+	  }
 	  case "/debug-strategy-change": {
 		const hasLineUser =
 			userId.trim() !== "" && userId !== "unknown-user";
