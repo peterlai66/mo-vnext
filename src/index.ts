@@ -1288,6 +1288,7 @@ function extractCommand(messageText: string): string | null {
 	if (messageText === "/strategy-review-explain") return "/strategy-review-explain";
 	if (messageText === "/strategy-review-debug") return "/strategy-review-debug";
 	if (messageText === "/strategy-review-decision") return "/strategy-review-decision";
+	if (messageText === "/strategy-review-reset") return "/strategy-review-reset";
 	if (messageText === "/strategy-review-demo-promote") return "/strategy-review-demo-promote";
 	if (messageText === "/strategy-review-demo-clear") return "/strategy-review-demo-clear";
 	if (messageText === "/strategy-promote-candidate") return "/strategy-promote-candidate";
@@ -1334,7 +1335,13 @@ const MO_STRATEGY_REVIEW_RESULT_KEY = "strategy_review_result";
 const MO_STRATEGY_REVIEW_DECISION_KEY = "strategy_review_decision";
 const MO_STRATEGY_REVIEW_DEMO_OVERRIDE_KEY = "strategy_review_demo_override";
 
-type StrategyReviewStatus = "none" | "reviewing" | "ready" | "reviewed" | "promoted";
+type StrategyReviewStatus =
+	| "none"
+	| "idle"
+	| "reviewing"
+	| "ready"
+	| "reviewed"
+	| "promoted";
 
 type StrategyReviewState = {
 	activeConfigVersion: string;
@@ -1542,6 +1549,7 @@ async function readCandidateStrategyConfig(
 function isStrategyReviewStatus(v: string): v is StrategyReviewStatus {
 	return (
 		v === "none" ||
+		v === "idle" ||
 		v === "reviewing" ||
 		v === "ready" ||
 		v === "reviewed" ||
@@ -2693,6 +2701,43 @@ decision: ${d.decision}
 source: ${d.decisionSource ?? "unknown"}
 reason: ${d.reason}
 evaluatedAt: ${d.evaluatedAt}`;
+	  }
+	  case "/strategy-review-reset": {
+		const [active, candidate] = await Promise.all([
+			readActiveStrategyConfig(env),
+			readCandidateStrategyConfig(env),
+		]);
+		const now = formatStatusPushAtTaipei(new Date());
+		await Promise.all([
+			clearStrategyReviewResult(env),
+			clearStrategyReviewDecision(env),
+			clearStrategyReviewDemoOverride(env),
+		]);
+
+		const state: StrategyReviewState = {
+			activeConfigVersion: active.config.configVersion,
+			candidateConfigVersion: candidate?.configVersion ?? "none",
+			reviewStatus: "idle",
+			reviewStartedAt: now,
+			lastReviewedAt: now,
+			note: "review reset manually",
+		};
+		await writeStrategyReviewState(env, state);
+
+		console.log("[strategy] review reset completed", {
+			cleared: [
+				MO_STRATEGY_REVIEW_RESULT_KEY,
+				MO_STRATEGY_REVIEW_DECISION_KEY,
+				MO_STRATEGY_REVIEW_DEMO_OVERRIDE_KEY,
+			],
+			reviewStatus: state.reviewStatus,
+		});
+
+		return `MO Strategy Review Reset
+
+result: ok
+clearedKeys: ${MO_STRATEGY_REVIEW_RESULT_KEY}, ${MO_STRATEGY_REVIEW_DECISION_KEY}, ${MO_STRATEGY_REVIEW_DEMO_OVERRIDE_KEY}
+reviewStatus: ${state.reviewStatus}`;
 	  }
 	  case "/strategy-review-demo-promote": {
 		const demo: StrategyReviewDemoOverride = {
