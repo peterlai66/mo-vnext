@@ -2757,13 +2757,57 @@ compareReason: ${r.compareReason}`;
 			source: "real",
 			allowDemoOverride: false,
 		});
+
+		// 只做提示：若已符合 auto promote 安全條件，提醒可手動執行 /strategy-auto-promote-run
+		let autoPromoteHintLine = "";
+		try {
+			const [active, candidate, reviewResult, reviewDecision, demoOverride] = await Promise.all([
+				readActiveStrategyConfig(env),
+				readCandidateStrategyConfig(env),
+				readStrategyReviewResult(env),
+				readStrategyReviewDecision(env),
+				readStrategyReviewDemoOverride(env),
+			]);
+
+			const a = active.config;
+			const c = candidate;
+			const diffs: string[] = [];
+			if (c !== null) {
+				if (a.freshnessWeight !== c.freshnessWeight) diffs.push("freshnessWeight");
+				if (a.volumeWeight !== c.volumeWeight) diffs.push("volumeWeight");
+				if (a.simulationWeight !== c.simulationWeight) diffs.push("simulationWeight");
+				if (a.aggressiveMinScore !== c.aggressiveMinScore) diffs.push("aggressiveMinScore");
+				if (a.balancedMinScore !== c.balancedMinScore) diffs.push("balancedMinScore");
+				if (a.freshnessIdleThresholdMs !== c.freshnessIdleThresholdMs) diffs.push("freshnessIdleThresholdMs");
+			}
+
+			const delta =
+				c !== null && typeof c.balancedMinScore === "number" ?
+					c.balancedMinScore - a.balancedMinScore
+				:	Number.NEGATIVE_INFINITY;
+
+			const autoPromoteEligible =
+				reviewResult?.source === "real" &&
+				reviewDecision?.decision === "auto_promote_candidate" &&
+				demoOverride === null &&
+				diffs.length === 1 &&
+				diffs[0] === "balancedMinScore" &&
+				delta >= 10;
+
+			if (autoPromoteEligible) {
+				autoPromoteHintLine = "\n\n⚠️ 建議執行 /strategy-auto-promote-run（條件已滿足）";
+			}
+		} catch {
+			// ignore (hint only)
+		}
+
 		return `MO Strategy Review Run
 
 reviewResultKey: ${MO_STRATEGY_REVIEW_RESULT_KEY}
 source: real
 comparedAt: ${r.comparedAt}
 compareDecision: ${r.compareDecision}
-compareReason: ${r.compareReason}`;
+compareReason: ${r.compareReason}${autoPromoteHintLine}`;
 	  }
 	  case "/strategy-review-decision": {
 		const d = await readStrategyReviewDecision(env);
