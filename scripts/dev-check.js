@@ -22,6 +22,7 @@
  *  expectedReason: string;
  *  expectedConfidence: Confidence;
  *  expectedAutoPromoteAllowed: boolean;
+ *  expectedAutoPromoteResult: "promoted" | "blocked" | "no_action";
  * }} TestCase
  */
 
@@ -129,6 +130,7 @@ const testCases = [
 		expectedReason: "candidate changes: balancedMinScore",
 		expectedConfidence: "medium",
 		expectedAutoPromoteAllowed: false,
+		expectedAutoPromoteResult: "blocked",
 	},
 	{
 		active: { balancedMinScore: 60, freshnessWeight: 1, volumeWeight: 1 },
@@ -138,6 +140,7 @@ const testCases = [
 		expectedReason: "no strategy changes",
 		expectedConfidence: "high",
 		expectedAutoPromoteAllowed: false,
+		expectedAutoPromoteResult: "no_action",
 	},
 	{
 		active: { balancedMinScore: 60, freshnessWeight: 1, volumeWeight: 1 },
@@ -147,6 +150,7 @@ const testCases = [
 		expectedReason: "candidate changes: balancedMinScore",
 		expectedConfidence: "medium",
 		expectedAutoPromoteAllowed: false,
+		expectedAutoPromoteResult: "blocked",
 	},
 	{
 		active: { balancedMinScore: 60, freshnessWeight: 1, volumeWeight: 1 },
@@ -156,6 +160,7 @@ const testCases = [
 		expectedReason: "candidate changes: freshnessWeight",
 		expectedConfidence: "high",
 		expectedAutoPromoteAllowed: true,
+		expectedAutoPromoteResult: "promoted",
 	},
 ];
 
@@ -168,20 +173,27 @@ const results = testCases.map(
 		expectedReason,
 		expectedConfidence,
 		expectedAutoPromoteAllowed,
+		expectedAutoPromoteResult,
 	}) => {
 	const reviewResult = buildReviewResult(active, candidate);
 	const autoPromoteAllowed = reviewResult.decision === "promote_candidate";
+	const autoPromoteResult =
+		reviewResult.decision === "promote_candidate" ? "promoted"
+		: reviewResult.decision === "keep_active" ? "no_action"
+		: "blocked";
 
 	return {
 		active,
 		candidate,
 		reviewResult,
 		autoPromoteAllowed,
+		autoPromoteResult,
 		expectedDecision,
 		expectedChangedFields,
 		expectedReason,
 		expectedConfidence,
 		expectedAutoPromoteAllowed,
+		expectedAutoPromoteResult,
 	};
 	}
 );
@@ -203,8 +215,17 @@ for (const item of results) {
 	const confidenceMatch = item.reviewResult.confidence === item.expectedConfidence;
 	const autoPromoteAllowedMatch =
 		item.autoPromoteAllowed === item.expectedAutoPromoteAllowed;
+	const autoPromoteResultMatch =
+		item.autoPromoteResult === item.expectedAutoPromoteResult;
 
-	if (!decisionMatch || !fieldsMatch || !reasonMatch || !confidenceMatch || !autoPromoteAllowedMatch) {
+	if (
+		!decisionMatch ||
+		!fieldsMatch ||
+		!reasonMatch ||
+		!confidenceMatch ||
+		!autoPromoteAllowedMatch ||
+		!autoPromoteResultMatch
+	) {
 		console.error("❌ mismatch", item);
 		failCount += 1;
 	} else {

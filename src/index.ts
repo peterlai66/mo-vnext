@@ -3546,6 +3546,26 @@ at: ${at}`;
 		};
 
 		if (candidate === null) return blocked();
+		if (decision === "keep_active") {
+			console.log("[strategy] auto promote run no_action", {
+				decision,
+				delta,
+				changedFields,
+				reason,
+				confidence,
+			});
+			return `MO Strategy Auto Promote Run
+
+result: no_action
+decision: ${decision}
+delta: ${delta}
+changedFields: ${changedFieldsText}
+reason: ${reason}
+confidence: ${confidence}
+auto promote skipped: active config already matches candidate
+decisionSource: ${decisionSource}
+at: ${at}`;
+		}
 		if (decision !== "promote_candidate") return blocked();
 
 		console.log("[strategy] auto promote run conditions matched", {
