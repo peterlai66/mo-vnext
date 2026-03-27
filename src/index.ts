@@ -26,6 +26,7 @@ import {
 	buildSystemDecisionLineLiveIntelligence,
 	buildActionLineLiveIntelligence,
 	buildSimulationStatusLineLiveIntelligence,
+	buildMoReportSummaryStatusBlockLines,
 	evaluateMoPushEventDecision,
 	MO_PUSH_COOLDOWN_MS_DEFAULT,
 	MO_PUSH_COOLDOWN_MS_P3_ONLY,
@@ -1298,37 +1299,7 @@ async function formatLastReportSummaryStatusBlock(env: Env, userId: string): Pro
 		parseReportSummaryRecord
 	);
 	if (r === null) return MO_STATUS_DEFAULT_BLOCK.report;
-	const lines: string[] = [
-		`reportStrategy: ${r.currentStrategy}`,
-		`reportPrev: ${r.previousStrategy}`,
-		`reportChanged: ${r.changed}`,
-		`reportShouldNotify: ${r.shouldNotify}`,
-		`reportRec: ${r.recommendationStatus}`,
-	];
-	if (r.recommendationReason !== undefined) {
-		lines.push(`reportReason: ${r.recommendationReason}`);
-	}
-	lines.push(`reportSimReady: ${r.simulationReady ? "yes" : "no"}`);
-	if (r.simulationResult !== undefined) {
-		lines.push(`reportSimResult: ${r.simulationResult}`);
-	}
-	if (r.reportDataQuality !== undefined) {
-		lines.push(`reportDataQuality: ${r.reportDataQuality}`);
-	}
-	if (r.recommendationReadiness !== undefined) {
-		lines.push(`recommendationReadiness: ${r.recommendationReadiness}`);
-	}
-	if (r.simulationReadiness !== undefined) {
-		lines.push(`simulationReadiness: ${r.simulationReadiness}`);
-	}
-	if (r.recommendationGateReason !== undefined) {
-		lines.push(`recommendationGateReason: ${r.recommendationGateReason}`);
-	}
-	if (r.simulationGateReason !== undefined) {
-		lines.push(`simulationGateReason: ${r.simulationGateReason}`);
-	}
-	lines.push(`reportAt: ${r.timestamp}`);
-	return lines.join("\n");
+	return buildMoReportSummaryStatusBlockLines(r);
 }
 
 type MoStatusState = {

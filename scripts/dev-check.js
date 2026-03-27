@@ -916,7 +916,10 @@ function deriveLiveMarketIntelligenceV1(gov, ctx) {
  * @param {ReturnType<typeof deriveLiveMarketIntelligenceV1>} li
  */
 function buildSystemDecisionLineLiveIntelligence(strategy, score, hasAdequateData, recReason, li) {
-	const base = buildSystemDecisionText(strategy, score, hasAdequateData, recReason);
+	const base =
+		!hasAdequateData && li.marketDataQuality !== "unusable" ?
+			buildSystemDecisionTextNotesInadequate(strategy, score, recReason)
+		:	buildSystemDecisionText(strategy, score, hasAdequateData, recReason);
 	if (li.marketDataQuality === "unusable") {
 		return `${base}\n\n【行情判讀】資料不足或過舊，不適合判斷。`;
 	}
@@ -941,6 +944,9 @@ function buildActionLineLiveIntelligence(score, li) {
 	if (li.recommendationReadiness === "limited") {
 		return `${s}（資料受限：${li.recommendationGateReason}；請保守／觀望）`;
 	}
+	if (li.marketDataQuality !== "trusted") {
+		return `${s}（可提供有限建議，請保守參考，不宜重部位；仍非投資顧問意見）`;
+	}
 	return `${s}（行情層級允許一般建議；仍非投資顧問意見）`;
 }
 
@@ -958,6 +964,66 @@ function buildSimulationStatusLineLiveIntelligence(simResult, simReadyLegacy, no
 		return `狀態：低信心可模擬\n原因：${li.simulationGateReason}\n參考：${simResult}`;
 	}
 	return `狀態：可模擬\n筆記：${String(noteCountForRec)} 則\n參考：${simResult}`;
+}
+
+/**
+ * /status [Report] 區塊：有 Live Intelligence v1 欄位時不再輸出易與新結論衝突的舊欄位。
+ * @param {{
+ *   currentStrategy: string;
+ *   previousStrategy: string;
+ *   changed: boolean;
+ *   shouldNotify: boolean;
+ *   recommendationStatus: string;
+ *   recommendationReason?: string;
+ *   simulationReady: boolean;
+ *   simulationResult?: string;
+ *   timestamp: string;
+ *   reportDataQuality?: string;
+ *   recommendationReadiness?: string;
+ *   simulationReadiness?: string;
+ *   recommendationGateReason?: string;
+ *   simulationGateReason?: string;
+ * }} r
+ * @returns {string}
+ */
+function buildMoReportSummaryStatusBlockLines(r) {
+	const lines = [
+		`reportStrategy: ${r.currentStrategy}`,
+		`reportPrev: ${r.previousStrategy}`,
+		`reportChanged: ${r.changed}`,
+		`reportShouldNotify: ${r.shouldNotify}`,
+	];
+	const hasV1Intel =
+		r.reportDataQuality !== undefined ||
+		r.recommendationReadiness !== undefined ||
+		r.simulationReadiness !== undefined;
+	if (!hasV1Intel) {
+		lines.push(`reportRec: ${r.recommendationStatus}`);
+		if (r.recommendationReason !== undefined) {
+			lines.push(`reportReason: ${r.recommendationReason}`);
+		}
+		lines.push(`reportSimReady: ${r.simulationReady ? "yes" : "no"}`);
+		if (r.simulationResult !== undefined) {
+			lines.push(`reportSimResult: ${r.simulationResult}`);
+		}
+	}
+	if (r.reportDataQuality !== undefined) {
+		lines.push(`reportDataQuality: ${r.reportDataQuality}`);
+	}
+	if (r.recommendationReadiness !== undefined) {
+		lines.push(`recommendationReadiness: ${r.recommendationReadiness}`);
+	}
+	if (r.simulationReadiness !== undefined) {
+		lines.push(`simulationReadiness: ${r.simulationReadiness}`);
+	}
+	if (r.recommendationGateReason !== undefined) {
+		lines.push(`recommendationGateReason: ${r.recommendationGateReason}`);
+	}
+	if (r.simulationGateReason !== undefined) {
+		lines.push(`simulationGateReason: ${r.simulationGateReason}`);
+	}
+	lines.push(`reportAt: ${r.timestamp}`);
+	return lines.join("\n");
 }
 
 /**
@@ -1056,6 +1122,23 @@ function mapScoreToActionLine(score) {
  * @param {string} recReason
  * @returns {string}
  */
+/**
+ * 筆記不足時的系統判斷（行情仍可用時避免寫成「整體尚無資料」）
+ * @param {"aggressive" | "balanced" | "conservative"} strategy
+ * @param {number} score
+ * @param {string} recReason
+ */
+function buildSystemDecisionTextNotesInadequate(strategy, score, recReason) {
+	const zh =
+		strategy === "aggressive" ? "積極型" : strategy === "conservative" ? "保守型" : "平衡型";
+	const stance =
+		strategy === "aggressive" ? "偏積極" : strategy === "conservative" ? "偏保守" : "中性平衡";
+	const detail =
+		recReason === "尚無資料" || recReason === "無資料可模擬" ? "尚無筆記" : recReason;
+	const judgment = `筆記不足（${detail}），策略依據有限，以下判斷僅供參考。`;
+	return `當前策略：${zh}（${stance}）\n綜合評分：${score} 分。\n${judgment}`;
+}
+
 function buildSystemDecisionText(strategy, score, hasAdequateData, recReason) {
 	const zh =
 		strategy === "aggressive" ? "積極型" : strategy === "conservative" ? "保守型" : "平衡型";
@@ -1898,6 +1981,70 @@ function runDevCheckMain() {
 			throw new Error("[mo-live] report v1 shape");
 		}
 
+		const liF1n0 = deriveLiveMarketIntelligenceV1(gF1, {
+			rowIsNull: false,
+			noteCountForRec: 0,
+			todayYyyymmdd: today,
+		});
+		if (liF1n0.marketDataQuality !== "limited" || liF1n0.recommendationReadiness !== "ready") {
+			throw new Error("[mo-live] li f1n0 limited ready");
+		}
+		if (liF1n0.simulationReadiness !== "blocked") {
+			throw new Error("[mo-live] li f1n0 sim blocked");
+		}
+		const sysN0 = buildSystemDecisionLineLiveIntelligence(
+			"balanced",
+			75,
+			false,
+			"尚無資料",
+			liF1n0
+		);
+		if (sysN0.includes("尚無資料")) {
+			throw new Error("[mo-live] system line must not say 尚無資料 when market usable");
+		}
+		const actN0 = buildActionLineLiveIntelligence(75, liF1n0);
+		if (actN0.includes("行情層級允許一般建議")) {
+			throw new Error("[mo-live] action limited+ready must stay conservative");
+		}
+		if (!actN0.includes("有限建議")) {
+			throw new Error("[mo-live] action limited+ready wording");
+		}
+
+		const statusV1 = buildMoReportSummaryStatusBlockLines({
+			currentStrategy: "balanced",
+			previousStrategy: "conservative",
+			changed: false,
+			shouldNotify: false,
+			recommendationStatus: "none",
+			recommendationReason: "尚無資料",
+			simulationReady: false,
+			simulationResult: "無法模擬",
+			timestamp: "t0",
+			reportDataQuality: "limited",
+			recommendationReadiness: "ready",
+			simulationReadiness: "blocked",
+			recommendationGateReason: "g",
+			simulationGateReason: "s",
+		});
+		if (statusV1.includes("reportRec:") || statusV1.includes("reportReason:")) {
+			throw new Error("[mo-live] status v1 must omit legacy reportRec/reportReason");
+		}
+		if (!statusV1.includes("recommendationReadiness: ready")) {
+			throw new Error("[mo-live] status v1 readiness");
+		}
+		const statusLegacy = buildMoReportSummaryStatusBlockLines({
+			currentStrategy: "balanced",
+			previousStrategy: "conservative",
+			changed: false,
+			shouldNotify: false,
+			recommendationStatus: "active",
+			simulationReady: true,
+			timestamp: "t1",
+		});
+		if (!statusLegacy.includes("reportRec: active")) {
+			throw new Error("[mo-live] status legacy keeps reportRec");
+		}
+
 		console.log("[mo-live] intelligence v1 ok");
 	}
 
@@ -2397,6 +2544,7 @@ module.exports = {
 	buildSystemDecisionLineLiveIntelligence,
 	buildActionLineLiveIntelligence,
 	buildSimulationStatusLineLiveIntelligence,
+	buildMoReportSummaryStatusBlockLines,
 };
 
 if (
