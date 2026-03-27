@@ -30,6 +30,7 @@
 - 當修改 strategy 相關邏輯（包含 review / decision / auto promote / status readiness）後，必須先執行 `npm run dev:check`
 - 回報結果時，需附上 `dev:check` 輸出摘要（至少包含 total / promote / hold / keep）
 - `dev:check` 通過後才能進行 ship（可使用 `npm run ship:strategy`）
+- `npm run ship` 已內建先執行 `dev:check`；若 `dev:check` 失敗，視為邏輯錯誤並中斷 commit
 
 ## Git rules
 - **Commit message 必須使用中文**（標題與內文；建議繁體中文）
