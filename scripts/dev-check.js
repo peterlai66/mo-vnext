@@ -352,6 +352,110 @@ for (const c of stabilityCases) {
 	guardState = checked.nextState;
 }
 
+/**
+ * MO Strategy E2E：對齊 LINE 手動驗證（clone → review → auto-promote ×2 → 同步後 review / auto-promote）。
+ * 重用 buildReviewResult、evaluateAutoPromoteStable（與 Worker 決策規則一致的最小模型）。
+ */
+function runStrategyE2E() {
+	const baseActive = { balancedMinScore: 60, freshnessWeight: 1, volumeWeight: 1 };
+	/** @type {StrategyShape} */
+	let active = { ...baseActive };
+	/** @type {StrategyShape} */
+	let candidate = { ...active };
+
+	/**
+	 * @param {boolean} cond
+	 * @param {string} step
+	 * @param {string} detail
+	 * @returns {asserts cond is true}
+	 */
+	function assertE2e(cond, step, detail) {
+		if (!cond) {
+			throw new Error(`[E2E ${step}] ${detail}`);
+		}
+	}
+
+	// Step 1：clone active → candidate
+	console.log("[E2E Step 1] clone active → candidate");
+	candidate = { ...active };
+	assertE2e(
+		candidate.balancedMinScore === active.balancedMinScore,
+		"Step 1",
+		"candidate should match active after clone"
+	);
+
+	// Step 2：patch candidate worse + review
+	console.log("[E2E Step 2] patch candidate balancedMinScore=25 + review");
+	candidate = { ...candidate, balancedMinScore: 25 };
+	let rr = buildReviewResult(active, candidate);
+	assertE2e(rr.decision === "hold_review", "Step 2", `expected hold_review, got ${rr.decision}`);
+	assertE2e(rr.delta < 0, "Step 2", `expected delta < 0, got ${rr.delta}`);
+
+	// Step 3：重新 clone
+	console.log("[E2E Step 3] clone active → candidate (reset)");
+	candidate = { ...active };
+
+	// Step 4：patch candidate 變強 + review
+	console.log("[E2E Step 4] patch candidate balancedMinScore=90 + review");
+	candidate = { ...candidate, balancedMinScore: 90 };
+	rr = buildReviewResult(active, candidate);
+	assertE2e(
+		rr.decision === "promote_candidate",
+		"Step 4",
+		`expected promote_candidate, got ${rr.decision}`
+	);
+	assertE2e(rr.delta >= 10, "Step 4", `expected delta >= 10, got ${rr.delta}`);
+
+	// Step 5：auto-promote 第一次（confirm guard）
+	console.log("[E2E Step 5] auto-promote (1st)");
+	/** @type {PromoteGuardState} */
+	let guard = { confirmCount: 0 };
+	const t0 = Date.now();
+	let ap = evaluateAutoPromoteStable(guard, "promote_candidate", t0);
+	assertE2e(ap.result !== "promoted", "Step 5", `expected not promoted first, got ${ap.result}`);
+	assertE2e(ap.confirmCount === 1, "Step 5", `expected confirmCount 1, got ${ap.confirmCount}`);
+	assertE2e(ap.result === "guarded", "Step 5", `expected guarded, got ${ap.result}`);
+	guard = ap.nextState;
+
+	// Step 6：auto-promote 第二次（promoted）
+	console.log("[E2E Step 6] auto-promote (2nd)");
+	ap = evaluateAutoPromoteStable(guard, "promote_candidate", t0 + 60_000);
+	assertE2e(ap.result === "promoted", "Step 6", `expected promoted, got ${ap.result}`);
+	assertE2e(ap.confirmCount === 2, "Step 6", `expected confirmCount 2, got ${ap.confirmCount}`);
+	guard = ap.nextState;
+
+	// Step 7：模擬 promote 後 active ← candidate（兩邊一致）→ review
+	console.log("[E2E Step 7] review after promote (active synced to candidate)");
+	active = { ...candidate };
+	rr = buildReviewResult(active, candidate);
+	assertE2e(rr.delta === 0, "Step 7", `expected delta 0, got ${rr.delta}`);
+	assertE2e(
+		rr.changedFields.length === 0,
+		"Step 7",
+		`expected no changed fields (none), got ${rr.changedFields.join(",") || "(empty)"}`
+	);
+	assertE2e(rr.decision === "keep_active", "Step 7", `expected keep_active, got ${rr.decision}`);
+
+	// Step 8：auto-promote 於 keep_active → no_action
+	console.log("[E2E Step 8] auto-promote when review is keep_active");
+	ap = evaluateAutoPromoteStable(guard, rr.decision, t0 + 120_000);
+	assertE2e(ap.result === "no_action", "Step 8", `expected no_action, got ${ap.result}`);
+	assertE2e(
+		rr.decision === "keep_active",
+		"Step 8",
+		`expected decision keep_active, got ${rr.decision}`
+	);
+}
+
+try {
+	runStrategyE2E();
+	passCount += 1;
+	console.log("✅ E2E strategy flow passed (8 steps)");
+} catch (e) {
+	failCount += 1;
+	console.error("❌ E2E strategy flow failed:", e);
+}
+
 console.log({ passCount, failCount });
 
 if (failCount > 0) {
