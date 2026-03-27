@@ -16,6 +16,9 @@ import {
 	buildActionText as moReportActionLine,
 	getMoLiveCycleStatusFromSnapshotRead,
 	formatDisplayDateFromYyyymmdd,
+	buildMoUpdatePushMessage,
+	fingerprintMoPushContent,
+	evaluateMoPushDecision,
 } from "../scripts/dev-check.js";
 
 interface KVListKey {
@@ -247,6 +250,7 @@ const MO_USER_KV_PREFIX = {
 	lastReportSummary: "last_report_summary",
 	lastStrategyNotifyGate: "last_strategy_notify_gate",
 	strategyNotifyLock: "strategy_notify_lock",
+	moPushAudit: "mo_push_audit",
 } as const;
 
 /** 正式 strategy notify：兩次推播嘗試最短間隔（毫秒） */
@@ -539,6 +543,114 @@ function parseStrategyNotifyStatusRecord(raw: string): StrategyNotifyStatusRecor
 	}
 }
 
+type MoPushEvaluationResult = {
+	shouldNotify: boolean;
+	pushType: "mo_update";
+	pushReason: string;
+	pushResult: string;
+	pushMessage: string;
+	cooldownRemainingMs: number | null;
+	comparedState: {
+		fingerprint: string;
+		marketLine: string;
+		actionLine: string;
+	};
+};
+
+type MoPushAuditRecord = {
+	lastPushType: "mo_update";
+	lastPushResult: string;
+	lastPushReason: string;
+	lastPushAt: string;
+	lastPushDryRun: boolean;
+	lastPushMessagePreview: string;
+	cooldownRemainingMs: number | null;
+	lastPushedFingerprint: string | null;
+	comparedFingerprint: string;
+};
+
+function getMoPushAuditKey(userId: string): string {
+	return buildMoUserKvKey(MO_USER_KV_PREFIX.moPushAudit, userId);
+}
+
+function truncateMoPushPreviewText(s: string, max: number): string {
+	if (s.length <= max) return s;
+	return `${s.slice(0, max)}…`;
+}
+
+function parseMoPushAuditRecord(raw: string): MoPushAuditRecord | null {
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (typeof parsed !== "object" || parsed === null) return null;
+		const o = parsed as Record<string, unknown>;
+		if (o.lastPushType !== "mo_update") return null;
+		if (typeof o.lastPushResult !== "string") return null;
+		if (typeof o.lastPushReason !== "string") return null;
+		if (typeof o.lastPushAt !== "string") return null;
+		if (typeof o.lastPushDryRun !== "boolean") return null;
+		if (typeof o.lastPushMessagePreview !== "string") return null;
+		if (
+			o.cooldownRemainingMs !== null &&
+			(typeof o.cooldownRemainingMs !== "number" || !Number.isFinite(o.cooldownRemainingMs))
+		) {
+			return null;
+		}
+		if (o.lastPushedFingerprint !== null && typeof o.lastPushedFingerprint !== "string") {
+			return null;
+		}
+		if (typeof o.comparedFingerprint !== "string") return null;
+		return {
+			lastPushType: "mo_update",
+			lastPushResult: o.lastPushResult,
+			lastPushReason: o.lastPushReason,
+			lastPushAt: o.lastPushAt,
+			lastPushDryRun: o.lastPushDryRun,
+			lastPushMessagePreview: o.lastPushMessagePreview,
+			cooldownRemainingMs: o.cooldownRemainingMs === null ? null : o.cooldownRemainingMs,
+			lastPushedFingerprint: o.lastPushedFingerprint === null ? null : o.lastPushedFingerprint,
+			comparedFingerprint: o.comparedFingerprint,
+		};
+	} catch {
+		return null;
+	}
+}
+
+async function readMoPushAudit(env: Env, userId: string): Promise<MoPushAuditRecord | null> {
+	return readMoUserKvJson(env, userId, getMoPushAuditKey(userId), parseMoPushAuditRecord);
+}
+
+async function recordMoPushAudit(env: Env, userId: string, rec: MoPushAuditRecord): Promise<void> {
+	try {
+		await env.MO_NOTES.put(getMoPushAuditKey(userId), JSON.stringify(rec));
+	} catch (err: unknown) {
+		const message = err instanceof Error ? err.message : String(err);
+		console.log("[mo-push] audit write failed", { userId, message });
+	}
+}
+
+function moPushAuditFromEvaluation(
+	evaluation: MoPushEvaluationResult,
+	params: {
+		dryRun: boolean;
+		lastPushedFingerprint: string | null;
+		snapshotTimeIso: string;
+		messagePreview: string;
+		lastPushResultOverride?: string;
+	}
+): MoPushAuditRecord {
+	return {
+		lastPushType: "mo_update",
+		lastPushResult: params.lastPushResultOverride ?? evaluation.pushResult,
+		lastPushReason: evaluation.pushReason,
+		lastPushAt: params.snapshotTimeIso,
+		lastPushDryRun: params.dryRun,
+		lastPushMessagePreview: truncateMoPushPreviewText(params.messagePreview, 200),
+		cooldownRemainingMs: evaluation.cooldownRemainingMs,
+		lastPushedFingerprint: params.lastPushedFingerprint,
+		comparedFingerprint: evaluation.comparedState.fingerprint,
+	};
+}
+
 /** detail 為空時依 result 補上可讀說明，與 lastNotifyResult 對齊 */
 function normalizeStrategyNotifyReason(
 	result: StrategyNotifyResultLabel,
@@ -721,7 +833,7 @@ async function formatLastPushStatusBlock(
 			"lastPush: none",
 		].join("\n");
 	}
-	const [n, r] = await Promise.all([
+	const [n, r, moAudit] = await Promise.all([
 		readMoUserKvJson(
 			env,
 			userId,
@@ -734,6 +846,7 @@ async function formatLastPushStatusBlock(
 			getLastPushNotifyKey(userId),
 			parseLastPushNotifyRecord
 		),
+		readMoPushAudit(env, userId),
 	]);
 	const lines: string[] = [`lineMode: ${lineMode}`];
 	if (n === null) {
@@ -753,15 +866,31 @@ async function formatLastPushStatusBlock(
 	}
 	if (r === null) {
 		lines.push("lastPush: none");
-		return lines.join("\n");
+	} else {
+		lines.push(`lastPush: ${r.kind}`);
+		if (r.pushStatus !== undefined) {
+			lines.push(`pushStatus: ${r.pushStatus}`);
+		}
+		lines.push(`pushAt: ${r.pushAt}`);
+		if (r.pushBodySummary !== undefined && r.pushBodySummary !== "") {
+			lines.push(`pushBody: ${r.pushBodySummary}`);
+		}
 	}
-	lines.push(`lastPush: ${r.kind}`);
-	if (r.pushStatus !== undefined) {
-		lines.push(`pushStatus: ${r.pushStatus}`);
-	}
-	lines.push(`pushAt: ${r.pushAt}`);
-	if (r.pushBodySummary !== undefined && r.pushBodySummary !== "") {
-		lines.push(`pushBody: ${r.pushBodySummary}`);
+	if (moAudit === null) {
+		lines.push("moPushAudit: none");
+	} else {
+		lines.push(`moPushType: ${moAudit.lastPushType}`);
+		lines.push(`moPushResult: ${moAudit.lastPushResult}`);
+		lines.push(`moPushReason: ${moAudit.lastPushReason}`);
+		lines.push(`moPushAt: ${moAudit.lastPushAt}`);
+		lines.push(`moPushDryRun: ${moAudit.lastPushDryRun ? "yes" : "no"}`);
+		if (moAudit.cooldownRemainingMs !== null) {
+			lines.push(`moPushCooldownRemainingMs: ${String(moAudit.cooldownRemainingMs)}`);
+		}
+		if (moAudit.lastPushMessagePreview.trim() !== "") {
+			const previewOneLine = moAudit.lastPushMessagePreview.replace(/\s+/gu, " ").trim();
+			lines.push(`moPushPreview: ${previewOneLine}`);
+		}
 	}
 	return lines.join("\n");
 }
@@ -2903,6 +3032,245 @@ async function executeMoLiveDataCycle(env: Env): Promise<MoLiveCycleResult> {
 	};
 }
 
+
+async function computeMoPushEvaluationForUser(
+	env: Env,
+	userId: string,
+	isReportTestChange: boolean
+): Promise<{
+	s: SystemStatus;
+	hasUserId: boolean;
+	totalNotesNum: number;
+	latestNoteMs: number | null;
+	score: number;
+	strategyFinal: "aggressive" | "balanced" | "conservative";
+	strategyFromScore: "aggressive" | "balanced" | "conservative";
+	recReason: string;
+	recStatus: "active" | "idle";
+	recAction: string;
+	noteCountForRec: number;
+	simResult: string;
+	simReady: string;
+	marketStatusLine: string;
+	displayDate: string;
+	dataSource: string;
+	hasAdequateData: boolean;
+	systemDecisionLine: string;
+	actionLine: string;
+	moMessage: string;
+	fingerprint: string;
+	evaluation: MoPushEvaluationResult;
+	snapshotTimeIso: string;
+	prevTrimForReport: string;
+	reportChanged: boolean;
+	reportPreviousStrategy: string;
+	activeStrategyConfig: StrategyActiveConfig;
+	auditBeforeEvaluate: MoPushAuditRecord | null;
+}> {
+	const s = await getSystemStatus(env, userId);
+	const hasUserId = userId.trim() !== "";
+	const totalNotesNum = s.noteCount === "error" ? 0 : s.noteCount;
+	let latestNoteMs: number | null = null;
+	if (hasUserId) {
+		try {
+			const list = await env.MO_NOTES.list({
+				prefix: `note:${userId}:`,
+				limit: 20,
+			});
+			const keyNames = list.keys.map((k) => k.name);
+			if (keyNames.length > 0) {
+				const sorted = [...keyNames].sort(
+					(a, b) => parseTimestampFromKey(b) - parseTimestampFromKey(a)
+				);
+				const latestName = sorted[0];
+				const tail =
+					latestName.startsWith(`note:${userId}:`) ?
+						latestName.slice(`note:${userId}:`.length)
+					:	latestName.split(":").pop() ?? latestName;
+				const ts = Number(tail);
+				if (Number.isFinite(ts)) {
+					const t = new Date(ts).getTime();
+					if (Number.isFinite(t)) {
+						latestNoteMs = ts;
+					}
+				}
+			}
+		} catch {
+			latestNoteMs = null;
+		}
+	}
+
+	const activeStrategyConfigResult = await readActiveStrategyConfig(env);
+	const activeStrategyConfig = activeStrategyConfigResult.config;
+	const freshnessIdleThresholdMs = activeStrategyConfig.freshnessIdleThresholdMs;
+
+	const deltaMs =
+		latestNoteMs === null ? Number.POSITIVE_INFINITY : Date.now() - latestNoteMs;
+	const dataFreshnessScore =
+		latestNoteMs === null || deltaMs >= freshnessIdleThresholdMs ?
+			0
+		:	Math.round((1 - deltaMs / freshnessIdleThresholdMs) * 100);
+	const dataVolumeScore = Math.round(Math.min(1, totalNotesNum / 10) * 100);
+	const simulationReadyScore = totalNotesNum > 0 ? 100 : 0;
+	const weightSum =
+		activeStrategyConfig.freshnessWeight +
+		activeStrategyConfig.volumeWeight +
+		activeStrategyConfig.simulationWeight;
+	const fallback = getDefaultStrategyActiveConfig();
+	const freshnessWeight =
+		weightSum > 0 ? activeStrategyConfig.freshnessWeight / weightSum : fallback.freshnessWeight;
+	const volumeWeight =
+		weightSum > 0 ? activeStrategyConfig.volumeWeight / weightSum : fallback.volumeWeight;
+	const simulationWeight =
+		weightSum > 0 ? activeStrategyConfig.simulationWeight / weightSum : fallback.simulationWeight;
+
+	const scoreRaw =
+		dataFreshnessScore * freshnessWeight +
+		dataVolumeScore * volumeWeight +
+		simulationReadyScore * simulationWeight;
+	const score = Math.max(0, Math.min(100, Math.round(scoreRaw)));
+
+	let recStatus: "active" | "idle";
+	let recReason: string;
+	if (latestNoteMs === null) {
+		recStatus = "idle";
+		recReason = "尚無資料";
+	} else if (deltaMs > freshnessIdleThresholdMs) {
+		recStatus = "idle";
+		recReason = "長時間未更新";
+	} else if (simulationReadyScore === 0) {
+		recStatus = "idle";
+		recReason = "無資料可模擬";
+	} else {
+		recStatus = "active";
+		recReason = "近期有活動";
+	}
+	let recAction: string;
+	if (totalNotesNum >= 10) {
+		recAction = "建議進行策略分析（資料充足）";
+	} else if (totalNotesNum >= 1) {
+		recAction = "建議持續累積資料";
+	} else {
+		recAction = "建議新增第一筆資料";
+	}
+
+	let strategy: "aggressive" | "balanced" | "conservative";
+	if (score >= activeStrategyConfig.aggressiveMinScore) {
+		strategy = "aggressive";
+	} else if (score >= activeStrategyConfig.balancedMinScore) {
+		strategy = "balanced";
+	} else {
+		strategy = "conservative";
+	}
+	const strategyFromScore = strategy;
+
+	let prevTrimForReport = "";
+	let testForceChangedFromEmptyPrevious = false;
+	let strategyFinal: "aggressive" | "balanced" | "conservative" = strategyFromScore;
+	if (hasUserId) {
+		const strategyKeyRead = `strategy:${userId}`;
+		const prevRawRead = await env.MO_NOTES.get(strategyKeyRead, "text");
+		prevTrimForReport = prevRawRead !== null ? prevRawRead.trim() : "";
+		if (isReportTestChange && userId !== "unknown-user") {
+			testForceChangedFromEmptyPrevious = prevTrimForReport === "";
+			strategyFinal = pickForcedStrategyForReportTest(
+				prevTrimForReport,
+				strategyFromScore
+			);
+		}
+	}
+
+	const noteCountForRec = s.noteCount === "error" ? 0 : s.noteCount;
+	const simReady = noteCountForRec > 0 ? "yes" : "no";
+	let simResult: string;
+	if (noteCountForRec === 0) {
+		simResult = "無法模擬";
+	} else if (strategyFinal === "aggressive") {
+		simResult = "模擬偏積極策略，可提高部位配置";
+	} else if (strategyFinal === "balanced") {
+		simResult = "模擬偏平衡策略，建議分批配置";
+	} else {
+		simResult = "模擬偏保守策略，建議先觀察";
+	}
+
+	const liveRead = await readLatestMoLiveMarketSnapshot(env);
+	const marketStatusLine = buildMarketStatusText(
+		getMoLiveCycleStatusFromSnapshotRead(liveRead)
+	);
+	const displayDate =
+		liveRead.kind === "ok" && liveRead.row !== null ?
+			formatDisplayDateFromYyyymmdd(liveRead.row.trade_date)
+		:	formatDisplayDateFromYyyymmdd(getTaipeiYYYYMMDDMinusDaysFromToday(0));
+	const dataSource =
+		liveRead.kind === "ok" && liveRead.row !== null ? liveRead.row.source : "—";
+	const hasAdequateData = totalNotesNum > 0;
+	const systemDecisionLine = buildSystemDecisionText(
+		strategyFinal,
+		score,
+		hasAdequateData,
+		recReason
+	);
+	const actionLine = buildActionText(score);
+	const moMessage = buildMoUpdatePushMessage(marketStatusLine, actionLine, displayDate);
+	const fingerprint = fingerprintMoPushContent(marketStatusLine, actionLine);
+	const audit = await readMoPushAudit(env, userId);
+	const gate = await readStrategyNotifyGateFromKv(env, userId);
+	const nowMs = Date.now();
+	const evaluation = evaluateMoPushDecision({
+		marketLine: marketStatusLine,
+		actionLine,
+		message: moMessage,
+		lastPushedFingerprint: audit === null ? null : audit.lastPushedFingerprint,
+		gateMessage: gate === null ? null : gate.lastNotifyMessage,
+		gateAtMs: gate === null ? null : gate.lastNotifyAt,
+		nowMs,
+		cooldownMs: STRATEGY_NOTIFY_COOLDOWN_MS,
+	});
+	const snapshotTimeIso = new Date().toISOString();
+
+	let reportPreviousStrategy = "none";
+	let reportChanged = false;
+	if (hasUserId) {
+		const prevTrim = prevTrimForReport;
+		const previousDisplay = prevTrim === "" ? "none" : prevTrim;
+		const changed: "yes" | "no" =
+			testForceChangedFromEmptyPrevious && prevTrim === "" ? "yes" :
+				prevTrim !== "" && prevTrim !== strategyFinal ? "yes" : "no";
+		reportPreviousStrategy = previousDisplay;
+		reportChanged = changed === "yes";
+	}
+
+	return {
+		s,
+		hasUserId,
+		totalNotesNum,
+		latestNoteMs,
+		score,
+		strategyFinal,
+		strategyFromScore,
+		recReason,
+		recStatus,
+		recAction,
+		noteCountForRec,
+		simResult,
+		simReady,
+		marketStatusLine,
+		displayDate,
+		dataSource,
+		hasAdequateData,
+		systemDecisionLine,
+		actionLine,
+		moMessage,
+		fingerprint,
+		evaluation,
+		snapshotTimeIso,
+		prevTrimForReport,
+		reportChanged,
+		reportPreviousStrategy,
+		activeStrategyConfig,
+		auditBeforeEvaluate: audit,
+	};
+}
 async function handleCommand(
 	command: string | null,
 	messageText: string,
@@ -4442,213 +4810,71 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 	  case "/report-test-change":
 	  case "/report": {
 		const isReportTestChange = command === "/report-test-change";
-		const s = await getSystemStatus(env, userId);
+		const ctx = await computeMoPushEvaluationForUser(env, userId, isReportTestChange);
+		const hasUserId = ctx.hasUserId;
+		const totalNotesNum = ctx.totalNotesNum;
+		const score = ctx.score;
+		const strategyFinal = ctx.strategyFinal;
+		const strategyFromScore = ctx.strategyFromScore;
+		const recStatus = ctx.recStatus;
+		const recReason = ctx.recReason;
+		const noteCountForRec = ctx.noteCountForRec;
+		const simResult = ctx.simResult;
+		const simReady = ctx.simReady;
+		const activeStrategyConfig = ctx.activeStrategyConfig;
 
-		const hasUserId = userId.trim() !== "";
-		const totalNotesNum = s.noteCount === "error" ? 0 : s.noteCount;
-		let latestNoteMs: number | null = null;
-		if (hasUserId) {
-			try {
-				const list = await env.MO_NOTES.list({
-					prefix: `note:${userId}:`,
-					limit: 20,
-				});
-				const keyNames = list.keys.map((k) => k.name);
-				if (keyNames.length > 0) {
-					const sorted = [...keyNames].sort(
-						(a, b) => parseTimestampFromKey(b) - parseTimestampFromKey(a)
-					);
-					const latestName = sorted[0];
-					const tail =
-						latestName.startsWith(`note:${userId}:`) ?
-							latestName.slice(`note:${userId}:`.length)
-						:	latestName.split(":").pop() ?? latestName;
-					const ts = Number(tail);
-					if (Number.isFinite(ts)) {
-						const t = new Date(ts).getTime();
-						if (Number.isFinite(t)) {
-							latestNoteMs = ts;
-						}
-					}
-				}
-			} catch {
-				latestNoteMs = null;
-			}
-		}
-
-		const activeStrategyConfigResult = await readActiveStrategyConfig(env);
-		const activeStrategyConfig = activeStrategyConfigResult.config;
-		const freshnessIdleThresholdMs = activeStrategyConfig.freshnessIdleThresholdMs;
-
-		// 第一版可解釋策略規則：三因子加權（參數來源：active strategy config）
-		const deltaMs =
-			latestNoteMs === null ? Number.POSITIVE_INFINITY : Date.now() - latestNoteMs;
-		// dataFreshnessScore: 0~100（0=過久未更新；100=剛更新）
-		const dataFreshnessScore =
-			latestNoteMs === null || deltaMs >= freshnessIdleThresholdMs ?
-				0
-			:	Math.round((1 - deltaMs / freshnessIdleThresholdMs) * 100);
-		// dataVolumeScore: 0~100（0=無資料；>=10 筆視為滿分）
-		const dataVolumeScore = Math.round(Math.min(1, totalNotesNum / 10) * 100);
-		// simulationReadyScore: 0~100（有資料即可進行模擬）
-		const simulationReadyScore = totalNotesNum > 0 ? 100 : 0;
-		const weightSum =
-			activeStrategyConfig.freshnessWeight +
-			activeStrategyConfig.volumeWeight +
-			activeStrategyConfig.simulationWeight;
-		const fallback = getDefaultStrategyActiveConfig();
-		const freshnessWeight =
-			weightSum > 0 ? activeStrategyConfig.freshnessWeight / weightSum : fallback.freshnessWeight;
-		const volumeWeight =
-			weightSum > 0 ? activeStrategyConfig.volumeWeight / weightSum : fallback.volumeWeight;
-		const simulationWeight =
-			weightSum > 0 ? activeStrategyConfig.simulationWeight / weightSum : fallback.simulationWeight;
-
-		const scoreRaw =
-			dataFreshnessScore * freshnessWeight +
-			dataVolumeScore * volumeWeight +
-			simulationReadyScore * simulationWeight;
-		const score = Math.max(0, Math.min(100, Math.round(scoreRaw)));
-
-		console.log("[strategy] inputs", {
-			configVersion: activeStrategyConfig.configVersion,
-			dataFreshnessScore,
-			dataVolumeScore,
-			simulationReadyScore,
-			totalNotesNum,
-			deltaMs,
-			freshnessIdleThresholdMs,
-			freshnessWeight,
-			volumeWeight,
-			simulationWeight,
-		});
-
-		let recStatus: "active" | "idle";
-		let recReason: string;
-		if (latestNoteMs === null) {
-			recStatus = "idle";
-			recReason = "尚無資料";
-		} else if (deltaMs > freshnessIdleThresholdMs) {
-			recStatus = "idle";
-			recReason = "長時間未更新";
-		} else if (simulationReadyScore === 0) {
-			recStatus = "idle";
-			recReason = "無資料可模擬";
-		} else {
-			recStatus = "active";
-			recReason = "近期有活動";
-		}
-		let recAction: string;
-		if (totalNotesNum >= 10) {
-			recAction = "建議進行策略分析（資料充足）";
-		} else if (totalNotesNum >= 1) {
-			recAction = "建議持續累積資料";
-		} else {
-			recAction = "建議新增第一筆資料";
-		}
-		let strategy: "aggressive" | "balanced" | "conservative";
-		if (score >= activeStrategyConfig.aggressiveMinScore) {
-			strategy = "aggressive";
-		} else if (score >= activeStrategyConfig.balancedMinScore) {
-			strategy = "balanced";
-		} else {
-			strategy = "conservative";
-		}
-		const strategyFromScore = strategy;
 		console.log("[strategy] score result", {
 			score,
 			strategy: strategyFromScore,
 			aggressiveMinScore: activeStrategyConfig.aggressiveMinScore,
 			balancedMinScore: activeStrategyConfig.balancedMinScore,
 		});
-		// /report 僅做報表計算，不落盤覆寫 strategy_review_decision（避免污染 promotion/review 狀態）
-		console.log("[strategy] report computed without persisting review decision", {
-			score,
-			strategy: strategyFromScore,
-			status: recStatus,
-			dataFreshnessScore,
-		});
-		let prevTrimForReport = "";
-		// 測試模式覆寫（/report-test-change only）集中在此：確保正式 /report 不受影響
-		let testForceChangedFromEmptyPrevious = false;
-		let strategyFinal: "aggressive" | "balanced" | "conservative" = strategyFromScore;
-		if (hasUserId) {
-			const strategyKeyRead = `strategy:${userId}`;
-			const prevRawRead = await env.MO_NOTES.get(strategyKeyRead, "text");
-			prevTrimForReport = prevRawRead !== null ? prevRawRead.trim() : "";
-			if (isReportTestChange && userId !== "unknown-user") {
-				testForceChangedFromEmptyPrevious = prevTrimForReport === "";
-				strategyFinal = pickForcedStrategyForReportTest(
-					prevTrimForReport,
-					strategyFromScore
-				);
-				console.log("[test] force strategy change", {
-					userId,
-					previous: prevTrimForReport === "" ? "(empty)" : prevTrimForReport,
-					fromScore: strategyFromScore,
-					forced: strategyFinal,
-				});
-			}
-		}
 		console.log("[report] final strategy selected", {
 			userId,
 			fromScore: strategyFromScore,
 			final: strategyFinal,
 			reportTestChange: isReportTestChange,
 		});
-		console.log("[report] recommendation strategy synced", {
-			strategy: strategyFinal,
-		});
 
-		const noteCountForRec = s.noteCount === "error" ? 0 : s.noteCount;
-		const simReady = noteCountForRec > 0 ? "yes" : "no";
-		let simResult: string;
-		if (noteCountForRec === 0) {
-			simResult = "無法模擬";
-		} else if (strategyFinal === "aggressive") {
-			simResult = "模擬偏積極策略，可提高部位配置";
-		} else if (strategyFinal === "balanced") {
-			simResult = "模擬偏平衡策略，建議分批配置";
-		} else {
-			simResult = "模擬偏保守策略，建議先觀察";
-		}
-		let strategyNotifyPushBody: string | null = null;
-		let reportPreviousStrategy = "none";
-		let reportChanged = false;
-		let reportShouldNotify = false;
+		let strategyNotifyPushBody: string | null = ctx.evaluation.shouldNotify ?
+			ctx.moMessage
+		:	null;
+		let reportPreviousStrategy = ctx.reportPreviousStrategy;
+		let reportChanged = ctx.reportChanged;
+		const reportShouldNotify = ctx.evaluation.shouldNotify;
+
 		if (hasUserId) {
 			const strategyKey = `strategy:${userId}`;
-			const prevTrim = prevTrimForReport;
-			const previousDisplay = prevTrim === "" ? "none" : prevTrim;
-			const changed: "yes" | "no" =
-				testForceChangedFromEmptyPrevious && prevTrim === "" ? "yes" :
-					prevTrim !== "" && prevTrim !== strategyFinal ? "yes" : "no";
-			const shouldNotify: "yes" | "no" = changed === "yes" ? "yes" : "no";
-			reportPreviousStrategy = previousDisplay;
-			reportChanged = changed === "yes";
-			reportShouldNotify = shouldNotify === "yes";
 			await env.MO_NOTES.put(strategyKey, strategyFinal);
-			if (shouldNotify === "yes") {
-				strategyNotifyPushBody = `MO Strategy Update
-previous: ${previousDisplay}
-current: ${strategyFinal}
-score: ${score}
-action: ${recAction}`;
-			}
+			const shouldNotifyStrategy: "yes" | "no" = ctx.reportChanged ? "yes" : "no";
 			const strategyDecision: StrategyDecisionRecord = {
-				changed: changed === "yes",
-				shouldNotify: shouldNotify === "yes",
+				changed: ctx.reportChanged,
+				shouldNotify: shouldNotifyStrategy === "yes",
 				hasMessage: strategyNotifyPushBody !== null,
 				timestamp: formatStatusPushAtTaipei(new Date()),
 			};
 			await recordStrategyDecision(env, userId, strategyDecision);
 		}
 
+		const lastFpPersist: string | null =
+			ctx.auditBeforeEvaluate === null ? null : ctx.auditBeforeEvaluate.lastPushedFingerprint;
+
 		if (hasUserId && userId !== "unknown-user") {
-			if (!reportChanged) {
-				console.log("[notify] skipped: decisionChanged=false", { userId });
-			} else if (!reportShouldNotify) {
-				console.log("[notify] skipped: shouldNotify=false", { userId });
+			if (!ctx.evaluation.shouldNotify) {
+				console.log("[notify] skipped: mo_push_decision", {
+					userId,
+					result: ctx.evaluation.pushResult,
+				});
+				await recordMoPushAudit(
+					env,
+					userId,
+					moPushAuditFromEvaluation(ctx.evaluation, {
+						dryRun: false,
+						lastPushedFingerprint: lastFpPersist,
+						snapshotTimeIso: ctx.snapshotTimeIso,
+						messagePreview: ctx.moMessage,
+					})
+				);
 			} else if (strategyNotifyPushBody === null) {
 				console.log("[notify] skipped: hasMessage=false", { userId });
 			} else {
@@ -4656,54 +4882,73 @@ action: ${recAction}`;
 				const lockSlot = await acquireStrategyNotifyLock(env, userId);
 				if (lockSlot === null) {
 					console.log("[notify] skipped: in_progress", { userId });
-					await recordStrategyNotifyOutcomeForStatus(
+					await recordStrategyNotifyOutcomeForStatus(env, userId, "in_progress", "");
+					const inProg: MoPushEvaluationResult = {
+						shouldNotify: false,
+						pushType: "mo_update",
+						pushReason: "parallel_notify_lock_active",
+						pushResult: "skipped_in_progress",
+						pushMessage: ctx.moMessage,
+						cooldownRemainingMs: null,
+						comparedState: ctx.evaluation.comparedState,
+					};
+					await recordMoPushAudit(
 						env,
 						userId,
-						"in_progress",
-						""
+						moPushAuditFromEvaluation(inProg, {
+							dryRun: false,
+							lastPushedFingerprint: lastFpPersist,
+							snapshotTimeIso: ctx.snapshotTimeIso,
+							messagePreview: ctx.moMessage,
+						})
 					);
 				} else {
 					console.log("[notify] lock acquired", { userId });
 					try {
 						const gate = await readStrategyNotifyGateFromKv(env, userId);
 						const nowMs = Date.now();
-						if (gate !== null && gate.lastNotifyMessage === notifyBody) {
-							console.log("[notify] skipped: duplicate_message", { userId });
-							await recordStrategyNotifyOutcomeForStatus(
+						const evalInLock = evaluateMoPushDecision({
+							marketLine: ctx.marketStatusLine,
+							actionLine: ctx.actionLine,
+							message: ctx.moMessage,
+							lastPushedFingerprint: lastFpPersist,
+							gateMessage: gate === null ? null : gate.lastNotifyMessage,
+							gateAtMs: gate === null ? null : gate.lastNotifyAt,
+							nowMs,
+							cooldownMs: STRATEGY_NOTIFY_COOLDOWN_MS,
+						});
+						if (!evalInLock.shouldNotify) {
+							console.log("[notify] skipped: mo_push_recheck", evalInLock.pushResult);
+							await recordMoPushAudit(
 								env,
 								userId,
-								"duplicate_message",
-								""
+								moPushAuditFromEvaluation(evalInLock, {
+									dryRun: false,
+									lastPushedFingerprint: lastFpPersist,
+									snapshotTimeIso: ctx.snapshotTimeIso,
+									messagePreview: ctx.moMessage,
+								})
 							);
-						} else if (
-							gate !== null &&
-							nowMs - gate.lastNotifyAt < STRATEGY_NOTIFY_COOLDOWN_MS
-						) {
-							const elapsedMs = nowMs - gate.lastNotifyAt;
-							console.log("[notify] skipped: cooldown", {
-								userId,
-								elapsedMs,
-								cooldownMs: STRATEGY_NOTIFY_COOLDOWN_MS,
-							});
-							await recordStrategyNotifyOutcomeForStatus(
-								env,
-								userId,
-								"cooldown",
-								`elapsedMs=${String(elapsedMs)}`
-							);
+							if (evalInLock.pushResult === "skipped_cooldown") {
+								const remaining = evalInLock.cooldownRemainingMs ?? 0;
+								await recordStrategyNotifyOutcomeForStatus(
+									env,
+									userId,
+									"cooldown",
+									`remainingMs=${String(remaining)}`
+								);
+							} else {
+								await recordStrategyNotifyOutcomeForStatus(
+									env,
+									userId,
+									"duplicate_message",
+									evalInLock.pushReason
+								);
+							}
 						} else {
 							console.log("[notify] start", { userId });
-							await recordStrategyNotifyGateAttempt(
-								env,
-								userId,
-								notifyBody,
-								nowMs
-							);
-							const notifyPush = await lineBotPushTextMessage(
-								env,
-								userId,
-								notifyBody
-							);
+							await recordStrategyNotifyGateAttempt(env, userId, notifyBody, nowMs);
+							const notifyPush = await lineBotPushTextMessage(env, userId, notifyBody);
 							await recordLinePushOutcomeForStatus(env, userId, notifyPush);
 							const ns = linePushOutcomeToStrategyNotifyStatus(notifyPush);
 							await recordStrategyNotifyOutcomeForStatus(
@@ -4712,7 +4957,40 @@ action: ${recAction}`;
 								ns.lastNotifyResult,
 								ns.lastNotifyReason
 							);
+							if (notifyPush.result === "success") {
+								await recordMoPushAudit(
+									env,
+									userId,
+									moPushAuditFromEvaluation(ctx.evaluation, {
+										dryRun: false,
+										lastPushedFingerprint: ctx.fingerprint,
+										snapshotTimeIso: ctx.snapshotTimeIso,
+										messagePreview: ctx.moMessage,
+										lastPushResultOverride: "line_success",
+									})
+								);
+							} else {
+								const lineLabel =
+									notifyPush.result === "skipped" ? "line_skipped_reply_only"
+									: notifyPush.result === "blocked_by_monthly_limit" ? "line_blocked_quota"
+									: notifyPush.result === "failed" ? "line_failed"
+									: "line_network_error";
+								await recordMoPushAudit(
+									env,
+									userId,
+									moPushAuditFromEvaluation(ctx.evaluation, {
+										dryRun: false,
+										lastPushedFingerprint: lastFpPersist,
+										snapshotTimeIso: ctx.snapshotTimeIso,
+										messagePreview: ctx.moMessage,
+										lastPushResultOverride: lineLabel,
+									})
+								);
+							}
 							switch (notifyPush.result) {
+								case "skipped":
+									console.log("[notify] skipped: reply_only_or_dry", { userId });
+									break;
 								case "success":
 									console.log("[notify] done", { userId });
 									break;
@@ -4760,32 +5038,15 @@ action: ${recAction}`;
 			await recordLastReportSummary(env, userId, summary);
 		}
 
-		const liveRead = await readLatestMoLiveMarketSnapshot(env);
-		const cycleForReport = getMoLiveCycleStatusFromSnapshotRead(liveRead);
-		const marketStatusLine = buildMarketStatusText(cycleForReport);
-		const displayDate =
-			liveRead.kind === "ok" && liveRead.row !== null ?
-				formatDisplayDateFromYyyymmdd(liveRead.row.trade_date)
-			:	formatDisplayDateFromYyyymmdd(getTaipeiYYYYMMDDMinusDaysFromToday(0));
-		const dataSource =
-			liveRead.kind === "ok" && liveRead.row !== null ? liveRead.row.source : "—";
-		const hasAdequateData = totalNotesNum > 0;
-		const systemDecisionLine = buildSystemDecisionText(
-			strategyFinal,
-			score,
-			hasAdequateData,
-			recReason
-		);
-		const actionLine = buildActionText(score);
 		const notesLine =
 			noteCountForRec > 0 ? `模擬顯示：${simResult}` : "";
 
 		return buildMoReportText({
-			displayDate,
-			dataSource,
-			marketStatusLine,
-			systemDecisionLine,
-			actionLine,
+			displayDate: ctx.displayDate,
+			dataSource: ctx.dataSource,
+			marketStatusLine: ctx.marketStatusLine,
+			systemDecisionLine: ctx.systemDecisionLine,
+			actionLine: ctx.actionLine,
 			notesLine: notesLine.trim() !== "" ? notesLine : undefined,
 		});
 	  }
@@ -4799,6 +5060,55 @@ action: ${recAction}`;
 	  default:
 		// 保持原本 echo 行為
 		return `你剛剛說：${messageText ?? ""}`;
+	}
+}
+
+async function buildMoPushPreviewJsonResponse(
+	env: Env,
+	userId: string,
+	isReportTestChange: boolean
+): Promise<Response> {
+	try {
+		const ctx = await computeMoPushEvaluationForUser(env, userId, isReportTestChange);
+		const audit = ctx.auditBeforeEvaluate;
+		const lastFp = audit === null ? null : audit.lastPushedFingerprint;
+		const previewResult =
+			ctx.evaluation.pushResult === "would_push" ? "dry_run_preview" : ctx.evaluation.pushResult;
+		await recordMoPushAudit(
+			env,
+			userId,
+			moPushAuditFromEvaluation(ctx.evaluation, {
+				dryRun: true,
+				lastPushedFingerprint: lastFp,
+				snapshotTimeIso: ctx.snapshotTimeIso,
+				messagePreview: ctx.moMessage,
+				lastPushResultOverride: previewResult,
+			})
+		);
+		const body = {
+			ok: true,
+			dryRun: true,
+			shouldNotify: ctx.evaluation.shouldNotify,
+			pushType: ctx.evaluation.pushType,
+			pushReason: ctx.evaluation.pushReason,
+			pushResult: previewResult,
+			cooldownRemainingMs: ctx.evaluation.cooldownRemainingMs,
+			message: ctx.moMessage,
+			comparedState: ctx.evaluation.comparedState,
+			snapshotTime: ctx.snapshotTimeIso,
+		};
+		return new Response(JSON.stringify(body), {
+			headers: { "Content-Type": "application/json; charset=utf-8" },
+		});
+	} catch (err: unknown) {
+		const message = err instanceof Error ? err.message : String(err);
+		return new Response(
+			JSON.stringify({ ok: false, dryRun: true, error: message }),
+			{
+				status: 500,
+				headers: { "Content-Type": "application/json; charset=utf-8" },
+			}
+		);
 	}
 }
 
@@ -4865,6 +5175,12 @@ async function getReplyText(
 					headers: { "Content-Type": "text/plain; charset=utf-8" },
 				});
 			}
+		}
+
+		if (url.pathname === "/admin/push-preview" && request.method === "GET") {
+			const uid = url.searchParams.get("userId") ?? "preview-user";
+			const testChange = url.searchParams.get("testChange") === "1";
+			return await buildMoPushPreviewJsonResponse(env, uid, testChange);
 		}
 
 		if (url.pathname === "/admin/run" && request.method === "GET") {
