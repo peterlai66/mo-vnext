@@ -3499,7 +3499,10 @@ at: ${at}`;
 			]);
 
 		const at = formatStatusPushAtTaipei(new Date());
-		const decisionSource = reviewDecision?.decisionSource ?? "unknown";
+		const decisionSource =
+			reviewResult?.source ??
+			reviewDecision?.decisionSource ??
+			"computed";
 
 		const a = active.config;
 		const c = candidate;
