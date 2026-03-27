@@ -3280,6 +3280,40 @@ reviewStatus: ${state.reviewStatus}`;
 			lines.push(`evaluatedAt: ${reviewDecision.evaluatedAt}`);
 		}
 
+		const activeBalanced = active.config.balancedMinScore;
+		const candidateBalanced = candidate?.balancedMinScore ?? null;
+		const delta =
+			candidateBalanced === null ? null : candidateBalanced - activeBalanced;
+		const source = reviewResult?.source ?? "none";
+		const decision = reviewDecision?.decision ?? "none";
+		let autoPromoteReadiness: "ready" | "blocked" = "blocked";
+		let autoPromoteReason = "candidate not found";
+		if (source !== "real") {
+			autoPromoteReadiness = "blocked";
+			autoPromoteReason = "source not real";
+		} else if (decision !== "auto_promote_candidate") {
+			autoPromoteReadiness = "blocked";
+			autoPromoteReason = "decision not ready";
+		} else if (delta === null || delta < 10) {
+			autoPromoteReadiness = "blocked";
+			autoPromoteReason = `delta < 10 (current=${delta === null ? "none" : String(delta)})`;
+		} else {
+			autoPromoteReadiness = "ready";
+			autoPromoteReason = "";
+		}
+
+		lines.push("");
+		lines.push("[Auto Promote]");
+		lines.push(`- readiness: ${autoPromoteReadiness}`);
+		lines.push(
+			`- delta: ${delta === null ? "none" : String(delta)} (active=${activeBalanced}, candidate=${candidateBalanced === null ? "none" : String(candidateBalanced)})`
+		);
+		lines.push(`- source: ${source}`);
+		lines.push(`- decision: ${decision}`);
+		if (autoPromoteReadiness === "blocked") {
+			lines.push(`- reason: ${autoPromoteReason}`);
+		}
+
 		console.log("[strategy] strategy status loaded", {
 			activeConfigVersion: activeVersion,
 			hasCandidate: hasCandidate ? "yes" : "no",
