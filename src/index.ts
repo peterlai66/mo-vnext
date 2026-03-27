@@ -3518,10 +3518,18 @@ at: ${at}`;
 		const delta = candidateScore - activeScore;
 		const decision: StrategyCompareDecision =
 			reviewResult?.compareDecision ?? "hold_review";
-		const reason =
+		const baseReason =
 			reviewResult?.compareReason && reviewResult.compareReason.trim() !== "" ?
 				reviewResult.compareReason
 			:	(changedFields.length === 0 ? "no strategy changes" : `candidate changes: ${changedFields.join(", ")}`);
+		const thresholdReason =
+			c !== null &&
+			changedFields.length === 1 &&
+			changedFields[0] === "balancedMinScore" &&
+			delta < 10 ?
+				`balancedMinScore delta is below threshold (delta=${c.balancedMinScore - a.balancedMinScore}, active=${a.balancedMinScore}, candidate=${c.balancedMinScore}); auto promote requires delta >= 10`
+			:	null;
+		const reason = thresholdReason ?? baseReason;
 		const confidence: "high" | "medium" =
 			(decision === "promote_candidate" && delta >= 10) ||
 			(decision === "keep_active" && delta === 0) ?
