@@ -31,6 +31,14 @@
 - 回報結果時，需附上 `dev:check` 輸出摘要（至少包含 total / promote / hold / keep）
 - `dev:check` 通過後才能進行 ship（可使用 `npm run ship:strategy`）
 - `npm run ship` 已內建先執行 `dev:check`；若 `dev:check` 失敗，視為邏輯錯誤並中斷 commit
+- 若修改內容涉及 strategy review / strategy decision / auto promote / strategy status readiness / dev:check，完成後回報格式需固定附上：
+  - 是否已執行 `npm run dev:check`
+  - `dev:check` 結果摘要
+  - `passCount / failCount`
+  - 是否可進行 ship
+- 若 `dev:check` 失敗：
+  - 不可宣稱可 ship
+  - 必須先說明失敗案例（mismatch 內容與原因）
 
 ## Git rules
 - **Commit message 必須使用中文**（標題與內文；建議繁體中文）
