@@ -1978,6 +1978,7 @@ async function runStrategyReview(params: {
 	comparedAt: string;
 	compareDecision: StrategyCompareDecision;
 	compareReason: string;
+	finalDecision: StrategyReviewDecisionLabel;
 }> {
 	const active = await readActiveStrategyConfig(params.env);
 	const candidate = await readCandidateStrategyConfig(params.env);
@@ -1988,6 +1989,7 @@ async function runStrategyReview(params: {
 			comparedAt: "",
 			compareDecision: "hold_review",
 			compareReason: "skipped: candidate_strategy_config 或 strategy_review_state 不存在",
+			finalDecision: "hold_review",
 		};
 	}
 
@@ -2200,7 +2202,7 @@ async function runStrategyReview(params: {
 			reason: "尚無資料",
 		};
 	}
-	await computeAndRecordStrategyReviewDecision({
+	const finalDecisionRecord = await computeAndRecordStrategyReviewDecision({
 		env: params.env,
 		activeConfig: a,
 		snapshot: decisionSnapshot,
@@ -2208,7 +2210,12 @@ async function runStrategyReview(params: {
 	});
 	console.log("[strategy] decision source persisted", { source: params.source });
 
-	return { comparedAt: nowIso, compareDecision, compareReason };
+	return {
+		comparedAt: nowIso,
+		compareDecision,
+		compareReason,
+		finalDecision: finalDecisionRecord.decision,
+	};
 }
 
 function computeStrategyReviewDecision(params: {
@@ -2327,7 +2334,7 @@ async function computeAndRecordStrategyReviewDecision(params: {
 	activeConfig: StrategyActiveConfig;
 	snapshot: StrategyCurrentSnapshot;
 	decisionSource?: "demo" | "real";
-}): Promise<void> {
+}): Promise<StrategyReviewDecisionRecord> {
 	// decision 規則只依賴現有資料；讀取失敗不阻擋主流程
 	const [candidate, reviewState, reviewResult] = await Promise.all([
 		readCandidateStrategyConfig(params.env),
@@ -2366,6 +2373,7 @@ async function computeAndRecordStrategyReviewDecision(params: {
 		reason: rec.reason,
 	});
 	await writeStrategyReviewDecision(params.env, rec);
+	return rec;
 }
 
 type StrategyReviewExplainAiFailureReason =
@@ -2776,11 +2784,10 @@ compareReason: ${r.compareReason}`;
 		// 只做提示：不自動 promotion；在 review 回覆中明確告知 auto promote 條件是否達成
 		let autoPromoteHintBlock = "";
 		try {
-			const [active, candidate, reviewResult, reviewDecision, demoOverride] = await Promise.all([
+			const [active, candidate, reviewResult, demoOverride] = await Promise.all([
 				readActiveStrategyConfig(env),
 				readCandidateStrategyConfig(env),
 				readStrategyReviewResult(env),
-				readStrategyReviewDecision(env),
 				readStrategyReviewDemoOverride(env),
 			]);
 
@@ -2801,7 +2808,7 @@ compareReason: ${r.compareReason}`;
 					c.balancedMinScore - a.balancedMinScore
 				:	null;
 			const source = reviewResult?.source ?? "none";
-			const finalDecision = reviewDecision?.decision ?? null;
+			const finalDecision: StrategyReviewDecisionLabel = r.finalDecision;
 			const compareDecision = reviewResult?.compareDecision ?? null;
 
 			const autoPromoteEligible =
@@ -2822,7 +2829,7 @@ compareReason: ${r.compareReason}`;
 				const sourceLine =
 					source !== "real" ? `${source}（需為 real）` : source;
 				const decisionLine =
-					finalDecision !== null ?
+					finalDecision !== undefined ?
 						`\n- decision: ${finalDecision}`
 					: compareDecision !== null ?
 						`\n- compareDecision: ${compareDecision}`
