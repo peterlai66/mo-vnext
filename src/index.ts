@@ -2939,8 +2939,23 @@ compareReason: ${r.compareReason}`;
 				confidence,
 			};
 		};
+		const existingView =
+			existingResult === null ? null
+			:	buildReviewResultView({
+					active: activeCfg.config,
+					candidate: candidateCfg,
+					compareDecision: existingResult.compareDecision,
+					compareReason: existingResult.compareReason,
+				});
+		const shouldComputeOnDemand =
+			existingResult === null ||
+			existingResult.comparedAt.trim() === "" ||
+			existingResult.compareReason === "review result not ready" ||
+			(existingView !== null &&
+				existingView.activeScore === 0 &&
+				existingView.candidateScore === 0);
 		const r =
-			existingResult !== null && existingResult.comparedAt.trim() !== "" ?
+			!shouldComputeOnDemand && existingResult !== null && existingView !== null ?
 				{
 					comparedAt: existingResult.comparedAt,
 					compareDecision: existingResult.compareDecision,
@@ -2949,12 +2964,7 @@ compareReason: ${r.compareReason}`;
 						existingResult.compareDecision === "promote_candidate" ? "promote_candidate"
 						: existingResult.compareDecision === "keep_active" ? "keep_active"
 						: "hold_review",
-					reviewResult: buildReviewResultView({
-						active: activeCfg.config,
-						candidate: candidateCfg,
-						compareDecision: existingResult.compareDecision,
-						compareReason: existingResult.compareReason,
-					}),
+					reviewResult: existingView,
 				}
 			:	(await (async () => {
 					const computed = await runStrategyReview({
