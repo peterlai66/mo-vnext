@@ -5,8 +5,12 @@
 	"observability": {
 		"enabled": true,
 	},
-	"vars":{
-		"LINE_MODE":"push_enabled"
+	"vars": {
+		"LINE_MODE": "push_enabled",
+		"MO_FORCE_TWSE_FAIL_FOR_TEST": "0"
+	},
+	"triggers": {
+		"crons": ["*/10 * * * *"]
 	},
 	"kv_namespaces": [
 		{

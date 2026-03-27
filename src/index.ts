@@ -16,6 +16,10 @@ import {
 	buildActionText as moReportActionLine,
 	getMoLiveCycleStatusFromSnapshotRead,
 	formatDisplayDateFromYyyymmdd,
+	deriveMoLiveDataGovernance,
+	buildMoReportDataQualityNote,
+	buildMarketStatusLineWithGovernance,
+	getMoLiveReportCycleFromGovernance,
 	evaluateMoPushEventDecision,
 	MO_PUSH_COOLDOWN_MS_DEFAULT,
 	MO_PUSH_COOLDOWN_MS_P3_ONLY,
@@ -85,6 +89,10 @@ export interface Env {
 	DEBUG_LOG?: string;
 	/** 僅測試用：非空時覆寫 /report 與 push 決策用的 actionLine（未設定則維持 buildActionText(score)） */
 	MO_FORCE_REPORT_ACTION_LINE?: string;
+	/** FinMind API token（TWSE 失敗時 fallback 使用） */
+	FINMIND_TOKEN?: string;
+	/** 僅驗證用：設為 "1" 時不呼叫 TWSE，直接走 FinMind fallback（正式請勿啟用） */
+	MO_FORCE_TWSE_FAIL_FOR_TEST?: string;
 }
 
 function isDebugLogEnabled(env: Env): boolean {
@@ -257,6 +265,15 @@ const MO_USER_KV_PREFIX = {
 
 /** 正式 strategy notify：兩次推播嘗試最短間隔（毫秒）；與 dev-check MO_PUSH_COOLDOWN_MS_DEFAULT 一致 */
 const STRATEGY_NOTIFY_COOLDOWN_MS = MO_PUSH_COOLDOWN_MS_DEFAULT;
+
+/** 早於此間隔的 mo_live 快照在 /status、/report 標示為 stale（僅顯示，不改 push 決策核心） */
+const MO_LIVE_SNAPSHOT_STALE_MS = 6 * 60 * 60 * 1000;
+
+function isMoLiveSnapshotStale(createdAtIso: string, nowMs: number): boolean {
+	const t = Date.parse(createdAtIso);
+	if (!Number.isFinite(t)) return true;
+	return nowMs - t > MO_LIVE_SNAPSHOT_STALE_MS;
+}
 
 /** notify 併發鎖租約（毫秒）；應涵蓋 push 往返時間，逾時由 KV expiration 回收 */
 const STRATEGY_NOTIFY_LOCK_LEASE_MS = 3 * 60 * 1000;
@@ -576,6 +593,7 @@ type MoPushEvaluationResult = {
 		actionLine: string;
 		currentPromoteKey: string;
 	};
+	moPushDataGate?: string;
 };
 
 type MoPushAuditRecord = {
@@ -593,6 +611,8 @@ type MoPushAuditRecord = {
 	lastEvaluatedMarketLine: string | null;
 	lastEvaluatedActionLine: string | null;
 	lastEvaluatedPromoteKey: string | null;
+	/** 資料可信度 gate（例如 push_ineligible_snapshot） */
+	lastMoPushDataGate?: string;
 };
 
 function getMoPushAuditKey(userId: string): string {
@@ -663,6 +683,11 @@ function parseMoPushAuditRecord(raw: string): MoPushAuditRecord | null {
 				lastEvaluatedPromoteKey = o.lastEvaluatedPromoteKey;
 			} else return null;
 		}
+		let lastMoPushDataGate: string | undefined;
+		if ("lastMoPushDataGate" in o && o.lastMoPushDataGate !== undefined) {
+			if (typeof o.lastMoPushDataGate !== "string") return null;
+			lastMoPushDataGate = o.lastMoPushDataGate;
+		}
 		return {
 			lastPushType: o.lastPushType,
 			lastPushEventsSummary,
@@ -678,6 +703,7 @@ function parseMoPushAuditRecord(raw: string): MoPushAuditRecord | null {
 			lastEvaluatedMarketLine,
 			lastEvaluatedActionLine,
 			lastEvaluatedPromoteKey,
+			...(lastMoPushDataGate !== undefined ? { lastMoPushDataGate } : {}),
 		};
 	} catch {
 		return null;
@@ -738,6 +764,9 @@ function moPushAuditFromEvaluation(
 		lastPushPriority: evaluation.pushPriority,
 		lastPushResult: params.lastPushResultOverride ?? evaluation.pushResult,
 		lastPushReason: evaluation.pushReason,
+		...(evaluation.moPushDataGate !== undefined ?
+			{ lastMoPushDataGate: evaluation.moPushDataGate }
+		:	{}),
 		lastPushAt: params.snapshotTimeIso,
 		lastPushDryRun: params.dryRun,
 		lastPushMessagePreview: truncateMoPushPreviewText(params.messagePreview, 200),
@@ -1052,6 +1081,9 @@ async function formatLastPushStatusBlock(
 		}
 		lines.push(`moPushResult: ${moAudit.lastPushResult}`);
 		lines.push(`moPushReason: ${displayReason}`);
+		if (moAudit.lastMoPushDataGate !== undefined && moAudit.lastMoPushDataGate !== "") {
+			lines.push(`moPushDataGate: ${moAudit.lastMoPushDataGate}`);
+		}
 		lines.push(`moPushAt: ${moAudit.lastPushAt}`);
 		lines.push(`moPushDryRun: ${moAudit.lastPushDryRun ? "yes" : "no"}`);
 		const fpOne = moAudit.comparedFingerprint.replace(/\s+/gu, " ").trim();
@@ -1269,6 +1301,354 @@ type MoLiveSnapshotRow = {
 	created_at: string;
 };
 
+/** 與 D1 payload_summary JSON 對齊（v2 正規化） */
+type MoLiveSummaryV2 = {
+	v: 2;
+	source: string;
+	sourceLevel: "primary" | "fallback1" | "fallback2";
+	fetchStatus: "success" | "fallback_used" | "unavailable";
+	confidence: "high" | "medium" | "low";
+	rawAvailabilityNote: string;
+	legacySummary: string;
+};
+
+/** D1 `source`：FinMind TaiwanStockPrice，data_id=TAIEX（加權指數日線） */
+const MO_LIVE_SOURCE_FINMIND_TAIEX = "FINMIND_TaiwanStockPrice";
+
+/** TWSE 官方 Open API（與 rwd 主路徑不同） */
+const MO_LIVE_SOURCE_TWSE_OPENAPI_MI_INDEX = "TWSE_OpenAPI_MI_INDEX";
+
+/** 三層皆失敗時寫入快照的 source 標記 */
+const MO_LIVE_SOURCE_UNAVAILABLE = "MO_LIVE_UNAVAILABLE";
+
+const TWSE_OPENAPI_MI_INDEX_ENDPOINT =
+	"https://openapi.twse.com.tw/v1/exchangeReport/MI_INDEX";
+
+/** Open API 回傳之「發行量加權股價指數」列 */
+const TWSE_OPENAPI_WEIGHTED_INDEX_NAME = "發行量加權股價指數";
+
+function isMoLiveSummaryV2(x: unknown): x is MoLiveSummaryV2 {
+	if (typeof x !== "object" || x === null) return false;
+	const o = x as Record<string, unknown>;
+	if (o.v !== 2) return false;
+	if (typeof o.source !== "string") return false;
+	if (
+		o.sourceLevel !== "primary" &&
+		o.sourceLevel !== "fallback1" &&
+		o.sourceLevel !== "fallback2"
+	) {
+		return false;
+	}
+	if (
+		o.fetchStatus !== "success" &&
+		o.fetchStatus !== "fallback_used" &&
+		o.fetchStatus !== "unavailable"
+	) {
+		return false;
+	}
+	if (o.confidence !== "high" && o.confidence !== "medium" && o.confidence !== "low") {
+		return false;
+	}
+	if (typeof o.rawAvailabilityNote !== "string") return false;
+	if (typeof o.legacySummary !== "string") return false;
+	return true;
+}
+
+function parseMoLivePayloadSummaryV2(raw: string): MoLiveSummaryV2 | null {
+	const t = raw.trim();
+	if (!t.startsWith("{")) return null;
+	try {
+		const parsed: unknown = JSON.parse(t);
+		return isMoLiveSummaryV2(parsed) ? parsed : null;
+	} catch {
+		return null;
+	}
+}
+
+/** 與 dev-check deriveMoLiveDataGovernance 對齊（單一推導來源） */
+type MoLiveDataUsability = "display_only" | "decision_ok" | "push_ok" | "unusable";
+type MoLiveStalenessLevel = "fresh" | "aging" | "stale" | "too_old";
+
+type MoLiveDataGovernance = {
+	tradeDate: string;
+	source: string;
+	sourceLevel: string;
+	fetchStatus: string;
+	confidence: string;
+	rawAvailabilityNote: string;
+	legacySummary: string;
+	dataUsability: MoLiveDataUsability;
+	stalenessLevel: MoLiveStalenessLevel;
+	freshnessMinutes: number | null;
+	sourcePriority: number;
+	decisionEligible: boolean;
+	pushEligible: boolean;
+	displayFetchStatus: string;
+	liveFreshness: string;
+};
+
+function deriveMoLiveDataGovernanceTyped(
+	row: MoLiveSnapshotRow | null,
+	nowMs: number,
+	todayYyyymmdd: string
+): MoLiveDataGovernance {
+	const g = deriveMoLiveDataGovernance({
+		row,
+		nowMs,
+		todayYyyymmdd,
+	}) as MoLiveDataGovernance;
+	return g;
+}
+
+function formatMoLiveGovernanceStatusBlock(
+	row: MoLiveSnapshotRow,
+	gov: MoLiveDataGovernance
+): string {
+	const cycleLine =
+		gov.dataUsability === "unusable" ? "fetch_failed" : "success";
+	const fm =
+		gov.freshnessMinutes === null ? "n/a" : String(gov.freshnessMinutes);
+	return [
+		`source: ${gov.source}`,
+		`sourceLevel: ${gov.sourceLevel}`,
+		`fetchStatus: ${gov.displayFetchStatus}`,
+		`confidence: ${gov.confidence}`,
+		`liveFreshness: ${gov.liveFreshness}`,
+		`freshnessMinutes: ${fm}`,
+		`stalenessLevel: ${gov.stalenessLevel}`,
+		`dataUsability: ${gov.dataUsability}`,
+		`decisionEligible: ${gov.decisionEligible ? "yes" : "no"}`,
+		`pushEligible: ${gov.pushEligible ? "yes" : "no"}`,
+		`sourcePriority: ${String(gov.sourcePriority)}`,
+		`rawAvailabilityNote: ${gov.rawAvailabilityNote}`,
+		`tradeDate: ${row.trade_date}`,
+		`summary: ${gov.legacySummary}`,
+		`storedAt: ${row.created_at}`,
+		`cycle: ${cycleLine}`,
+	].join("\n");
+}
+
+function formatMoLiveGovernanceSnapshotOnly(gov: MoLiveDataGovernance): string {
+	const fm =
+		gov.freshnessMinutes === null ? "n/a" : String(gov.freshnessMinutes);
+	return [
+		`source: ${gov.source}`,
+		`sourceLevel: ${gov.sourceLevel}`,
+		`fetchStatus: ${gov.displayFetchStatus}`,
+		`confidence: ${gov.confidence}`,
+		`liveFreshness: ${gov.liveFreshness}`,
+		`freshnessMinutes: ${fm}`,
+		`stalenessLevel: ${gov.stalenessLevel}`,
+		`dataUsability: ${gov.dataUsability}`,
+		`decisionEligible: ${gov.decisionEligible ? "yes" : "no"}`,
+		`pushEligible: ${gov.pushEligible ? "yes" : "no"}`,
+		`sourcePriority: ${String(gov.sourcePriority)}`,
+		`rawAvailabilityNote: ${gov.rawAvailabilityNote}`,
+		`tradeDate: ${gov.tradeDate}`,
+		`summary: ${gov.legacySummary}`,
+		`cycle: ${gov.dataUsability === "unusable" ? "fetch_failed" : "waiting_data"}`,
+	].join("\n");
+}
+
+function parseFinMindTaiwanStockPriceTaiexResponse(
+	parsed: unknown
+): { tradeDateYyyymmdd: string; legacySummary: string } | null {
+	if (typeof parsed !== "object" || parsed === null) return null;
+	const o = parsed as Record<string, unknown>;
+	if (o.msg === "error") return null;
+	const data = o.data;
+	if (!Array.isArray(data) || data.length === 0) return null;
+	const last = data[data.length - 1];
+	if (typeof last !== "object" || last === null) return null;
+	const row = last as Record<string, unknown>;
+	const dateRaw = row.date;
+	if (typeof dateRaw !== "string") return null;
+	const ymd = dateRaw.replace(/-/gu, "");
+	if (!/^\d{8}$/.test(ymd)) return null;
+	const close = row.close;
+	const legacySummary = `finmind=TaiwanStockPrice;data_id=TAIEX;date=${ymd};close=${
+		typeof close === "number" && Number.isFinite(close) ? String(close) : ""
+	}`;
+	return { tradeDateYyyymmdd: ymd, legacySummary };
+}
+
+/** FinMind v4 要求 start_date / end_date 為 YYYY-MM-DD（不可為 YYYYMMDD） */
+function yyyymmddToFinMindDate(yyyymmdd: string): string | null {
+	if (!/^\d{8}$/u.test(yyyymmdd)) return null;
+	return `${yyyymmdd.slice(0, 4)}-${yyyymmdd.slice(4, 6)}-${yyyymmdd.slice(6, 8)}`;
+}
+
+function maskFinMindTokenInRequestUrl(fullUrl: string): string {
+	try {
+		const u = new URL(fullUrl);
+		if (u.searchParams.has("token")) {
+			u.searchParams.set("token", "***");
+		}
+		return u.toString();
+	} catch {
+		return "<invalid url>";
+	}
+}
+
+/**
+ * FinMind fallback：GET /api/v4/data dataset=TaiwanStockPrice data_id=TAIEX
+ * （與 TWSE MI_INDEX 欄位不同，僅最小日線；v4 已無 TaiwanStockDaily 資料集名稱）
+ */
+async function tryFinMindTaiexDaily(env: Env): Promise<
+	| { ok: true; tradeDateYyyymmdd: string; rawText: string; legacySummary: string }
+	| { ok: false; note: string }
+> {
+	const token = env.FINMIND_TOKEN?.trim();
+	if (token === undefined || token === "") {
+		return { ok: false, note: "FINMIND_TOKEN unset" };
+	}
+	let lastNote = "";
+	for (let i = 0; i < 7; i++) {
+		const td = getTaipeiYYYYMMDDMinusDaysFromToday(i);
+		const finDate = yyyymmddToFinMindDate(td);
+		if (finDate === null) {
+			lastNote = `bad td ${td}`;
+			continue;
+		}
+		const params = new URLSearchParams({
+			dataset: "TaiwanStockPrice",
+			data_id: "TAIEX",
+			start_date: finDate,
+			end_date: finDate,
+			token,
+		});
+		const url = `https://api.finmindtrade.com/api/v4/data?${params.toString()}`;
+		try {
+			const res = await fetch(url, {
+				headers: {
+					"User-Agent": "Mozilla/5.0 (compatible; MO-vNext/1.0; FinMind-fallback)",
+				},
+			});
+			const text = await res.text();
+			if (!res.ok) {
+				console.log("[mo-live] finmind http error", {
+					requestUrl: maskFinMindTokenInRequestUrl(url),
+					status: res.status,
+					bodyPreview: text.slice(0, 200),
+				});
+				lastNote = `http ${String(res.status)} for ${td}`;
+				continue;
+			}
+			let j: unknown;
+			try {
+				j = JSON.parse(text) as unknown;
+			} catch {
+				lastNote = `json parse failed for ${td}`;
+				continue;
+			}
+			const parsed = parseFinMindTaiwanStockPriceTaiexResponse(j);
+			if (parsed !== null) {
+				return {
+					ok: true,
+					tradeDateYyyymmdd: parsed.tradeDateYyyymmdd,
+					rawText: text,
+					legacySummary: parsed.legacySummary,
+				};
+			}
+			lastNote = `no TAIEX row for ${td}`;
+		} catch (err: unknown) {
+			lastNote = err instanceof Error ? err.message : String(err);
+		}
+	}
+	return { ok: false, note: lastNote || "FinMind TAIEX daily empty" };
+}
+
+/** Open API「日期」欄位：民國 yyyMMdd（7 位數）→ 西元 YYYYMMDD */
+function rocYyyymmddToGregorianYyyymmdd(roc: string): string | null {
+	if (!/^\d{7}$/u.test(roc)) return null;
+	const rocY = Number(roc.slice(0, 3));
+	const mm = roc.slice(3, 5);
+	const dd = roc.slice(5, 7);
+	const gy = rocY + 1911;
+	if (gy < 1990 || gy > 2100) return null;
+	return `${String(gy)}${mm}${dd}`;
+}
+
+function parseTwseOpenApiMiIndexWeightedResponse(
+	parsed: unknown
+): { tradeDateYyyymmdd: string; legacySummary: string } | null {
+	if (!Array.isArray(parsed)) return null;
+	for (const item of parsed) {
+		if (typeof item !== "object" || item === null) continue;
+		const row = item as Record<string, unknown>;
+		const nameRaw = row["指數"];
+		if (typeof nameRaw !== "string") continue;
+		if (nameRaw.trim() !== TWSE_OPENAPI_WEIGHTED_INDEX_NAME) continue;
+		const rocDate = row["日期"];
+		if (typeof rocDate !== "string") continue;
+		const greg = rocYyyymmddToGregorianYyyymmdd(rocDate);
+		if (greg === null) continue;
+		const close = row["收盤指數"];
+		let closeStr = "";
+		if (typeof close === "string") {
+			closeStr = close;
+		} else if (typeof close === "number" && Number.isFinite(close)) {
+			closeStr = String(close);
+		}
+		const legacySummary = `twse_openapi=exchangeReport/MI_INDEX;weighted=${TWSE_OPENAPI_WEIGHTED_INDEX_NAME};date=${greg};close=${closeStr}`;
+		return { tradeDateYyyymmdd: greg, legacySummary };
+	}
+	return null;
+}
+
+/**
+ * 第 3 層：TWSE 官方 Open API（openapi.twse.com.tw）GET /v1/exchangeReport/MI_INDEX
+ * 僅取「發行量加權股價指數」收盤指數（UTF-8 JSON，與 rwd 主路徑不同）。
+ */
+async function tryTwseOpenApiMiIndexWeighted(env: Env): Promise<
+	| { ok: true; tradeDateYyyymmdd: string; rawText: string; legacySummary: string }
+	| { ok: false; note: string }
+> {
+	void env;
+	let lastNote = "";
+	for (let i = 0; i < 14; i++) {
+		const td = getTaipeiYYYYMMDDMinusDaysFromToday(i);
+		const url = `${TWSE_OPENAPI_MI_INDEX_ENDPOINT}?date=${encodeURIComponent(td)}`;
+		try {
+			const res = await fetch(url, {
+				headers: {
+					"User-Agent": "Mozilla/5.0 (compatible; MO-vNext/1.0; TWSE-OpenAPI-fallback)",
+				},
+			});
+			const text = await res.text();
+			if (!res.ok) {
+				console.log("[mo-live] official http error", {
+					requestUrl: url,
+					status: res.status,
+					bodyPreview: text.slice(0, 200),
+				});
+				lastNote = `http ${String(res.status)} for ${td}`;
+				continue;
+			}
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(text) as unknown;
+			} catch {
+				lastNote = `json parse failed for ${td}`;
+				continue;
+			}
+			const row = parseTwseOpenApiMiIndexWeightedResponse(parsed);
+			if (row !== null) {
+				return {
+					ok: true,
+					tradeDateYyyymmdd: row.tradeDateYyyymmdd,
+					rawText: text,
+					legacySummary: row.legacySummary,
+				};
+			}
+			lastNote = `no weighted index row for ${td}`;
+		} catch (err: unknown) {
+			lastNote = err instanceof Error ? err.message : String(err);
+		}
+	}
+	return { ok: false, note: lastNote || "TWSE OpenAPI MI_INDEX empty" };
+}
+
 async function readLatestMoLiveMarketSnapshot(
 	env: Env
 ): Promise<{ kind: "ok"; row: MoLiveSnapshotRow | null } | { kind: "error"; message: string }> {
@@ -1306,10 +1686,26 @@ async function readLatestMoLiveMarketSnapshot(
 
 async function buildMoLiveMarketStatusBlock(env: Env): Promise<string> {
 	const read = await readLatestMoLiveMarketSnapshot(env);
+	const nowMs = Date.now();
+	const todayYyyymmdd = getTaipeiYYYYMMDDMinusDaysFromToday(0);
 	if (read.kind === "error") {
 		return formatMoLiveMarketStatusBlock(null, { d1ReadError: read.message });
 	}
-	return formatMoLiveMarketStatusBlock(read.row, {});
+	if (read.row === null) {
+		const base = formatMoLiveMarketStatusBlock(null, {});
+		const gov = deriveMoLiveDataGovernanceTyped(null, nowMs, todayYyyymmdd);
+		return `${base}\n${formatMoLiveGovernanceSnapshotOnly(gov)}\nnote: 尚無快照；行情由排程寫入 D1，/report 不會即時抓外部來源。`;
+	}
+	const gov = deriveMoLiveDataGovernanceTyped(read.row, nowMs, todayYyyymmdd);
+	const v2 = parseMoLivePayloadSummaryV2(read.row.payload_summary);
+	if (v2 !== null) {
+		return formatMoLiveGovernanceStatusBlock(read.row, gov);
+	}
+	let block = formatMoLiveMarketStatusBlock(read.row, {});
+	if (isMoLiveSnapshotStale(read.row.created_at, nowMs)) {
+		block = `${block}\nstale: yes（快照偏舊，僅供參考）`;
+	}
+	return `${block}\n${formatMoLiveGovernanceStatusBlock(read.row, gov)}`;
 }
 
 async function buildMoStatusState(env: Env, userId: string): Promise<MoStatusState> {
@@ -3130,89 +3526,249 @@ async function executeMoLiveDataCycle(env: Env): Promise<MoLiveCycleResult> {
 	let rawText = "";
 	let fetched = false;
 
-	for (let i = 0; i < 14; i++) {
-		const td = getTaipeiYYYYMMDDMinusDaysFromToday(i);
-		const url =
-			`https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date=${td}&selectType=MS&response=json`;
-		try {
-			const res = await fetch(url, {
-				headers: {
-					"User-Agent": "Mozilla/5.0 (compatible; MO-vNext/1.0)",
-				},
-			});
-			if (!res.ok) {
-				lastNote = `http ${String(res.status)} for ${td}`;
-				continue;
-			}
-			const text = await res.text();
-			rawText = text;
-			let j: unknown;
+	const forceTwseFailForTest = env.MO_FORCE_TWSE_FAIL_FOR_TEST === "1";
+	if (forceTwseFailForTest) {
+		console.log("[mo-live] twse forced fail for test");
+		lastNote = "MO_FORCE_TWSE_FAIL_FOR_TEST=1";
+	} else {
+		for (let i = 0; i < 14; i++) {
+			const td = getTaipeiYYYYMMDDMinusDaysFromToday(i);
+			const url =
+				`https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date=${td}&selectType=MS&response=json`;
 			try {
-				j = JSON.parse(text) as unknown;
-			} catch {
-				lastNote = `json parse failed for ${td}`;
-				continue;
+				const res = await fetch(url, {
+					headers: {
+						"User-Agent": "Mozilla/5.0 (compatible; MO-vNext/1.0)",
+					},
+				});
+				if (!res.ok) {
+					lastNote = `http ${String(res.status)} for ${td}`;
+					continue;
+				}
+				const text = await res.text();
+				rawText = text;
+				let j: unknown;
+				try {
+					j = JSON.parse(text) as unknown;
+				} catch {
+					lastNote = `json parse failed for ${td}`;
+					continue;
+				}
+				jsonSeen = true;
+				if (isTwseMiIndexPayloadOk(j)) {
+					tradeDate = td;
+					parsed = j;
+					fetched = true;
+					break;
+				}
+				lastNote = `stat not OK or empty tables for ${td}`;
+			} catch (err: unknown) {
+				lastNote = err instanceof Error ? err.message : String(err);
 			}
-			jsonSeen = true;
-			if (isTwseMiIndexPayloadOk(j)) {
-				tradeDate = td;
-				parsed = j;
-				fetched = true;
-				break;
-			}
-			lastNote = `stat not OK or empty tables for ${td}`;
-		} catch (err: unknown) {
-			lastNote = err instanceof Error ? err.message : String(err);
 		}
 	}
 
-	if (!fetched) {
-		const noTrading = jsonSeen;
-		const cycleStatus = deriveMoLiveCycleStatus(
-			false,
-			false,
-			noTrading ? { noTradingDataInWindow: true } : undefined
-		);
-		return {
-			ok: false,
-			tradeDate: "",
+	if (fetched && parsed !== null) {
+		const legacySummary = summarizeTwseMiIndexPayload(parsed);
+		const payloadSummaryObj: MoLiveSummaryV2 = {
+			v: 2,
 			source,
-			fetched: false,
-			dbWrite: false,
+			sourceLevel: "primary",
+			fetchStatus: "success",
+			confidence: "high",
+			rawAvailabilityNote:
+				"TWSE MI_INDEX（afterTrading MS）完整 JSON；與證交所公開格式一致。",
+			legacySummary,
+		};
+		const payloadSummary = JSON.stringify(payloadSummaryObj);
+		const createdAt = new Date().toISOString();
+		const rawStore = truncateUtf16ForMoLive(rawText, 12000);
+		console.log("[mo-live] twse success", { tradeDate });
+		let dbWrite = false;
+		let dbNote = "";
+		try {
+			await env.MO_DB
+				.prepare(
+					`INSERT INTO mo_live_market_snapshots (trade_date, source, payload_summary, raw_payload, created_at)
+					 VALUES (?, ?, ?, ?, ?)`
+				)
+				.bind(tradeDate, source, payloadSummary, rawStore, createdAt)
+				.run();
+			dbWrite = true;
+		} catch (err: unknown) {
+			dbNote = err instanceof Error ? err.message : String(err);
+		}
+
+		const cycleStatus = deriveMoLiveCycleStatus(true, dbWrite);
+		const ok = cycleStatus === "success" || cycleStatus === "partial";
+		const note = dbWrite ? "TWSE MI_INDEX fetched and stored" : `fetch ok; db: ${dbNote}`;
+		return {
+			ok,
+			tradeDate,
+			source,
+			fetched: true,
+			dbWrite,
 			cycleStatus,
-			note: lastNote || "no MI_INDEX in lookback",
+			note,
 		};
 	}
 
-	const summary = summarizeTwseMiIndexPayload(parsed);
-	const createdAt = new Date().toISOString();
-	const rawStore = truncateUtf16ForMoLive(rawText, 12000);
-	let dbWrite = false;
-	let dbNote = "";
+	if (!forceTwseFailForTest) {
+		console.log("[mo-live] twse fail", { lastNote: lastNote || "no MI_INDEX in lookback" });
+	}
+	const fin = await tryFinMindTaiexDaily(env);
+	if (fin.ok) {
+		const finSource = MO_LIVE_SOURCE_FINMIND_TAIEX;
+		const payloadSummaryObj: MoLiveSummaryV2 = {
+			v: 2,
+			source: finSource,
+			sourceLevel: "fallback1",
+			fetchStatus: "fallback_used",
+			confidence: "medium",
+			rawAvailabilityNote:
+				"FinMind TaiwanStockPrice（data_id=TAIEX）僅含加權指數日線，非 TWSE MI_INDEX 全表；欄位較少。",
+			legacySummary: fin.legacySummary,
+		};
+		const payloadSummary = JSON.stringify(payloadSummaryObj);
+		const createdAt = new Date().toISOString();
+		const rawStore = truncateUtf16ForMoLive(fin.rawText, 12000);
+		console.log("[mo-live] finmind fallback success", { tradeDate: fin.tradeDateYyyymmdd });
+		let dbWrite = false;
+		let dbNote = "";
+		try {
+			await env.MO_DB
+				.prepare(
+					`INSERT INTO mo_live_market_snapshots (trade_date, source, payload_summary, raw_payload, created_at)
+					 VALUES (?, ?, ?, ?, ?)`
+				)
+				.bind(fin.tradeDateYyyymmdd, finSource, payloadSummary, rawStore, createdAt)
+				.run();
+			dbWrite = true;
+		} catch (err: unknown) {
+			dbNote = err instanceof Error ? err.message : String(err);
+		}
+		const cycleStatus = deriveMoLiveCycleStatus(true, dbWrite);
+		const ok = cycleStatus === "success" || cycleStatus === "partial";
+		const note =
+			dbWrite ? "FinMind TAIEX daily fallback stored" : `finmind ok; db: ${dbNote}`;
+		return {
+			ok,
+			tradeDate: fin.tradeDateYyyymmdd,
+			source: finSource,
+			fetched: true,
+			dbWrite,
+			cycleStatus,
+			note,
+		};
+	}
+
+	console.log("[mo-live] finmind fallback fail", { note: fin.note });
+	const off = await tryTwseOpenApiMiIndexWeighted(env);
+	if (off.ok) {
+		const offSource = MO_LIVE_SOURCE_TWSE_OPENAPI_MI_INDEX;
+		const payloadSummaryObj: MoLiveSummaryV2 = {
+			v: 2,
+			source: offSource,
+			sourceLevel: "fallback2",
+			fetchStatus: "fallback_used",
+			confidence: "low",
+			rawAvailabilityNote:
+				"TWSE 官方 Open API（openapi.twse.com.tw）v1 exchangeReport/MI_INDEX；UTF-8 JSON 陣列；僅取「發行量加權股價指數」收盤指數；與 rwd MI_INDEX 主路徑表格式不同。",
+			legacySummary: off.legacySummary,
+		};
+		const payloadSummary = JSON.stringify(payloadSummaryObj);
+		const createdAt = new Date().toISOString();
+		const rawStore = truncateUtf16ForMoLive(off.rawText, 12000);
+		console.log("[mo-live] official fallback success", { tradeDate: off.tradeDateYyyymmdd });
+		let dbWrite = false;
+		let dbNote = "";
+		try {
+			await env.MO_DB
+				.prepare(
+					`INSERT INTO mo_live_market_snapshots (trade_date, source, payload_summary, raw_payload, created_at)
+					 VALUES (?, ?, ?, ?, ?)`
+				)
+				.bind(off.tradeDateYyyymmdd, offSource, payloadSummary, rawStore, createdAt)
+				.run();
+			dbWrite = true;
+		} catch (err: unknown) {
+			dbNote = err instanceof Error ? err.message : String(err);
+		}
+		const cycleStatus = deriveMoLiveCycleStatus(true, dbWrite);
+		const ok = cycleStatus === "success" || cycleStatus === "partial";
+		const note =
+			dbWrite ?
+				"TWSE OpenAPI MI_INDEX fallback stored"
+			:	`official ok; db: ${dbNote}`;
+		return {
+			ok,
+			tradeDate: off.tradeDateYyyymmdd,
+			source: offSource,
+			fetched: true,
+			dbWrite,
+			cycleStatus,
+			note,
+		};
+	}
+
+	console.log("[mo-live] official fallback fail", { note: off.note });
+	const combinedNote = `twse: ${lastNote || "no MI_INDEX in lookback"}; finmind: ${fin.note}; official: ${off.note}`;
+	const asOfTd = getTaipeiYYYYMMDDMinusDaysFromToday(0);
+	const unavailPayload: MoLiveSummaryV2 = {
+		v: 2,
+		source: MO_LIVE_SOURCE_UNAVAILABLE,
+		sourceLevel: "fallback2",
+		fetchStatus: "unavailable",
+		confidence: "low",
+		rawAvailabilityNote: `三層皆失敗（TWSE rwd、FinMind、TWSE Open API）。${combinedNote}`,
+		legacySummary: combinedNote,
+	};
+	const payloadSummaryUnavail = JSON.stringify(unavailPayload);
+	const createdAtUnavail = new Date().toISOString();
+	const rawStoreUnavail = truncateUtf16ForMoLive(
+		JSON.stringify({
+			twse: lastNote || "no MI_INDEX in lookback",
+			finmind: fin.note,
+			official: off.note,
+		}),
+		12000
+	);
+	let dbWriteUnavail = false;
+	let dbNoteUnavail = "";
 	try {
 		await env.MO_DB
 			.prepare(
 				`INSERT INTO mo_live_market_snapshots (trade_date, source, payload_summary, raw_payload, created_at)
 				 VALUES (?, ?, ?, ?, ?)`
 			)
-			.bind(tradeDate, source, summary, rawStore, createdAt)
+			.bind(
+				asOfTd,
+				MO_LIVE_SOURCE_UNAVAILABLE,
+				payloadSummaryUnavail,
+				rawStoreUnavail,
+				createdAtUnavail
+			)
 			.run();
-		dbWrite = true;
+		dbWriteUnavail = true;
 	} catch (err: unknown) {
-		dbNote = err instanceof Error ? err.message : String(err);
+		dbNoteUnavail = err instanceof Error ? err.message : String(err);
 	}
-
-	const cycleStatus = deriveMoLiveCycleStatus(true, dbWrite);
-	const ok = cycleStatus === "success" || cycleStatus === "partial";
-	const note = dbWrite ? "TWSE MI_INDEX fetched and stored" : `fetch ok; db: ${dbNote}`;
+	const noTrading = jsonSeen;
+	const cycleStatus: MoLiveCycleStatus =
+		dbWriteUnavail ? "partial"
+		: noTrading ? "waiting_data"
+		: "fetch_failed";
 	return {
-		ok,
-		tradeDate,
-		source,
-		fetched: true,
-		dbWrite,
+		ok: false,
+		tradeDate: asOfTd,
+		source: MO_LIVE_SOURCE_UNAVAILABLE,
+		fetched: false,
+		dbWrite: dbWriteUnavail,
 		cycleStatus,
-		note,
+		note:
+			dbWriteUnavail ?
+				`all sources failed; unavailable snapshot stored`
+			:	`all sources failed; db: ${dbNoteUnavail}; ${combinedNote}`,
 	};
 }
 
@@ -3253,6 +3809,10 @@ async function computeMoPushEvaluationForUser(
 	reportPreviousStrategy: string;
 	activeStrategyConfig: StrategyActiveConfig;
 	auditBeforeEvaluate: MoPushAuditRecord | null;
+	liveSnapshotMissing: boolean;
+	liveSnapshotStale: boolean;
+	liveDataGovernance: MoLiveDataGovernance | null;
+	liveMarketPushEligible: boolean;
 }> {
 	const s = await getSystemStatus(env, userId);
 	const hasUserId = userId.trim() !== "";
@@ -3380,23 +3940,61 @@ async function computeMoPushEvaluationForUser(
 		simResult = "模擬偏保守策略，建議先觀察";
 	}
 
+	const todayYyyymmddLive = getTaipeiYYYYMMDDMinusDaysFromToday(0);
 	const liveRead = await readLatestMoLiveMarketSnapshot(env);
-	const marketStatusLine = buildMarketStatusText(
-		getMoLiveCycleStatusFromSnapshotRead(liveRead)
-	);
+	const nowMsLive = Date.now();
+	let marketStatusLine: string;
+	let liveSnapshotMissing = false;
+	let liveSnapshotStale = false;
+	let liveDataGovernance: MoLiveDataGovernance | null = null;
+	if (liveRead.kind === "error") {
+		liveDataGovernance = deriveMoLiveDataGovernanceTyped(null, nowMsLive, todayYyyymmddLive);
+		marketStatusLine = `${buildMarketStatusText("fetch_failed")}\n\n【資料品質】${buildMoReportDataQualityNote(liveDataGovernance)}`;
+	} else if (liveRead.row === null) {
+		liveSnapshotMissing = true;
+		liveDataGovernance = deriveMoLiveDataGovernanceTyped(null, nowMsLive, todayYyyymmddLive);
+		marketStatusLine = buildMarketStatusLineWithGovernance(
+			getMoLiveReportCycleFromGovernance(liveDataGovernance),
+			liveDataGovernance
+		);
+	} else {
+		liveDataGovernance = deriveMoLiveDataGovernanceTyped(
+			liveRead.row,
+			nowMsLive,
+			todayYyyymmddLive
+		);
+		liveSnapshotStale =
+			liveDataGovernance.stalenessLevel === "stale" ||
+			liveDataGovernance.stalenessLevel === "too_old";
+		marketStatusLine = buildMarketStatusLineWithGovernance(
+			getMoLiveReportCycleFromGovernance(liveDataGovernance),
+			liveDataGovernance
+		);
+	}
+	const liveMarketPushEligible =
+		liveDataGovernance !== null && liveDataGovernance.pushEligible;
 	const displayDate =
 		liveRead.kind === "ok" && liveRead.row !== null ?
 			formatDisplayDateFromYyyymmdd(liveRead.row.trade_date)
 		:	formatDisplayDateFromYyyymmdd(getTaipeiYYYYMMDDMinusDaysFromToday(0));
 	const dataSource =
-		liveRead.kind === "ok" && liveRead.row !== null ? liveRead.row.source : "—";
+		liveRead.kind === "error" ? "—"
+		: liveRead.row !== null ? liveRead.row.source
+		: "—（無快照）";
 	const hasAdequateData = totalNotesNum > 0;
-	const systemDecisionLine = buildSystemDecisionText(
+	let systemDecisionLine = buildSystemDecisionText(
 		strategyFinal,
 		score,
 		hasAdequateData,
 		recReason
 	);
+	if (liveDataGovernance !== null) {
+		if (liveDataGovernance.dataUsability === "unusable") {
+			systemDecisionLine = `${systemDecisionLine}\n\n【行情資料】資料不足或過舊，不適合判斷。`;
+		} else if (!liveDataGovernance.decisionEligible) {
+			systemDecisionLine = `${systemDecisionLine}\n\n【行情資料】資料僅供參考，不足以作為系統策略判斷依據。`;
+		}
+	}
 	const actionLineBase = buildActionText(score);
 	const forcedActionLine = (env.MO_FORCE_REPORT_ACTION_LINE ?? "").trim();
 	const actionLine =
@@ -3441,7 +4039,17 @@ async function computeMoPushEvaluationForUser(
 		nowMs,
 		cooldownMsDefault: STRATEGY_NOTIFY_COOLDOWN_MS,
 		cooldownMsP3Only: MO_PUSH_COOLDOWN_MS_P3_ONLY,
+		liveMarketPushEligible,
 	});
+	if (
+		!evaluation.shouldNotify &&
+		evaluation.pushReason === "blocked_by_data_usability"
+	) {
+		console.log("[mo-push] skipped: live data not push-eligible", {
+			dataUsability: liveDataGovernance?.dataUsability,
+			stalenessLevel: liveDataGovernance?.stalenessLevel,
+		});
+	}
 	const moMessage = evaluation.mergedMessage;
 	const fingerprint = evaluation.fingerprint;
 	const snapshotTimeIso = new Date().toISOString();
@@ -3490,6 +4098,10 @@ async function computeMoPushEvaluationForUser(
 		reportPreviousStrategy,
 		activeStrategyConfig,
 		auditBeforeEvaluate: audit,
+		liveSnapshotMissing,
+		liveSnapshotStale,
+		liveDataGovernance,
+		liveMarketPushEligible,
 	};
 }
 async function handleCommand(
@@ -5127,6 +5739,7 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 						cooldownRemainingMs: null,
 						fingerprint: ctx.fingerprint,
 						comparedState: ctx.evaluation.comparedState,
+						moPushDataGate: undefined,
 					};
 					await recordMoPushAudit(
 						env,
@@ -5175,6 +5788,7 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 							nowMs,
 							cooldownMsDefault: STRATEGY_NOTIFY_COOLDOWN_MS,
 							cooldownMsP3Only: MO_PUSH_COOLDOWN_MS_P3_ONLY,
+							liveMarketPushEligible: ctx.liveMarketPushEligible,
 						});
 						if (!evalInLock.shouldNotify) {
 							console.log("[notify] skipped: mo_push_recheck", evalInLock.pushResult);
@@ -5307,8 +5921,21 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 			await recordLastReportSummary(env, userId, summary);
 		}
 
-		const notesLine =
-			noteCountForRec > 0 ? `模擬顯示：${simResult}` : "";
+		const reportNotesParts: string[] = [];
+		if (noteCountForRec > 0) {
+			reportNotesParts.push(`模擬顯示：${simResult}`);
+		}
+		if (ctx.liveDataGovernance !== null) {
+			reportNotesParts.push(`【資料品質】${buildMoReportDataQualityNote(ctx.liveDataGovernance)}`);
+		}
+		if (ctx.liveSnapshotMissing) {
+			reportNotesParts.push(
+				"【市場資料】尚無 D1 快照（資料不足）；行情由排程寫入，非本指令即時抓取。"
+			);
+		} else if (ctx.liveSnapshotStale) {
+			reportNotesParts.push("【市場資料】快照時效偏弱（stale／too_old），不建議作為推播依據。");
+		}
+		const notesLine = reportNotesParts.join("\n");
 
 		return buildMoReportText({
 			displayDate: ctx.displayDate,
@@ -5677,5 +6304,20 @@ async function getReplyText(
   
 	  return new Response("Hello World!");
 	},
+	async scheduled(
+		_event: { readonly cron?: string },
+		env: Env,
+		ctx: ExecutionContext
+	): Promise<void> {
+		ctx.waitUntil(
+			executeMoLiveDataCycle(env).then((r) => {
+				console.log("[cron] mo_live", {
+					ok: r.ok,
+					cycleStatus: r.cycleStatus,
+					dbWrite: r.dbWrite,
+					note: r.note,
+				});
+			})
+		);
+	},
   };
-  // test commit

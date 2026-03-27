@@ -482,6 +482,320 @@ function formatDisplayDateFromYyyymmdd(yyyymmdd) {
 	return `${yyyymmdd.slice(0, 4)}/${yyyymmdd.slice(4, 6)}/${yyyymmdd.slice(6, 8)}`;
 }
 
+/** ---- MO live 資料可信度（與 Worker 單一推導；規則集中於此） ---- */
+
+const MO_LIVE_GOV_FRESH_MS = 30 * 60 * 1000;
+const MO_LIVE_GOV_AGING_MS = 2 * 60 * 60 * 1000;
+const MO_LIVE_GOV_STALE_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * @param {string} yyyymmdd
+ * @returns {number}
+ */
+function moLiveParseYyyymmddUtcMs(yyyymmdd) {
+	const y = Number(yyyymmdd.slice(0, 4));
+	const m = Number(yyyymmdd.slice(4, 6)) - 1;
+	const d = Number(yyyymmdd.slice(6, 8));
+	return Date.UTC(y, m, d);
+}
+
+/**
+ * 交易日相對「今日」落後天數（非負表示 trade 在過去或未來；僅供分級）
+ * @param {string} tradeYyyymmdd
+ * @param {string} todayYyyymmdd
+ */
+function moLiveTradeDateLagDays(tradeYyyymmdd, todayYyyymmdd) {
+	if (typeof tradeYyyymmdd !== "string" || !/^\d{8}$/.test(tradeYyyymmdd)) return 999;
+	if (typeof todayYyyymmdd !== "string" || !/^\d{8}$/.test(todayYyyymmdd)) return 999;
+	const tt = moLiveParseYyyymmddUtcMs(tradeYyyymmdd);
+	const tn = moLiveParseYyyymmddUtcMs(todayYyyymmdd);
+	return Math.round((tn - tt) / (24 * 60 * 60 * 1000));
+}
+
+/**
+ * @param {number} ageMs
+ * @returns {"fresh" | "aging" | "stale" | "too_old"}
+ */
+function moLiveStalenessFromAgeMs(ageMs) {
+	if (!Number.isFinite(ageMs)) return "too_old";
+	if (ageMs <= MO_LIVE_GOV_FRESH_MS) return "fresh";
+	if (ageMs <= MO_LIVE_GOV_AGING_MS) return "aging";
+	if (ageMs <= MO_LIVE_GOV_STALE_MS) return "stale";
+	return "too_old";
+}
+
+/**
+ * @param {number} lagDays
+ */
+function moLiveStalenessFromTradeLagDays(lagDays) {
+	if (lagDays <= 0) return "fresh";
+	if (lagDays <= 1) return "aging";
+	if (lagDays <= 2) return "stale";
+	return "too_old";
+}
+
+/**
+ * @param {"fresh" | "aging" | "stale" | "too_old"} a
+ * @param {"fresh" | "aging" | "stale" | "too_old"} b
+ */
+function moLiveMergeStalenessTier(a, b) {
+	const order = ["fresh", "aging", "stale", "too_old"];
+	const ia = order.indexOf(a);
+	const ib = order.indexOf(b);
+	return order[Math.max(ia, ib)];
+}
+
+/**
+ * @param {string} raw
+ * @returns {null | {
+ *   v: number;
+ *   source: string;
+ *   sourceLevel: string;
+ *   fetchStatus: string;
+ *   confidence: string;
+ *   rawAvailabilityNote: string;
+ *   legacySummary: string;
+ * }}
+ */
+function parseMoLiveV2PayloadSummaryForGov(raw) {
+	if (typeof raw !== "string") return null;
+	const t = raw.trim();
+	if (!t.startsWith("{")) return null;
+	try {
+		const o = JSON.parse(t);
+		if (typeof o !== "object" || o === null) return null;
+		if (o.v !== 2) return null;
+		if (typeof o.source !== "string") return null;
+		if (
+			o.sourceLevel !== "primary" &&
+			o.sourceLevel !== "fallback1" &&
+			o.sourceLevel !== "fallback2"
+		) {
+			return null;
+		}
+		if (
+			o.fetchStatus !== "success" &&
+			o.fetchStatus !== "fallback_used" &&
+			o.fetchStatus !== "unavailable"
+		) {
+			return null;
+		}
+		if (
+			o.confidence !== "high" &&
+			o.confidence !== "medium" &&
+			o.confidence !== "low"
+		) {
+			return null;
+		}
+		if (typeof o.rawAvailabilityNote !== "string") return null;
+		if (typeof o.legacySummary !== "string") return null;
+		return o;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * 單一入口：由 D1 列 + 現在時間推導可信度（不讀其他列；最新一筆 unavailable 仍明示不可用）。
+ *
+ * @param {{
+ *   row: { trade_date: string; created_at: string; payload_summary: string } | null;
+ *   nowMs: number;
+ *   todayYyyymmdd: string;
+ * }} p
+ */
+function deriveMoLiveDataGovernance(p) {
+	const today = p.todayYyyymmdd;
+	if (p.row === null) {
+		return {
+			tradeDate: "",
+			source: "—",
+			sourceLevel: "primary",
+			fetchStatus: "unavailable",
+			confidence: "low",
+			rawAvailabilityNote: "無快照",
+			legacySummary: "",
+			dataUsability: "unusable",
+			stalenessLevel: "too_old",
+			freshnessMinutes: null,
+			sourcePriority: 99,
+			decisionEligible: false,
+			pushEligible: false,
+			displayFetchStatus: "unavailable",
+			liveFreshness: "stale",
+			v2: null,
+		};
+	}
+	const row = p.row;
+	const createdMs = Date.parse(row.created_at);
+	const ageMs = Number.isFinite(createdMs) ? p.nowMs - createdMs : Number.POSITIVE_INFINITY;
+	const freshnessMinutes = Number.isFinite(createdMs) ? Math.floor(ageMs / 60000) : null;
+	const v2 = parseMoLiveV2PayloadSummaryForGov(row.payload_summary);
+	const lagDays = moLiveTradeDateLagDays(row.trade_date, today);
+
+	if (v2 === null) {
+		const stalenessLevel = moLiveStalenessFromAgeMs(ageMs);
+		const unusable = stalenessLevel === "too_old";
+		return {
+			tradeDate: row.trade_date,
+			source: row.source,
+			sourceLevel: "primary",
+			fetchStatus: "success",
+			confidence: "low",
+			rawAvailabilityNote: "legacy payload_summary（非 v2 JSON）",
+			legacySummary: row.payload_summary.slice(0, 200),
+			dataUsability: unusable ? "unusable" : "display_only",
+			stalenessLevel,
+			freshnessMinutes,
+			sourcePriority: 9,
+			decisionEligible: false,
+			pushEligible: false,
+			displayFetchStatus: unusable ? "stale" : "success",
+			liveFreshness: stalenessLevel === "fresh" ? "ok" : "stale",
+			v2: null,
+		};
+	}
+
+	const ageTier = moLiveStalenessFromAgeMs(ageMs);
+	const lagTier = moLiveStalenessFromTradeLagDays(lagDays);
+	let merged = moLiveMergeStalenessTier(ageTier, lagTier);
+	if (v2.fetchStatus === "unavailable") {
+		merged = "too_old";
+	}
+	const stalenessLevel = merged;
+
+	const sourcePriority =
+		v2.sourceLevel === "primary" ? 1
+		: v2.sourceLevel === "fallback1" ? 2
+		: v2.sourceLevel === "fallback2" ? 3
+		: 9;
+
+	let decisionEligible = false;
+	if (stalenessLevel !== "too_old" && v2.fetchStatus !== "unavailable") {
+		if (
+			v2.sourceLevel === "primary" &&
+			v2.fetchStatus === "success" &&
+			lagDays <= 2
+		) {
+			decisionEligible = true;
+		} else if (
+			v2.sourceLevel === "fallback1" &&
+			v2.fetchStatus === "fallback_used" &&
+			(stalenessLevel === "fresh" || stalenessLevel === "aging") &&
+			lagDays <= 1
+		) {
+			decisionEligible = true;
+		}
+		// fallback2：預設不提供 decision（僅顯示）；避免 OpenAPI 欄位少／日期落後誤判
+	}
+
+	let pushEligible = false;
+	if (
+		v2.sourceLevel === "primary" &&
+		v2.fetchStatus === "success" &&
+		stalenessLevel === "fresh" &&
+		lagDays <= 0 &&
+		ageMs <= MO_LIVE_GOV_FRESH_MS
+	) {
+		pushEligible = true;
+	}
+
+	let dataUsability = "display_only";
+	if (v2.fetchStatus === "unavailable" || stalenessLevel === "too_old") {
+		dataUsability = "unusable";
+	} else if (pushEligible) {
+		dataUsability = "push_ok";
+	} else if (decisionEligible) {
+		dataUsability = "decision_ok";
+	} else {
+		dataUsability = "display_only";
+	}
+
+	let displayFetchStatus = v2.fetchStatus;
+	if (v2.fetchStatus === "unavailable") {
+		displayFetchStatus = "unavailable";
+	} else if (stalenessLevel === "stale" || stalenessLevel === "too_old") {
+		displayFetchStatus = "stale";
+	}
+
+	let liveFreshness = "ok";
+	if (stalenessLevel === "aging") {
+		liveFreshness = "aging";
+	}
+	if (stalenessLevel === "stale" || stalenessLevel === "too_old") {
+		liveFreshness = "stale";
+	}
+
+	return {
+		tradeDate: row.trade_date,
+		source: v2.source,
+		sourceLevel: v2.sourceLevel,
+		fetchStatus: v2.fetchStatus,
+		confidence: v2.confidence,
+		rawAvailabilityNote: v2.rawAvailabilityNote,
+		legacySummary: v2.legacySummary,
+		dataUsability,
+		stalenessLevel,
+		freshnessMinutes,
+		sourcePriority,
+		decisionEligible,
+		pushEligible,
+		displayFetchStatus,
+		liveFreshness,
+		v2,
+	};
+}
+
+/**
+ * @param {ReturnType<typeof deriveMoLiveDataGovernance>} g
+ */
+function buildMoReportDataQualityNote(g) {
+	if (g.dataUsability === "push_ok") {
+		return "資料新鮮可用（行情層級符合推播門檻）。";
+	}
+	if (g.dataUsability === "decision_ok") {
+		return "行情資料可用於分析；若為 fallback，欄位較少，僅供參考。";
+	}
+	if (g.dataUsability === "display_only") {
+		return "資料僅供參考（來源或時效不足以作為自動判斷／推播依據）。";
+	}
+	return "無可用行情快照或資料不足／過舊，不適合判斷。";
+}
+
+/**
+ * @param {ReturnType<typeof deriveMoLiveDataGovernance>} g
+ */
+function getMoLiveReportCycleFromGovernance(g) {
+	if (g.dataUsability === "unusable") return "fetch_failed";
+	if (g.stalenessLevel === "too_old") return "partial";
+	return "success";
+}
+
+/**
+ * @param {"success" | "waiting_data" | "partial" | "fetch_failed"} cycle
+ * @param {ReturnType<typeof deriveMoLiveDataGovernance>} g
+ */
+function buildMarketStatusLineWithGovernance(cycle, g) {
+	const base = mapMoLiveMarketStatusHuman(cycle);
+	return `${base}\n\n【資料品質】${buildMoReportDataQualityNote(g)}`;
+}
+
+/**
+ * @param {{ liveMarketPushEligible?: boolean }} p
+ * @param {Record<string, unknown>} result
+ */
+function applyMoPushLiveDataGate(p, result) {
+	if (p.liveMarketPushEligible !== false) return result;
+	if (!result.shouldNotify) return result;
+	return {
+		...result,
+		shouldNotify: false,
+		pushReason: "blocked_by_data_usability",
+		pushResult: "skipped_live_data_not_push_eligible",
+		moPushDataGate: "push_ineligible_snapshot",
+	};
+}
+
 /**
  * @param {number} score
  * @returns {string}
@@ -722,6 +1036,7 @@ function fingerprintMoPushPayload(p) {
  *   nowMs: number;
  *   cooldownMsDefault: number;
  *   cooldownMsP3Only: number;
+ *   liveMarketPushEligible?: boolean;
  * }} p
  * @returns {{
  *   shouldNotify: boolean;
@@ -735,6 +1050,7 @@ function fingerprintMoPushPayload(p) {
  *   cooldownRemainingMs: number | null;
  *   fingerprint: string;
  *   comparedState: { fingerprint: string; marketLine: string; actionLine: string; currentPromoteKey: string };
+ *   moPushDataGate?: string;
  * }}
  */
 function evaluateMoPushEventDecision(p) {
@@ -781,7 +1097,7 @@ function evaluateMoPushEventDecision(p) {
 	};
 
 	if (triggeredEvents.length === 0) {
-		return {
+		return applyMoPushLiveDataGate(p, {
 			shouldNotify: false,
 			triggeredEvents,
 			primaryPushType: null,
@@ -793,11 +1109,11 @@ function evaluateMoPushEventDecision(p) {
 			cooldownRemainingMs: null,
 			fingerprint,
 			comparedState,
-		};
+		});
 	}
 
 	if (p.lastPushedFingerprint !== null && fingerprint === p.lastPushedFingerprint) {
-		return {
+		return applyMoPushLiveDataGate(p, {
 			shouldNotify: false,
 			triggeredEvents,
 			primaryPushType,
@@ -809,7 +1125,7 @@ function evaluateMoPushEventDecision(p) {
 			cooldownRemainingMs: null,
 			fingerprint,
 			comparedState,
-		};
+		});
 	}
 
 	const onlyLowPriority =
@@ -823,7 +1139,7 @@ function evaluateMoPushEventDecision(p) {
 		const elapsed = p.nowMs - p.gateAtMs;
 		if (elapsed < effectiveCooldownMs) {
 			if (pushPriority !== null && pushPriority < gatePri) {
-				return {
+				return applyMoPushLiveDataGate(p, {
 					shouldNotify: true,
 					triggeredEvents,
 					primaryPushType,
@@ -835,10 +1151,10 @@ function evaluateMoPushEventDecision(p) {
 					cooldownRemainingMs: null,
 					fingerprint,
 					comparedState,
-				};
+				});
 			}
 			if (p.gateMessage !== null && p.gateMessage === mergedMessage) {
-				return {
+				return applyMoPushLiveDataGate(p, {
 					shouldNotify: false,
 					triggeredEvents,
 					primaryPushType,
@@ -850,10 +1166,10 @@ function evaluateMoPushEventDecision(p) {
 					cooldownRemainingMs: Math.max(0, effectiveCooldownMs - elapsed),
 					fingerprint,
 					comparedState,
-				};
+				});
 			}
 		} else if (p.gateMessage !== null && p.gateMessage === mergedMessage) {
-			return {
+			return applyMoPushLiveDataGate(p, {
 				shouldNotify: false,
 				triggeredEvents,
 				primaryPushType,
@@ -865,11 +1181,11 @@ function evaluateMoPushEventDecision(p) {
 				cooldownRemainingMs: null,
 				fingerprint,
 				comparedState,
-			};
+			});
 		}
 	}
 
-	return {
+	return applyMoPushLiveDataGate(p, {
 		shouldNotify: true,
 		triggeredEvents,
 		primaryPushType,
@@ -881,7 +1197,7 @@ function evaluateMoPushEventDecision(p) {
 		cooldownRemainingMs: null,
 		fingerprint,
 		comparedState,
-	};
+	});
 }
 
 /**
@@ -1073,6 +1389,143 @@ function runDevCheckMain() {
 	}
 
 	runMoLiveCycleDevChecks();
+	passCount += 1;
+
+	function runMoLiveGovernanceDevChecks() {
+		console.log("[mo-live] governance");
+		const today = getTaipeiYYYYMMDDMinusDaysFromToday(0);
+		const now = Date.now();
+		const isoFresh = new Date(now - 10 * 60 * 1000).toISOString();
+		const v2Primary = {
+			v: 2,
+			source: MO_LIVE_SOURCE_TWSE_MI_INDEX,
+			sourceLevel: "primary",
+			fetchStatus: "success",
+			confidence: "high",
+			rawAvailabilityNote: "x",
+			legacySummary: "y",
+		};
+		const gPrimaryFresh = deriveMoLiveDataGovernance({
+			row: {
+				trade_date: today,
+				created_at: isoFresh,
+				payload_summary: JSON.stringify(v2Primary),
+			},
+			nowMs: now,
+			todayYyyymmdd: today,
+		});
+		if (!gPrimaryFresh.pushEligible || !gPrimaryFresh.decisionEligible) {
+			throw new Error("[mo-live gov] primary fresh push+decision");
+		}
+		if (gPrimaryFresh.dataUsability !== "push_ok") {
+			throw new Error("[mo-live gov] primary push_ok");
+		}
+
+		const v2F1 = {
+			...v2Primary,
+			source: "FINMIND_TaiwanStockPrice",
+			sourceLevel: "fallback1",
+			fetchStatus: "fallback_used",
+			confidence: "medium",
+		};
+		const gF1 = deriveMoLiveDataGovernance({
+			row: {
+				trade_date: today,
+				created_at: isoFresh,
+				payload_summary: JSON.stringify(v2F1),
+			},
+			nowMs: now,
+			todayYyyymmdd: today,
+		});
+		if (!gF1.decisionEligible || gF1.pushEligible) {
+			throw new Error("[mo-live gov] fallback1 decision no push");
+		}
+		if (gF1.dataUsability !== "decision_ok") {
+			throw new Error("[mo-live gov] fallback1 decision_ok");
+		}
+
+		const v2F2 = {
+			...v2Primary,
+			source: "TWSE_OpenAPI_MI_INDEX",
+			sourceLevel: "fallback2",
+			fetchStatus: "fallback_used",
+			confidence: "low",
+		};
+		const gF2 = deriveMoLiveDataGovernance({
+			row: {
+				trade_date: today,
+				created_at: isoFresh,
+				payload_summary: JSON.stringify(v2F2),
+			},
+			nowMs: now,
+			todayYyyymmdd: today,
+		});
+		if (gF2.decisionEligible || gF2.pushEligible) {
+			throw new Error("[mo-live gov] fallback2 display_only");
+		}
+		if (gF2.dataUsability !== "display_only") {
+			throw new Error("[mo-live gov] fallback2 display_only usability");
+		}
+
+		const staleIso = new Date(now - 3 * 60 * 60 * 1000).toISOString();
+		const gStale = deriveMoLiveDataGovernance({
+			row: {
+				trade_date: today,
+				created_at: staleIso,
+				payload_summary: JSON.stringify(v2Primary),
+			},
+			nowMs: now,
+			todayYyyymmdd: today,
+		});
+		if (gStale.pushEligible || gStale.stalenessLevel !== "stale") {
+			throw new Error(`[mo-live gov] stale no push: ${gStale.stalenessLevel}`);
+		}
+
+		const v2Un = {
+			...v2Primary,
+			source: MO_LIVE_SOURCE_TWSE_MI_INDEX,
+			sourceLevel: "fallback2",
+			fetchStatus: "unavailable",
+			confidence: "low",
+		};
+		const gUn = deriveMoLiveDataGovernance({
+			row: {
+				trade_date: today,
+				created_at: isoFresh,
+				payload_summary: JSON.stringify(v2Un),
+			},
+			nowMs: now,
+			todayYyyymmdd: today,
+		});
+		if (gUn.dataUsability !== "unusable" || gUn.decisionEligible) {
+			throw new Error("[mo-live gov] unavailable unusable");
+		}
+
+		const evWould = evaluateMoPushEventDecision({
+			displayDate: "x",
+			marketLine: "a",
+			actionLine: "b",
+			currentPromoteKey: "",
+			lastEvaluatedMarketLine: "",
+			lastEvaluatedActionLine: "",
+			lastEvaluatedPromoteKey: "",
+			lastPushedFingerprint: null,
+			gateMessage: null,
+			gateAtMs: null,
+			gatePriority: 3,
+			nowMs: now,
+			cooldownMsDefault: MO_PUSH_COOLDOWN_MS_DEFAULT,
+			cooldownMsP3Only: MO_PUSH_COOLDOWN_MS_P3_ONLY,
+			liveMarketPushEligible: false,
+		});
+		if (evWould.shouldNotify || evWould.pushReason !== "blocked_by_data_usability") {
+			throw new Error("[mo-live gov] push gate");
+		}
+
+		console.log("[mo-live] governance ok");
+	}
+
+	runMoLiveGovernanceDevChecks();
 	passCount += 1;
 
 	function runMoLiveStatusSummaryDevChecks() {
@@ -1555,6 +2008,13 @@ module.exports = {
 	MO_PUSH_COOLDOWN_MS_P3_ONLY,
 	detectMoPushTriggeredEvents,
 	detectReportRiskChangedForMoPush,
+	deriveMoLiveDataGovernance,
+	buildMoReportDataQualityNote,
+	buildMarketStatusLineWithGovernance,
+	getMoLiveReportCycleFromGovernance,
+	MO_LIVE_GOV_FRESH_MS,
+	MO_LIVE_GOV_AGING_MS,
+	MO_LIVE_GOV_STALE_MS,
 };
 
 if (
