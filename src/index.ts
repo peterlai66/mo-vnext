@@ -27,6 +27,8 @@ import {
 	buildActionLineLiveIntelligence,
 	buildSimulationStatusLineLiveIntelligence,
 	buildMoReportSummaryStatusBlockLines,
+	applyLiveIntelligenceToRecommendationFields,
+	applyLiveIntelligenceToSimulationFields,
 	evaluateMoPushEventDecision,
 	MO_PUSH_COOLDOWN_MS_DEFAULT,
 	MO_PUSH_COOLDOWN_MS_P3_ONLY,
@@ -3958,7 +3960,7 @@ async function computeMoPushEvaluationForUser(
 	}
 
 	const noteCountForRec = s.noteCount === "error" ? 0 : s.noteCount;
-	const simReady = noteCountForRec > 0 ? "yes" : "no";
+	let simReady = noteCountForRec > 0 ? "yes" : "no";
 	let simResult: string;
 	if (noteCountForRec === 0) {
 		simResult = "無法模擬";
@@ -4010,6 +4012,21 @@ async function computeMoPushEvaluationForUser(
 			todayYyyymmdd: todayYyyymmddLive,
 		}
 	) as MoLiveMarketIntelligenceV1;
+	const recGated = applyLiveIntelligenceToRecommendationFields(liveMarketIntelligenceV1, {
+		recStatus,
+		recReason,
+		recAction,
+	});
+	recStatus = recGated.recStatus;
+	recReason = recGated.recReason;
+	recAction = recGated.recAction;
+	const simGated = applyLiveIntelligenceToSimulationFields(liveMarketIntelligenceV1, {
+		simResult,
+		simReady,
+		noteCountForRec,
+	});
+	simResult = simGated.simResult;
+	simReady = simGated.simReady;
 	const displayDate =
 		liveRead.kind === "ok" && liveRead.row !== null ?
 			formatDisplayDateFromYyyymmdd(liveRead.row.trade_date)
@@ -5974,7 +5991,6 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 		);
 		const simulationLine = buildSimulationStatusLineLiveIntelligence(
 			simResult,
-			simReady === "yes" ? "yes" : "no",
 			noteCountForRec,
 			ctx.liveMarketIntelligenceV1
 		);

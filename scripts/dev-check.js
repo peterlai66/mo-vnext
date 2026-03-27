@@ -916,20 +916,27 @@ function deriveLiveMarketIntelligenceV1(gov, ctx) {
  * @param {ReturnType<typeof deriveLiveMarketIntelligenceV1>} li
  */
 function buildSystemDecisionLineLiveIntelligence(strategy, score, hasAdequateData, recReason, li) {
+	if (li.recommendationReadiness === "blocked") {
+		return `建議輸出已依資料條件阻擋（${li.recommendationGateReason}）\n請保守觀望，不以此作為進出依據。\n\n【行情判讀】${li.marketInterpretation}`;
+	}
 	const base =
 		!hasAdequateData && li.marketDataQuality !== "unusable" ?
 			buildSystemDecisionTextNotesInadequate(strategy, score, recReason)
 		:	buildSystemDecisionText(strategy, score, hasAdequateData, recReason);
+	let body = base;
+	if (li.recommendationReadiness === "limited") {
+		body = `【建議層級】有限／低信心（以下判斷僅供參考，不宜重部位）\n${base}`;
+	}
 	if (li.marketDataQuality === "unusable") {
-		return `${base}\n\n【行情判讀】資料不足或過舊，不適合判斷。`;
+		return `${body}\n\n【行情判讀】資料不足或過舊，不適合判斷。`;
 	}
 	if (li.marketDataQuality === "trusted" || li.recommendationReadiness === "ready") {
-		return `${base}\n\n【行情判讀】${li.marketInterpretation}`;
+		return `${body}\n\n【行情判讀】${li.marketInterpretation}`;
 	}
 	if (li.marketDataQuality === "limited") {
-		return `${base}\n\n【行情判讀】資料僅供參考：${li.marketInterpretation}`;
+		return `${body}\n\n【行情判讀】資料僅供參考：${li.marketInterpretation}`;
 	}
-	return `${base}\n\n【行情判讀】${li.marketInterpretation}`;
+	return `${body}\n\n【行情判讀】${li.marketInterpretation}`;
 }
 
 /**
@@ -952,18 +959,75 @@ function buildActionLineLiveIntelligence(score, li) {
 
 /**
  * @param {string} simResult
- * @param {"yes" | "no"} simReadyLegacy
  * @param {number} noteCountForRec
  * @param {ReturnType<typeof deriveLiveMarketIntelligenceV1>} li
  */
-function buildSimulationStatusLineLiveIntelligence(simResult, simReadyLegacy, noteCountForRec, li) {
+function buildSimulationStatusLineLiveIntelligence(simResult, noteCountForRec, li) {
 	if (li.simulationReadiness === "blocked") {
 		return `狀態：不可模擬\n原因：${li.simulationGateReason}`;
 	}
 	if (li.simulationReadiness === "limited") {
-		return `狀態：低信心可模擬\n原因：${li.simulationGateReason}\n參考：${simResult}`;
+		return `狀態：低信心可模擬（策略敘述僅供參考，不宜重部位）\n原因：${li.simulationGateReason}\n參考：${simResult}`;
 	}
-	return `狀態：可模擬\n筆記：${String(noteCountForRec)} 則\n參考：${simResult}`;
+	return `狀態：可模擬（正常參考）\n筆記：${String(noteCountForRec)} 則\n參考：${simResult}`;
+}
+
+/**
+ * 對齊 recommendation 摘要欄位與 recommendationReadiness（供 KV／status 與報告語意一致）
+ * @param {ReturnType<typeof deriveLiveMarketIntelligenceV1>} li
+ * @param {{ recStatus: "active" | "idle"; recReason: string; recAction: string }} base
+ */
+function applyLiveIntelligenceToRecommendationFields(li, base) {
+	if (li.recommendationReadiness === "blocked") {
+		return {
+			recStatus: /** @type {"idle"} */ ("idle"),
+			recReason: li.recommendationGateReason,
+			recAction: `不給出具體部位或策略建議（${li.recommendationGateReason}）請保守觀望並待資料更新。`,
+		};
+	}
+	if (li.recommendationReadiness === "limited") {
+		return {
+			recStatus: /** @type {"active"} */ ("active"),
+			recReason: li.recommendationGateReason,
+			recAction: `有限建議／低信心參考（${li.recommendationGateReason}）請保守因應，不宜重部位。`,
+		};
+	}
+	if (base.recStatus === "idle" && base.recReason === "尚無資料") {
+		return {
+			recStatus: /** @type {"active"} */ ("active"),
+			recReason: "行情條件允許建議輸出；筆記仍不足，策略依據有限",
+			recAction: "可參考目前建議與評分語氣；仍建議補齊筆記以強化依據。",
+		};
+	}
+	return {
+		recStatus: base.recStatus,
+		recReason: base.recReason,
+		recAction: base.recAction,
+	};
+}
+
+/**
+ * 對齊 simulation 摘要欄位與 simulationReadiness
+ * @param {ReturnType<typeof deriveLiveMarketIntelligenceV1>} li
+ * @param {{ simResult: string; simReady: string; noteCountForRec: number }} base
+ */
+function applyLiveIntelligenceToSimulationFields(li, base) {
+	if (li.simulationReadiness === "blocked") {
+		return {
+			simResult: `無法模擬（${li.simulationGateReason}）`,
+			simReady: "no",
+		};
+	}
+	if (li.simulationReadiness === "limited") {
+		return {
+			simResult: base.simResult,
+			simReady: "no",
+		};
+	}
+	return {
+		simResult: base.simResult,
+		simReady: base.noteCountForRec > 0 ? "yes" : "no",
+	};
 }
 
 /**
@@ -2010,6 +2074,95 @@ function runDevCheckMain() {
 			throw new Error("[mo-live] action limited+ready wording");
 		}
 
+		const sysBlocked = buildSystemDecisionLineLiveIntelligence(
+			"balanced",
+			80,
+			true,
+			"近期有活動",
+			liUn
+		);
+		if (sysBlocked.includes("綜合評分")) {
+			throw new Error("[mo-live] blocked system must not show score");
+		}
+		if (!sysBlocked.includes("阻擋")) {
+			throw new Error("[mo-live] blocked system gate");
+		}
+		const actBlocked = buildActionLineLiveIntelligence(80, liUn);
+		if (!actBlocked.includes("不給出")) {
+			throw new Error("[mo-live] blocked action");
+		}
+
+		const sysLimRec = buildSystemDecisionLineLiveIntelligence(
+			"balanced",
+			70,
+			true,
+			"近期有活動",
+			liF2
+		);
+		if (!sysLimRec.includes("建議層級") || !sysLimRec.includes("有限")) {
+			throw new Error("[mo-live] limited recommendation system line");
+		}
+		const actLim = buildActionLineLiveIntelligence(70, liF2);
+		if (!actLim.includes("資料受限")) {
+			throw new Error("[mo-live] limited action");
+		}
+
+		const sysReadyP = buildSystemDecisionLineLiveIntelligence(
+			"balanced",
+			80,
+			true,
+			"近期有活動",
+			liP
+		);
+		if (!sysReadyP.includes("綜合評分")) {
+			throw new Error("[mo-live] ready system keeps score");
+		}
+		if (sysReadyP.includes("建議層級")) {
+			throw new Error("[mo-live] ready system no limited banner");
+		}
+		const actReadyP = buildActionLineLiveIntelligence(80, liP);
+		if (!actReadyP.includes("行情層級允許一般建議")) {
+			throw new Error("[mo-live] ready trusted action tone");
+		}
+
+		const simLiUn = buildSimulationStatusLineLiveIntelligence("模擬測試", 5, liUn);
+		if (!simLiUn.includes("不可模擬") || simLiUn.includes("參考：模擬")) {
+			throw new Error("[mo-live] sim blocked line");
+		}
+		const liF2n2 = deriveLiveMarketIntelligenceV1(gF2, {
+			rowIsNull: false,
+			noteCountForRec: 2,
+			todayYyyymmdd: today,
+		});
+		if (liF2n2.simulationReadiness !== "limited") {
+			throw new Error("[mo-live] f2n2 sim limited");
+		}
+		const simLiLim = buildSimulationStatusLineLiveIntelligence("模擬偏平衡", 2, liF2n2);
+		if (!simLiLim.includes("低信心") || !simLiLim.includes("參考：模擬偏平衡")) {
+			throw new Error("[mo-live] sim limited line");
+		}
+		const simLiReady = buildSimulationStatusLineLiveIntelligence("模擬偏積極", 3, liP);
+		if (!simLiReady.includes("可模擬（正常參考）") || !simLiReady.includes("參考：模擬偏積極")) {
+			throw new Error("[mo-live] sim ready line");
+		}
+
+		const recApply = applyLiveIntelligenceToRecommendationFields(liUn, {
+			recStatus: "active",
+			recReason: "近期有活動",
+			recAction: "x",
+		});
+		if (recApply.recStatus !== "idle" || recApply.recReason !== liUn.recommendationGateReason) {
+			throw new Error("[mo-live] apply rec blocked");
+		}
+		const simApply = applyLiveIntelligenceToSimulationFields(liUn, {
+			simResult: "模擬偏積極",
+			simReady: "yes",
+			noteCountForRec: 5,
+		});
+		if (simApply.simReady !== "no" || !simApply.simResult.includes("無法模擬")) {
+			throw new Error("[mo-live] apply sim blocked");
+		}
+
 		const statusV1 = buildMoReportSummaryStatusBlockLines({
 			currentStrategy: "balanced",
 			previousStrategy: "conservative",
@@ -2545,6 +2698,8 @@ module.exports = {
 	buildActionLineLiveIntelligence,
 	buildSimulationStatusLineLiveIntelligence,
 	buildMoReportSummaryStatusBlockLines,
+	applyLiveIntelligenceToRecommendationFields,
+	applyLiveIntelligenceToSimulationFields,
 };
 
 if (
