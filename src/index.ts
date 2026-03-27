@@ -2953,6 +2953,50 @@ compareReason: ${r.compareReason}`;
 			existingResult.compareReason === "review result not ready" ||
 			(existingView !== null &&
 				(existingView.activeScore === 0 || existingView.candidateScore === 0));
+		if (shouldComputeOnDemand) {
+			// runStrategyReview 在 candidate 或 review state 缺失時會早退且不寫 KV，導致每次只看到 placeholder。
+			// 補齊與 /strategy-candidate-clone-active 相同的最小前置條件後再進 compare/evaluate。
+			const stateForPrereq = await readStrategyReviewState(env);
+			if (candidateCfg === null) {
+				const nowIso = new Date().toISOString();
+				const newCandidateVersion = `candidate-auto-${Date.now()}`;
+				const candidateObj: StrategyActiveConfig = {
+					...activeCfg.config,
+					configVersion: newCandidateVersion,
+					updatedAt: nowIso,
+				};
+				await env.MO_NOTES.put(
+					MO_CANDIDATE_STRATEGY_CONFIG_KEY,
+					JSON.stringify(candidateObj)
+				);
+				console.log("[strategy] review prerequisites auto-init (candidate cloned)", {
+					activeConfigVersion: activeCfg.config.configVersion,
+					candidateConfigVersion: candidateObj.configVersion,
+				});
+				await Promise.all([
+					clearStrategyReviewResult(env),
+					clearStrategyReviewDecision(env),
+					clearStrategyReviewDemoOverride(env, "new_cycle"),
+					writeStrategyReviewStateNewCycle({
+						env,
+						activeConfigVersion: activeCfg.config.configVersion,
+						candidateConfigVersion: candidateObj.configVersion,
+						note: "auto-initialized for review run",
+					}),
+				]);
+			} else if (stateForPrereq === null) {
+				await writeStrategyReviewStateNewCycle({
+					env,
+					activeConfigVersion: activeCfg.config.configVersion,
+					candidateConfigVersion: candidateCfg.configVersion,
+					note: "auto-initialized for review run",
+				});
+				console.log("[strategy] review prerequisites auto-init (review state)", {
+					activeConfigVersion: activeCfg.config.configVersion,
+					candidateConfigVersion: candidateCfg.configVersion,
+				});
+			}
+		}
 		const r =
 			!shouldComputeOnDemand && existingResult !== null && existingView !== null ?
 				{
