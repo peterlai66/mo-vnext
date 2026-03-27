@@ -2952,8 +2952,7 @@ compareReason: ${r.compareReason}`;
 			existingResult.comparedAt.trim() === "" ||
 			existingResult.compareReason === "review result not ready" ||
 			(existingView !== null &&
-				existingView.activeScore === 0 &&
-				existingView.candidateScore === 0);
+				(existingView.activeScore === 0 || existingView.candidateScore === 0));
 		const r =
 			!shouldComputeOnDemand && existingResult !== null && existingView !== null ?
 				{
