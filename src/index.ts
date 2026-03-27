@@ -2824,56 +2824,30 @@ compareReason: ${r.compareReason}`;
 		// 只做提示：不自動 promotion；在 review 回覆中明確告知 auto promote 條件是否達成
 		let autoPromoteHintBlock = "";
 		try {
-			const [active, candidate, reviewResult, demoOverride] = await Promise.all([
-				readActiveStrategyConfig(env),
-				readCandidateStrategyConfig(env),
-				readStrategyReviewResult(env),
-				readStrategyReviewDemoOverride(env),
-			]);
-
-			const a = active.config;
-			const c = candidate;
-			const diffs: string[] = [];
-			if (c !== null) {
-				if (a.freshnessWeight !== c.freshnessWeight) diffs.push("freshnessWeight");
-				if (a.volumeWeight !== c.volumeWeight) diffs.push("volumeWeight");
-				if (a.simulationWeight !== c.simulationWeight) diffs.push("simulationWeight");
-				if (a.aggressiveMinScore !== c.aggressiveMinScore) diffs.push("aggressiveMinScore");
-				if (a.balancedMinScore !== c.balancedMinScore) diffs.push("balancedMinScore");
-				if (a.freshnessIdleThresholdMs !== c.freshnessIdleThresholdMs) diffs.push("freshnessIdleThresholdMs");
-			}
-
-			const delta =
-				c !== null && typeof c.balancedMinScore === "number" ?
-					c.balancedMinScore - a.balancedMinScore
-				:	null;
-			const source = reviewResult?.source ?? "none";
-			const finalDecision: StrategyReviewDecisionLabel = r.finalDecision;
-			const compareDecision = reviewResult?.compareDecision ?? null;
+			const demoOverride = await readStrategyReviewDemoOverride(env);
+			const delta = r.reviewResult.delta;
+			const source = "real";
+			const finalDecision: StrategyCompareDecision = r.reviewResult.decision;
+			const changedFields = r.reviewResult.changedFields;
 
 			const autoPromoteEligible =
 				source === "real" &&
-				finalDecision === "auto_promote_candidate" &&
+				finalDecision === "promote_candidate" &&
 				demoOverride === null &&
-				diffs.length === 1 &&
-				diffs[0] === "balancedMinScore" &&
-				delta !== null &&
+				changedFields.length === 1 &&
+				changedFields[0] === "balancedMinScore" &&
 				delta >= 10;
 
 			if (autoPromoteEligible) {
 				autoPromoteHintBlock =
 					"\n\n⚠️ 建議執行 /strategy-auto-promote-run（條件已滿足）" +
-					`\n- delta: ${delta} (active=${a.balancedMinScore}, candidate=${c?.balancedMinScore ?? "none"})`;
+					`\n- delta: ${delta}`;
 			} else {
-				const deltaDisplay = delta === null ? "none" : String(delta);
+				const deltaDisplay = String(delta);
 				const sourceLine =
 					source !== "real" ? `${source}（需為 real）` : source;
 				const decisionLine =
-					finalDecision !== undefined ?
-						`\n- decision: ${finalDecision}`
-					: compareDecision !== null ?
-						`\n- compareDecision: ${compareDecision}`
-					:	"\n- decision: none";
+					`\n- decision: ${finalDecision}`;
 				autoPromoteHintBlock =
 					"\n\nAuto Promote 條件未達：" +
 					`\n- delta: ${deltaDisplay}（需 >=10）` +
@@ -3516,11 +3490,22 @@ at: ${at}`;
 		const candidateScore =
 			c === null ? activeScore : c.balancedMinScore * 1 + c.freshnessWeight * 10 + c.volumeWeight * 10;
 		const delta = candidateScore - activeScore;
+		const decisionFromReviewResult = reviewResult?.compareDecision;
+		const decisionFromReviewDecision =
+			reviewDecision?.decision === "auto_promote_candidate" ?
+				"promote_candidate"
+			: reviewDecision?.decision === "promote_candidate" ||
+				reviewDecision?.decision === "hold_review" ||
+				reviewDecision?.decision === "keep_active" ?
+				reviewDecision.decision
+			:	null;
 		const decision: StrategyCompareDecision =
-			reviewResult?.compareDecision ?? "hold_review";
+			decisionFromReviewResult ?? decisionFromReviewDecision ?? "hold_review";
 		const baseReason =
 			reviewResult?.compareReason && reviewResult.compareReason.trim() !== "" ?
 				reviewResult.compareReason
+			:	reviewDecision?.reason && reviewDecision.reason.trim() !== "" ?
+				reviewDecision.reason
 			:	(changedFields.length === 0 ? "no strategy changes" : `candidate changes: ${changedFields.join(", ")}`);
 		const thresholdReason =
 			c !== null &&
@@ -3540,6 +3525,8 @@ at: ${at}`;
 		const blocked = (): string => {
 			console.log("[strategy] auto promote run blocked", {
 				decision,
+				decisionFromReviewResult: decisionFromReviewResult ?? "none",
+				decisionFromReviewDecision: decisionFromReviewDecision ?? "none",
 				delta,
 				changedFields,
 				reason,
@@ -3559,7 +3546,6 @@ at: ${at}`;
 		};
 
 		if (candidate === null) return blocked();
-		if (reviewResult === null) return blocked();
 		if (decision !== "promote_candidate") return blocked();
 
 		console.log("[strategy] auto promote run conditions matched", {

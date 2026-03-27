@@ -21,6 +21,7 @@
  *  expectedChangedFields: Array<keyof StrategyShape>;
  *  expectedReason: string;
  *  expectedConfidence: Confidence;
+ *  expectedAutoPromoteAllowed: boolean;
  * }} TestCase
  */
 
@@ -127,6 +128,7 @@ const testCases = [
 		expectedChangedFields: ["balancedMinScore"],
 		expectedReason: "candidate changes: balancedMinScore",
 		expectedConfidence: "medium",
+		expectedAutoPromoteAllowed: false,
 	},
 	{
 		active: { balancedMinScore: 60, freshnessWeight: 1, volumeWeight: 1 },
@@ -135,6 +137,7 @@ const testCases = [
 		expectedChangedFields: [],
 		expectedReason: "no strategy changes",
 		expectedConfidence: "high",
+		expectedAutoPromoteAllowed: false,
 	},
 	{
 		active: { balancedMinScore: 60, freshnessWeight: 1, volumeWeight: 1 },
@@ -143,6 +146,7 @@ const testCases = [
 		expectedChangedFields: ["balancedMinScore"],
 		expectedReason: "candidate changes: balancedMinScore",
 		expectedConfidence: "medium",
+		expectedAutoPromoteAllowed: false,
 	},
 	{
 		active: { balancedMinScore: 60, freshnessWeight: 1, volumeWeight: 1 },
@@ -151,6 +155,7 @@ const testCases = [
 		expectedChangedFields: ["freshnessWeight"],
 		expectedReason: "candidate changes: freshnessWeight",
 		expectedConfidence: "high",
+		expectedAutoPromoteAllowed: true,
 	},
 ];
 
@@ -162,17 +167,21 @@ const results = testCases.map(
 		expectedChangedFields,
 		expectedReason,
 		expectedConfidence,
+		expectedAutoPromoteAllowed,
 	}) => {
 	const reviewResult = buildReviewResult(active, candidate);
+	const autoPromoteAllowed = reviewResult.decision === "promote_candidate";
 
 	return {
 		active,
 		candidate,
 		reviewResult,
+		autoPromoteAllowed,
 		expectedDecision,
 		expectedChangedFields,
 		expectedReason,
 		expectedConfidence,
+		expectedAutoPromoteAllowed,
 	};
 	}
 );
@@ -192,8 +201,10 @@ for (const item of results) {
 	const reasonMatch = item.reviewResult.reason === item.expectedReason;
 	const decisionMatch = item.reviewResult.decision === item.expectedDecision;
 	const confidenceMatch = item.reviewResult.confidence === item.expectedConfidence;
+	const autoPromoteAllowedMatch =
+		item.autoPromoteAllowed === item.expectedAutoPromoteAllowed;
 
-	if (!decisionMatch || !fieldsMatch || !reasonMatch || !confidenceMatch) {
+	if (!decisionMatch || !fieldsMatch || !reasonMatch || !confidenceMatch || !autoPromoteAllowedMatch) {
 		console.error("❌ mismatch", item);
 		failCount += 1;
 	} else {
