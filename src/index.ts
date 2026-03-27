@@ -2773,8 +2773,8 @@ compareReason: ${r.compareReason}`;
 			allowDemoOverride: false,
 		});
 
-		// 只做提示：若已符合 auto promote 安全條件，提醒可手動執行 /strategy-auto-promote-run
-		let autoPromoteHintLine = "";
+		// 只做提示：不自動 promotion；在 review 回覆中明確告知 auto promote 條件是否達成
+		let autoPromoteHintBlock = "";
 		try {
 			const [active, candidate, reviewResult, reviewDecision, demoOverride] = await Promise.all([
 				readActiveStrategyConfig(env),
@@ -2799,18 +2799,32 @@ compareReason: ${r.compareReason}`;
 			const delta =
 				c !== null && typeof c.balancedMinScore === "number" ?
 					c.balancedMinScore - a.balancedMinScore
-				:	Number.NEGATIVE_INFINITY;
+				:	null;
+			const source = reviewResult?.source ?? "none";
+			const decision = reviewDecision?.decision ?? "none";
 
 			const autoPromoteEligible =
-				reviewResult?.source === "real" &&
-				reviewDecision?.decision === "auto_promote_candidate" &&
+				source === "real" &&
+				decision === "auto_promote_candidate" &&
 				demoOverride === null &&
 				diffs.length === 1 &&
 				diffs[0] === "balancedMinScore" &&
+				delta !== null &&
 				delta >= 10;
 
 			if (autoPromoteEligible) {
-				autoPromoteHintLine = "\n\n⚠️ 建議執行 /strategy-auto-promote-run（條件已滿足）";
+				autoPromoteHintBlock =
+					"\n\n⚠️ 建議執行 /strategy-auto-promote-run（條件已滿足）" +
+					`\n- delta: ${delta} (active=${a.balancedMinScore}, candidate=${c?.balancedMinScore ?? "none"})`;
+			} else {
+				const deltaDisplay = delta === null ? "none" : String(delta);
+				const sourceLine =
+					source !== "real" ? `${source}（需為 real）` : source;
+				autoPromoteHintBlock =
+					"\n\nAuto Promote 條件未達：" +
+					`\n- delta: ${deltaDisplay}（需 >=10）` +
+					`\n- source: ${sourceLine}` +
+					`\n- decision: ${decision}`;
 			}
 		} catch {
 			// ignore (hint only)
@@ -2822,7 +2836,7 @@ reviewResultKey: ${MO_STRATEGY_REVIEW_RESULT_KEY}
 source: real
 comparedAt: ${r.comparedAt}
 compareDecision: ${r.compareDecision}
-compareReason: ${r.compareReason}${autoPromoteHintLine}`;
+compareReason: ${r.compareReason}${autoPromoteHintBlock}`;
 	  }
 	  case "/strategy-review-decision": {
 		const d = await readStrategyReviewDecision(env);
