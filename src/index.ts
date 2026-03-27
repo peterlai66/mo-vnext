@@ -2030,7 +2030,7 @@ async function runStrategyReview(params: {
 	// - 不放寬到多欄位 diff
 	// - 仍需真實資料新鮮且量足夠，且避免 simulationReady 太低
 	const isBalancedMinScoreOnlyDiff = diffs.length === 1 && diffs[0] === "balancedMinScore";
-	const balancedMinScoreDelta = Math.abs(a.balancedMinScore - c.balancedMinScore);
+	const balancedMinScoreDelta = c.balancedMinScore - a.balancedMinScore;
 	const isSafeRealPromoteBalancedMinScoreOnly =
 		params.source === "real" &&
 		demoOverride === null &&
@@ -2099,6 +2099,10 @@ async function runStrategyReview(params: {
 		safeRealPromoteBaseline: isSafeRealPromoteBalancedMinScoreOnly ? "matched" : "not_matched",
 		isStrongReal: params.source === "real" ? isStrongReal : undefined,
 		isSafeBalancedMinScoreOnlyReal: params.source === "real" ? isSafeBalancedMinScoreOnlyReal : undefined,
+		activeBalancedMinScore:
+			params.source === "real" && isBalancedMinScoreOnlyDiff ? a.balancedMinScore : undefined,
+		candidateBalancedMinScore:
+			params.source === "real" && isBalancedMinScoreOnlyDiff ? c.balancedMinScore : undefined,
 		balancedMinScoreDelta: isBalancedMinScoreOnlyDiff ? balancedMinScoreDelta : undefined,
 		balancedMinScoreActive:
 			params.source === "real" && (isBalancedMinScoreOnlyDiff || diffs.length === 0) ?
@@ -2806,7 +2810,7 @@ compareReason: ${r.compareReason}`;
 
 			const delta =
 				c !== null && typeof c.balancedMinScore === "number" ?
-					Math.abs(c.balancedMinScore - a.balancedMinScore)
+					c.balancedMinScore - a.balancedMinScore
 				:	null;
 			const source = reviewResult?.source ?? "none";
 			const finalDecision: StrategyReviewDecisionLabel = r.finalDecision;
