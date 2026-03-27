@@ -781,6 +781,247 @@ function buildMarketStatusLineWithGovernance(cycle, g) {
 }
 
 /**
+ * 從 legacySummary 抽出指數／收盤數值（最小可用；取不到則 null）
+ * @param {string} legacySummary
+ * @returns {string | null}
+ */
+function moLiveExtractMarketValue(legacySummary) {
+	if (typeof legacySummary !== "string" || legacySummary.trim() === "") return null;
+	const m = /close=([\d.]+)/u.exec(legacySummary);
+	if (m !== null) return m[1];
+	const m2 = /date=\d{8};close=([\d.]+)/u.exec(legacySummary);
+	if (m2 !== null) return m2[1];
+	return null;
+}
+
+/**
+ * Live Market Intelligence v1（只吃 governance 推導結果 + 筆記數）
+ *
+ * @param {ReturnType<typeof deriveMoLiveDataGovernance>} gov
+ * @param {{ rowIsNull: boolean; noteCountForRec: number; todayYyyymmdd: string }} ctx
+ */
+function deriveLiveMarketIntelligenceV1(gov, ctx) {
+	const rowIsNull = ctx.rowIsNull;
+	const noteCount = ctx.noteCountForRec;
+	const today = ctx.todayYyyymmdd;
+	const lagDays =
+		rowIsNull || typeof gov.tradeDate !== "string" || gov.tradeDate === "" ?
+			999
+		:	moLiveTradeDateLagDays(gov.tradeDate, today);
+
+	const marketDataAvailable =
+		!rowIsNull && gov.dataUsability !== "unusable";
+	const marketValue = marketDataAvailable ? moLiveExtractMarketValue(gov.legacySummary) : null;
+
+	/** @type {"trusted" | "limited" | "weak" | "unusable"} */
+	let marketDataQuality = "unusable";
+	if (!marketDataAvailable || gov.dataUsability === "unusable" || gov.stalenessLevel === "too_old") {
+		marketDataQuality = "unusable";
+	} else if (
+		gov.dataUsability === "push_ok" ||
+		(gov.dataUsability === "decision_ok" &&
+			gov.sourceLevel === "primary" &&
+			gov.stalenessLevel === "fresh" &&
+			lagDays <= 0)
+	) {
+		marketDataQuality = "trusted";
+	} else if (
+		gov.dataUsability === "decision_ok" ||
+		(gov.dataUsability === "display_only" &&
+			(gov.stalenessLevel === "fresh" || gov.stalenessLevel === "aging"))
+	) {
+		marketDataQuality = "limited";
+	} else {
+		marketDataQuality = "weak";
+	}
+
+	/** @type {"same_day" | "previous_day" | "stale" | "unavailable"} */
+	let marketRecencyLabel = "unavailable";
+	if (!marketDataAvailable || gov.dataUsability === "unusable") {
+		marketRecencyLabel = "unavailable";
+	} else if (lagDays <= 0) {
+		marketRecencyLabel = "same_day";
+	} else if (lagDays === 1) {
+		marketRecencyLabel = "previous_day";
+	} else {
+		marketRecencyLabel = "stale";
+	}
+
+	let marketInterpretation = "無可用行情解讀。";
+	if (!marketDataAvailable) {
+		marketInterpretation = "尚無有效行情快照，或資料標記為不可用。";
+	} else if (marketDataQuality === "trusted") {
+		marketInterpretation = "資料可作為即時決策參考（仍非投資建議）。";
+	} else if (marketDataQuality === "limited") {
+		marketInterpretation = "可作方向參考，不宜作即時推播或重部位依據。";
+	} else if (marketDataQuality === "weak") {
+		marketInterpretation = "來源或欄位受限，僅供概略參考。";
+	} else {
+		marketInterpretation = "不適合做市場判斷。";
+	}
+
+	/** @type {"ready" | "limited" | "blocked"} */
+	let recommendationReadiness = "blocked";
+	let recommendationGateReason = "行情不可用或過舊，已阻擋建議輸出。";
+	if (marketDataQuality === "unusable") {
+		recommendationReadiness = "blocked";
+		recommendationGateReason = "資料標記為 unusable 或過舊。";
+	} else if (gov.decisionEligible && marketDataQuality !== "weak") {
+		recommendationReadiness = "ready";
+		recommendationGateReason = "治理允許：decisionEligible 且資料品質非 weak。";
+	} else if (marketDataAvailable && gov.sourceLevel === "fallback2") {
+		recommendationReadiness = "limited";
+		recommendationGateReason = "OpenAPI fallback 僅顯示層級，建議保守。";
+	} else if (marketDataAvailable) {
+		recommendationReadiness = "limited";
+		recommendationGateReason = "資料僅供參考，不給出積極建議。";
+	}
+
+	/** @type {"ready" | "limited" | "blocked"} */
+	let simulationReadiness = "blocked";
+	let simulationGateReason = "無筆記或行情不可用，無法模擬。";
+	if (noteCount <= 0) {
+		simulationReadiness = "blocked";
+		simulationGateReason = "尚無筆記資料，無法進行策略模擬。";
+	} else if (marketDataQuality === "unusable") {
+		simulationReadiness = "blocked";
+		simulationGateReason = "行情不可用，模擬結果可信度不足。";
+	} else if (recommendationReadiness === "ready" && marketDataQuality !== "weak") {
+		simulationReadiness = "ready";
+		simulationGateReason = "筆記與行情條件足夠，可做模擬參考。";
+	} else {
+		simulationReadiness = "limited";
+		simulationGateReason = "可做低信心模擬；行情或資料層級受限。";
+	}
+
+	return {
+		marketDataAvailable,
+		marketDataQuality,
+		marketRecencyLabel,
+		marketValue,
+		marketValueChange: null,
+		marketInterpretation,
+		recommendationReadiness,
+		simulationReadiness,
+		recommendationGateReason,
+		simulationGateReason,
+	};
+}
+
+/**
+ * @param {"aggressive" | "balanced" | "conservative"} strategy
+ * @param {number} score
+ * @param {boolean} hasAdequateData
+ * @param {string} recReason
+ * @param {ReturnType<typeof deriveLiveMarketIntelligenceV1>} li
+ */
+function buildSystemDecisionLineLiveIntelligence(strategy, score, hasAdequateData, recReason, li) {
+	const base = buildSystemDecisionText(strategy, score, hasAdequateData, recReason);
+	if (li.marketDataQuality === "unusable") {
+		return `${base}\n\n【行情判讀】資料不足或過舊，不適合判斷。`;
+	}
+	if (li.marketDataQuality === "trusted" || li.recommendationReadiness === "ready") {
+		return `${base}\n\n【行情判讀】${li.marketInterpretation}`;
+	}
+	if (li.marketDataQuality === "limited") {
+		return `${base}\n\n【行情判讀】資料僅供參考：${li.marketInterpretation}`;
+	}
+	return `${base}\n\n【行情判讀】${li.marketInterpretation}`;
+}
+
+/**
+ * @param {number} score
+ * @param {ReturnType<typeof deriveLiveMarketIntelligenceV1>} li
+ */
+function buildActionLineLiveIntelligence(score, li) {
+	const s = mapScoreToActionLine(score);
+	if (li.recommendationReadiness === "blocked") {
+		return `不給出具體部位建議（${li.recommendationGateReason}）建議保守觀望並待資料更新。`;
+	}
+	if (li.recommendationReadiness === "limited") {
+		return `${s}（資料受限：${li.recommendationGateReason}；請保守／觀望）`;
+	}
+	return `${s}（行情層級允許一般建議；仍非投資顧問意見）`;
+}
+
+/**
+ * @param {string} simResult
+ * @param {"yes" | "no"} simReadyLegacy
+ * @param {number} noteCountForRec
+ * @param {ReturnType<typeof deriveLiveMarketIntelligenceV1>} li
+ */
+function buildSimulationStatusLineLiveIntelligence(simResult, simReadyLegacy, noteCountForRec, li) {
+	if (li.simulationReadiness === "blocked") {
+		return `狀態：不可模擬\n原因：${li.simulationGateReason}`;
+	}
+	if (li.simulationReadiness === "limited") {
+		return `狀態：低信心可模擬\n原因：${li.simulationGateReason}\n參考：${simResult}`;
+	}
+	return `狀態：可模擬\n筆記：${String(noteCountForRec)} 則\n參考：${simResult}`;
+}
+
+/**
+ * @param {ReturnType<typeof deriveLiveMarketIntelligenceV1>} li
+ * @param {ReturnType<typeof deriveMoLiveDataGovernance>} gov
+ * @param {string} displayDate
+ * @param {string} dataSource
+ */
+function buildMoReportMarketSummarySection(li, gov, displayDate, dataSource) {
+	const val =
+		li.marketValue !== null ? `指數／收盤參考值：${li.marketValue}` : "指數／收盤參考值：—（未能自摘要解析）";
+	const recency =
+		li.marketRecencyLabel === "same_day" ? "交易日：與今日同日（曆日對齊）"
+		: li.marketRecencyLabel === "previous_day" ? "交易日：前一曆日／接近最近交易日"
+		: li.marketRecencyLabel === "stale" ? "交易日：偏舊或非最近交易日"
+		: "交易日：不可用";
+	return [
+		`資料來源欄位：${dataSource}`,
+		`交易日（快照）：${gov.tradeDate || "—"}`,
+		`報告日期：${displayDate}`,
+		recency,
+		val,
+		`可信度層級：${li.marketDataQuality}`,
+		`摘要：${li.marketInterpretation}`,
+	].join("\n");
+}
+
+/**
+ * @param {{
+ *   displayDate: string;
+ *   dataSource: string;
+ *   dataQualityLine: string;
+ *   marketSummaryLine: string;
+ *   systemDecisionLine: string;
+ *   actionLine: string;
+ *   simulationLine: string;
+ * }} p
+ * @returns {string}
+ */
+function buildMoReportTextV1(p) {
+	const parts = [
+		"MO Report",
+		"",
+		`日期：${p.displayDate}`,
+		"",
+		"【資料品質】",
+		p.dataQualityLine,
+		"",
+		"【行情摘要】",
+		p.marketSummaryLine,
+		"",
+		"【系統判斷】",
+		p.systemDecisionLine,
+		"",
+		"【建議】",
+		p.actionLine,
+		"",
+		"【模擬狀態】",
+		p.simulationLine,
+	];
+	return parts.join("\n");
+}
+
+/**
  * @param {{ liveMarketPushEligible?: boolean }} p
  * @param {Record<string, unknown>} result
  */
@@ -1528,6 +1769,141 @@ function runDevCheckMain() {
 	runMoLiveGovernanceDevChecks();
 	passCount += 1;
 
+	function runMoLiveIntelligenceV1DevChecks() {
+		console.log("[mo-live] intelligence v1");
+		const today = getTaipeiYYYYMMDDMinusDaysFromToday(0);
+		const now = Date.now();
+		const isoFresh = new Date(now - 10 * 60 * 1000).toISOString();
+		const v2Primary = {
+			v: 2,
+			source: MO_LIVE_SOURCE_TWSE_MI_INDEX,
+			sourceLevel: "primary",
+			fetchStatus: "success",
+			confidence: "high",
+			rawAvailabilityNote: "x",
+			legacySummary: "stat=OK;close=12345.67",
+		};
+		const gP = deriveMoLiveDataGovernance({
+			row: {
+				trade_date: today,
+				created_at: isoFresh,
+				payload_summary: JSON.stringify(v2Primary),
+			},
+			nowMs: now,
+			todayYyyymmdd: today,
+		});
+		const liP = deriveLiveMarketIntelligenceV1(gP, {
+			rowIsNull: false,
+			noteCountForRec: 3,
+			todayYyyymmdd: today,
+		});
+		if (
+			liP.recommendationReadiness !== "ready" ||
+			liP.simulationReadiness !== "ready" ||
+			liP.marketDataQuality !== "trusted"
+		) {
+			throw new Error("[mo-live] li primary ready");
+		}
+
+		const v2F1 = {
+			...v2Primary,
+			source: "FINMIND_TaiwanStockPrice",
+			sourceLevel: "fallback1",
+			fetchStatus: "fallback_used",
+			confidence: "medium",
+			legacySummary: "close=20000",
+		};
+		const gF1 = deriveMoLiveDataGovernance({
+			row: {
+				trade_date: today,
+				created_at: isoFresh,
+				payload_summary: JSON.stringify(v2F1),
+			},
+			nowMs: now,
+			todayYyyymmdd: today,
+		});
+		if (!gF1.pushEligible) {
+			/* expected */
+		}
+		const liF1 = deriveLiveMarketIntelligenceV1(gF1, {
+			rowIsNull: false,
+			noteCountForRec: 2,
+			todayYyyymmdd: today,
+		});
+		if (liF1.recommendationReadiness !== "ready") {
+			throw new Error("[mo-live] li f1 rec");
+		}
+
+		const v2F2 = {
+			...v2Primary,
+			source: "TWSE_OpenAPI_MI_INDEX",
+			sourceLevel: "fallback2",
+			fetchStatus: "fallback_used",
+			confidence: "low",
+			legacySummary: "close=1",
+		};
+		const gF2 = deriveMoLiveDataGovernance({
+			row: {
+				trade_date: today,
+				created_at: isoFresh,
+				payload_summary: JSON.stringify(v2F2),
+			},
+			nowMs: now,
+			todayYyyymmdd: today,
+		});
+		const liF2 = deriveLiveMarketIntelligenceV1(gF2, {
+			rowIsNull: false,
+			noteCountForRec: 1,
+			todayYyyymmdd: today,
+		});
+		if (liF2.recommendationReadiness !== "limited") {
+			throw new Error("[mo-live] li f2 limited");
+		}
+
+		const v2Un = {
+			...v2Primary,
+			source: MO_LIVE_SOURCE_TWSE_MI_INDEX,
+			sourceLevel: "fallback2",
+			fetchStatus: "unavailable",
+			confidence: "low",
+		};
+		const gUn = deriveMoLiveDataGovernance({
+			row: {
+				trade_date: today,
+				created_at: isoFresh,
+				payload_summary: JSON.stringify(v2Un),
+			},
+			nowMs: now,
+			todayYyyymmdd: today,
+		});
+		const liUn = deriveLiveMarketIntelligenceV1(gUn, {
+			rowIsNull: false,
+			noteCountForRec: 5,
+			todayYyyymmdd: today,
+		});
+		if (liUn.recommendationReadiness !== "blocked" || liUn.simulationReadiness !== "blocked") {
+			throw new Error("[mo-live] li unavailable blocked");
+		}
+
+		const txt = buildMoReportTextV1({
+			displayDate: "d",
+			dataSource: "ds",
+			dataQualityLine: "q",
+			marketSummaryLine: "m",
+			systemDecisionLine: "s",
+			actionLine: "a",
+			simulationLine: "sim",
+		});
+		if (!txt.includes("【行情摘要】") || !txt.includes("【模擬狀態】") || !txt.includes("【建議】")) {
+			throw new Error("[mo-live] report v1 shape");
+		}
+
+		console.log("[mo-live] intelligence v1 ok");
+	}
+
+	runMoLiveIntelligenceV1DevChecks();
+	passCount += 1;
+
 	function runMoLiveStatusSummaryDevChecks() {
 		console.log("[mo-live] status summary builder");
 		const none = formatMoLiveMarketStatusBlock(null, {});
@@ -2015,6 +2391,12 @@ module.exports = {
 	MO_LIVE_GOV_FRESH_MS,
 	MO_LIVE_GOV_AGING_MS,
 	MO_LIVE_GOV_STALE_MS,
+	deriveLiveMarketIntelligenceV1,
+	buildMoReportTextV1,
+	buildMoReportMarketSummarySection,
+	buildSystemDecisionLineLiveIntelligence,
+	buildActionLineLiveIntelligence,
+	buildSimulationStatusLineLiveIntelligence,
 };
 
 if (

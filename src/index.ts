@@ -11,6 +11,7 @@ import {
 	isTwseMiIndexPayloadOk,
 	formatMoLiveMarketStatusBlock,
 	buildMoReportText as moReportComposeFullText,
+	buildMoReportTextV1 as moReportComposeFullTextV1,
 	buildMarketStatusText as moReportMarketLine,
 	buildSystemDecisionText as moReportSystemDecision,
 	buildActionText as moReportActionLine,
@@ -20,6 +21,11 @@ import {
 	buildMoReportDataQualityNote,
 	buildMarketStatusLineWithGovernance,
 	getMoLiveReportCycleFromGovernance,
+	deriveLiveMarketIntelligenceV1,
+	buildMoReportMarketSummarySection,
+	buildSystemDecisionLineLiveIntelligence,
+	buildActionLineLiveIntelligence,
+	buildSimulationStatusLineLiveIntelligence,
 	evaluateMoPushEventDecision,
 	MO_PUSH_COOLDOWN_MS_DEFAULT,
 	MO_PUSH_COOLDOWN_MS_P3_ONLY,
@@ -1181,6 +1187,12 @@ type ReportSummaryRecord = {
 	simulationReady: boolean;
 	simulationResult?: string;
 	timestamp: string;
+	/** Live Market Intelligence v1 快照（供 /status Report 區塊） */
+	reportDataQuality?: string;
+	recommendationReadiness?: string;
+	simulationReadiness?: string;
+	recommendationGateReason?: string;
+	simulationGateReason?: string;
 };
 
 function getLastReportSummaryKey(userId: string): string {
@@ -1254,6 +1266,23 @@ function parseReportSummaryRecord(raw: string): ReportSummaryRecord | null {
 		) {
 			rec.simulationResult = parsed.simulationResult;
 		}
+		const optStr = (k: string): string | undefined => {
+			if (!(k in parsed) || typeof (parsed as Record<string, unknown>)[k] !== "string") {
+				return undefined;
+			}
+			const v = String((parsed as Record<string, unknown>)[k]).trim();
+			return v === "" ? undefined : v;
+		};
+		const rdq = optStr("reportDataQuality");
+		if (rdq !== undefined) rec.reportDataQuality = rdq;
+		const rr = optStr("recommendationReadiness");
+		if (rr !== undefined) rec.recommendationReadiness = rr;
+		const sr = optStr("simulationReadiness");
+		if (sr !== undefined) rec.simulationReadiness = sr;
+		const rgr = optStr("recommendationGateReason");
+		if (rgr !== undefined) rec.recommendationGateReason = rgr;
+		const sgr = optStr("simulationGateReason");
+		if (sgr !== undefined) rec.simulationGateReason = sgr;
 		return rec;
 	} catch {
 		return null;
@@ -1282,6 +1311,21 @@ async function formatLastReportSummaryStatusBlock(env: Env, userId: string): Pro
 	lines.push(`reportSimReady: ${r.simulationReady ? "yes" : "no"}`);
 	if (r.simulationResult !== undefined) {
 		lines.push(`reportSimResult: ${r.simulationResult}`);
+	}
+	if (r.reportDataQuality !== undefined) {
+		lines.push(`reportDataQuality: ${r.reportDataQuality}`);
+	}
+	if (r.recommendationReadiness !== undefined) {
+		lines.push(`recommendationReadiness: ${r.recommendationReadiness}`);
+	}
+	if (r.simulationReadiness !== undefined) {
+		lines.push(`simulationReadiness: ${r.simulationReadiness}`);
+	}
+	if (r.recommendationGateReason !== undefined) {
+		lines.push(`recommendationGateReason: ${r.recommendationGateReason}`);
+	}
+	if (r.simulationGateReason !== undefined) {
+		lines.push(`simulationGateReason: ${r.simulationGateReason}`);
 	}
 	lines.push(`reportAt: ${r.timestamp}`);
 	return lines.join("\n");
@@ -1385,6 +1429,20 @@ type MoLiveDataGovernance = {
 	pushEligible: boolean;
 	displayFetchStatus: string;
 	liveFreshness: string;
+};
+
+/** Live Market Intelligence v1（與 dev-check deriveLiveMarketIntelligenceV1 對齊） */
+type MoLiveMarketIntelligenceV1 = {
+	marketDataAvailable: boolean;
+	marketDataQuality: "trusted" | "limited" | "weak" | "unusable";
+	marketRecencyLabel: string;
+	marketValue: string | null;
+	marketValueChange: null;
+	marketInterpretation: string;
+	recommendationReadiness: "ready" | "limited" | "blocked";
+	simulationReadiness: "ready" | "limited" | "blocked";
+	recommendationGateReason: string;
+	simulationGateReason: string;
 };
 
 function deriveMoLiveDataGovernanceTyped(
@@ -3811,7 +3869,8 @@ async function computeMoPushEvaluationForUser(
 	auditBeforeEvaluate: MoPushAuditRecord | null;
 	liveSnapshotMissing: boolean;
 	liveSnapshotStale: boolean;
-	liveDataGovernance: MoLiveDataGovernance | null;
+	liveDataGovernance: MoLiveDataGovernance;
+	liveMarketIntelligenceV1: MoLiveMarketIntelligenceV1;
 	liveMarketPushEligible: boolean;
 }> {
 	const s = await getSystemStatus(env, userId);
@@ -3946,7 +4005,7 @@ async function computeMoPushEvaluationForUser(
 	let marketStatusLine: string;
 	let liveSnapshotMissing = false;
 	let liveSnapshotStale = false;
-	let liveDataGovernance: MoLiveDataGovernance | null = null;
+	let liveDataGovernance: MoLiveDataGovernance;
 	if (liveRead.kind === "error") {
 		liveDataGovernance = deriveMoLiveDataGovernanceTyped(null, nowMsLive, todayYyyymmddLive);
 		marketStatusLine = `${buildMarketStatusText("fetch_failed")}\n\n【資料品質】${buildMoReportDataQualityNote(liveDataGovernance)}`;
@@ -3971,8 +4030,15 @@ async function computeMoPushEvaluationForUser(
 			liveDataGovernance
 		);
 	}
-	const liveMarketPushEligible =
-		liveDataGovernance !== null && liveDataGovernance.pushEligible;
+	const liveMarketPushEligible = liveDataGovernance.pushEligible;
+	const liveMarketIntelligenceV1 = deriveLiveMarketIntelligenceV1(
+		liveDataGovernance,
+		{
+			rowIsNull: liveRead.kind !== "ok" || liveRead.row === null,
+			noteCountForRec,
+			todayYyyymmdd: todayYyyymmddLive,
+		}
+	) as MoLiveMarketIntelligenceV1;
 	const displayDate =
 		liveRead.kind === "ok" && liveRead.row !== null ?
 			formatDisplayDateFromYyyymmdd(liveRead.row.trade_date)
@@ -3982,23 +4048,18 @@ async function computeMoPushEvaluationForUser(
 		: liveRead.row !== null ? liveRead.row.source
 		: "—（無快照）";
 	const hasAdequateData = totalNotesNum > 0;
-	let systemDecisionLine = buildSystemDecisionText(
+	const systemDecisionLine = buildSystemDecisionLineLiveIntelligence(
 		strategyFinal,
 		score,
 		hasAdequateData,
-		recReason
+		recReason,
+		liveMarketIntelligenceV1
 	);
-	if (liveDataGovernance !== null) {
-		if (liveDataGovernance.dataUsability === "unusable") {
-			systemDecisionLine = `${systemDecisionLine}\n\n【行情資料】資料不足或過舊，不適合判斷。`;
-		} else if (!liveDataGovernance.decisionEligible) {
-			systemDecisionLine = `${systemDecisionLine}\n\n【行情資料】資料僅供參考，不足以作為系統策略判斷依據。`;
-		}
-	}
-	const actionLineBase = buildActionText(score);
 	const forcedActionLine = (env.MO_FORCE_REPORT_ACTION_LINE ?? "").trim();
 	const actionLine =
-		forcedActionLine !== "" ? forcedActionLine : actionLineBase;
+		forcedActionLine !== "" ?
+			forcedActionLine
+		:	buildActionLineLiveIntelligence(score, liveMarketIntelligenceV1);
 	const audit = await readMoPushAudit(env, userId);
 	const strategyReview = await readStrategyReviewState(env);
 	let currentPromoteKey = "";
@@ -4046,8 +4107,8 @@ async function computeMoPushEvaluationForUser(
 		evaluation.pushReason === "blocked_by_data_usability"
 	) {
 		console.log("[mo-push] skipped: live data not push-eligible", {
-			dataUsability: liveDataGovernance?.dataUsability,
-			stalenessLevel: liveDataGovernance?.stalenessLevel,
+			dataUsability: liveDataGovernance.dataUsability,
+			stalenessLevel: liveDataGovernance.stalenessLevel,
 		});
 	}
 	const moMessage = evaluation.mergedMessage;
@@ -4101,6 +4162,7 @@ async function computeMoPushEvaluationForUser(
 		liveSnapshotMissing,
 		liveSnapshotStale,
 		liveDataGovernance,
+		liveMarketIntelligenceV1,
 		liveMarketPushEligible,
 	};
 }
@@ -5917,33 +5979,43 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 				simulationReady: simReady === "yes",
 				simulationResult: simResult,
 				timestamp: formatStatusPushAtTaipei(new Date()),
+				reportDataQuality: ctx.liveMarketIntelligenceV1.marketDataQuality,
+				recommendationReadiness: ctx.liveMarketIntelligenceV1.recommendationReadiness,
+				simulationReadiness: ctx.liveMarketIntelligenceV1.simulationReadiness,
+				recommendationGateReason: ctx.liveMarketIntelligenceV1.recommendationGateReason,
+				simulationGateReason: ctx.liveMarketIntelligenceV1.simulationGateReason,
 			};
 			await recordLastReportSummary(env, userId, summary);
 		}
 
-		const reportNotesParts: string[] = [];
-		if (noteCountForRec > 0) {
-			reportNotesParts.push(`模擬顯示：${simResult}`);
-		}
-		if (ctx.liveDataGovernance !== null) {
-			reportNotesParts.push(`【資料品質】${buildMoReportDataQualityNote(ctx.liveDataGovernance)}`);
-		}
+		let dataQualityLine = buildMoReportDataQualityNote(ctx.liveDataGovernance);
 		if (ctx.liveSnapshotMissing) {
-			reportNotesParts.push(
-				"【市場資料】尚無 D1 快照（資料不足）；行情由排程寫入，非本指令即時抓取。"
-			);
+			dataQualityLine = `${dataQualityLine}\n（尚無 D1 快照；行情由排程寫入，非本指令即時抓取。）`;
 		} else if (ctx.liveSnapshotStale) {
-			reportNotesParts.push("【市場資料】快照時效偏弱（stale／too_old），不建議作為推播依據。");
+			dataQualityLine = `${dataQualityLine}\n（快照時效偏弱，請以 staleness 為準。）`;
 		}
-		const notesLine = reportNotesParts.join("\n");
 
-		return buildMoReportText({
+		const marketSummaryLine = buildMoReportMarketSummarySection(
+			ctx.liveMarketIntelligenceV1,
+			ctx.liveDataGovernance,
+			ctx.displayDate,
+			ctx.dataSource
+		);
+		const simulationLine = buildSimulationStatusLineLiveIntelligence(
+			simResult,
+			simReady === "yes" ? "yes" : "no",
+			noteCountForRec,
+			ctx.liveMarketIntelligenceV1
+		);
+
+		return moReportComposeFullTextV1({
 			displayDate: ctx.displayDate,
 			dataSource: ctx.dataSource,
-			marketStatusLine: ctx.marketStatusLine,
+			dataQualityLine,
+			marketSummaryLine,
 			systemDecisionLine: ctx.systemDecisionLine,
 			actionLine: ctx.actionLine,
-			notesLine: notesLine.trim() !== "" ? notesLine : undefined,
+			simulationLine,
 		});
 	  }
 	  // TODO: later commands
