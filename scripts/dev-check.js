@@ -120,6 +120,65 @@ function buildReviewResult(active, candidate) {
 	};
 }
 
+const CONFIRM_REQUIRED = 2;
+const COOLDOWN_MS = 30 * 60 * 1000;
+
+/**
+ * @typedef {{
+ *  lastDecision?: Decision;
+ *  confirmCount: number;
+ *  lastPromoteAt?: number;
+ * }} PromoteGuardState
+ */
+
+/**
+ * @param {PromoteGuardState} state
+ * @param {Decision} decision
+ * @param {number} nowMs
+ * @returns {{ result: "promoted" | "blocked" | "no_action" | "guarded"; confirmCount: number; cooldownRemainingMs: number; nextState: PromoteGuardState; }}
+ */
+function evaluateAutoPromoteStable(state, decision, nowMs) {
+	const confirmCount = state.lastDecision === decision ? state.confirmCount + 1 : 1;
+	const baseState = {
+		lastDecision: decision,
+		confirmCount,
+		...(typeof state.lastPromoteAt === "number" ? { lastPromoteAt: state.lastPromoteAt } : {}),
+	};
+
+	if (decision === "keep_active") {
+		return { result: "no_action", confirmCount, cooldownRemainingMs: 0, nextState: baseState };
+	}
+	if (decision !== "promote_candidate") {
+		return { result: "blocked", confirmCount, cooldownRemainingMs: 0, nextState: baseState };
+	}
+	if (confirmCount < CONFIRM_REQUIRED) {
+		return { result: "guarded", confirmCount, cooldownRemainingMs: 0, nextState: baseState };
+	}
+
+	const remaining =
+		typeof state.lastPromoteAt === "number" ?
+			Math.max(0, COOLDOWN_MS - (nowMs - state.lastPromoteAt))
+		:	0;
+	if (remaining > 0) {
+		return {
+			result: "guarded",
+			confirmCount,
+			cooldownRemainingMs: remaining,
+			nextState: baseState,
+		};
+	}
+	return {
+		result: "promoted",
+		confirmCount,
+		cooldownRemainingMs: 0,
+		nextState: {
+			lastDecision: decision,
+			confirmCount,
+			lastPromoteAt: nowMs,
+		},
+	};
+}
+
 /** @type {TestCase[]} */
 const testCases = [
 	{
@@ -244,6 +303,55 @@ const summary = results.reduce(
 );
 
 console.log(summary);
+
+// 穩定機制驗證：confirm_count + cooldown
+/** @type {PromoteGuardState} */
+let guardState = { confirmCount: 0 };
+const t0 = 1_700_000_000_000;
+const stabilityCases = [
+	{
+		name: "first promote_candidate",
+		decision: /** @type {Decision} */ ("promote_candidate"),
+		at: t0,
+		expectedResult: "guarded",
+	},
+	{
+		name: "second promote_candidate",
+		decision: /** @type {Decision} */ ("promote_candidate"),
+		at: t0 + 60_000,
+		expectedResult: "promoted",
+	},
+	{
+		name: "post-promote immediate",
+		decision: /** @type {Decision} */ ("promote_candidate"),
+		at: t0 + 120_000,
+		expectedResult: "guarded",
+	},
+];
+
+for (const c of stabilityCases) {
+	const checked = evaluateAutoPromoteStable(guardState, c.decision, c.at);
+	console.log({
+		stabilityCase: c.name,
+		decision: c.decision,
+		result: checked.result,
+		expectedResult: c.expectedResult,
+		confirmCount: checked.confirmCount,
+		cooldownRemainingMs: checked.cooldownRemainingMs,
+	});
+	if (checked.result !== c.expectedResult) {
+		console.error("❌ mismatch", {
+			stabilityCase: c.name,
+			result: checked.result,
+			expectedResult: c.expectedResult,
+		});
+		failCount += 1;
+	} else {
+		passCount += 1;
+	}
+	guardState = checked.nextState;
+}
+
 console.log({ passCount, failCount });
 
 if (failCount > 0) {

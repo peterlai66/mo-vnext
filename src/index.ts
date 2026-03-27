@@ -1337,6 +1337,9 @@ const MO_STRATEGY_REVIEW_STATE_KEY = "strategy_review_state";
 const MO_STRATEGY_REVIEW_RESULT_KEY = "strategy_review_result";
 const MO_STRATEGY_REVIEW_DECISION_KEY = "strategy_review_decision";
 const MO_STRATEGY_REVIEW_DEMO_OVERRIDE_KEY = "strategy_review_demo_override";
+const MO_STRATEGY_AUTO_PROMOTE_GUARD_KEY = "strategy_auto_promote_guard";
+const STRATEGY_AUTO_PROMOTE_CONFIRM_REQUIRED = 2;
+const STRATEGY_AUTO_PROMOTE_COOLDOWN_MS = 30 * 60 * 1000;
 
 type StrategyReviewStatus =
 	| "none"
@@ -1395,6 +1398,12 @@ type StrategyReviewDemoOverride = {
 	status: "active" | "idle";
 	note: string;
 	updatedAt: string;
+};
+
+type StrategyAutoPromoteGuardRecord = {
+	lastDecision: StrategyCompareDecision;
+	confirmCount: number;
+	lastPromoteAt?: number;
 };
 
 function getDefaultStrategyActiveConfig(): StrategyActiveConfig {
@@ -1874,6 +1883,62 @@ async function clearStrategyReviewDemoOverride(
 			context,
 			message,
 		});
+	}
+}
+
+function parseStrategyAutoPromoteGuardRecord(raw: string): StrategyAutoPromoteGuardRecord | null {
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (typeof parsed !== "object" || parsed === null) return null;
+		const obj = parsed as Record<string, unknown>;
+		if (
+			typeof obj.lastDecision !== "string" ||
+			(obj.lastDecision !== "keep_active" &&
+				obj.lastDecision !== "hold_review" &&
+				obj.lastDecision !== "promote_candidate")
+		) {
+			return null;
+		}
+		if (typeof obj.confirmCount !== "number" || !Number.isFinite(obj.confirmCount)) {
+			return null;
+		}
+		if (
+			"lastPromoteAt" in obj &&
+			obj.lastPromoteAt !== undefined &&
+			(typeof obj.lastPromoteAt !== "number" || !Number.isFinite(obj.lastPromoteAt))
+		) {
+			return null;
+		}
+		return {
+			lastDecision: obj.lastDecision,
+			confirmCount: Math.max(0, Math.floor(obj.confirmCount)),
+			...(typeof obj.lastPromoteAt === "number" ? { lastPromoteAt: obj.lastPromoteAt } : {}),
+		};
+	} catch {
+		return null;
+	}
+}
+
+async function readStrategyAutoPromoteGuard(
+	env: Env
+): Promise<StrategyAutoPromoteGuardRecord | null> {
+	try {
+		const raw = await env.MO_NOTES.get(MO_STRATEGY_AUTO_PROMOTE_GUARD_KEY, "text");
+		if (!raw) return null;
+		return parseStrategyAutoPromoteGuardRecord(raw);
+	} catch {
+		return null;
+	}
+}
+
+async function writeStrategyAutoPromoteGuard(
+	env: Env,
+	record: StrategyAutoPromoteGuardRecord
+): Promise<void> {
+	try {
+		await env.MO_NOTES.put(MO_STRATEGY_AUTO_PROMOTE_GUARD_KEY, JSON.stringify(record));
+	} catch {
+		// guard only
 	}
 }
 
@@ -3463,13 +3528,14 @@ at: ${at}`;
 	  }
 	  case "/strategy-auto-promote-run": {
 		console.log("[strategy] auto promote run start");
-		const [active, candidate, reviewState, reviewResult, reviewDecision] =
+		const [active, candidate, reviewState, reviewResult, reviewDecision, promoteGuard] =
 			await Promise.all([
 				readActiveStrategyConfig(env),
 				readCandidateStrategyConfig(env),
 				readStrategyReviewState(env),
 				readStrategyReviewResult(env),
 				readStrategyReviewDecision(env),
+				readStrategyAutoPromoteGuard(env),
 			]);
 
 		const at = formatStatusPushAtTaipei(new Date());
@@ -3521,6 +3587,17 @@ at: ${at}`;
 				"high"
 			:	"medium";
 		const changedFieldsText = changedFields.length === 0 ? "none" : changedFields.join(", ");
+		const previousDecision = promoteGuard?.lastDecision ?? null;
+		const previousConfirmCount = promoteGuard?.confirmCount ?? 0;
+		const confirmCount =
+			previousDecision === decision ? previousConfirmCount + 1 : 1;
+		const nowMs = Date.now();
+		const lastPromoteAt = promoteGuard?.lastPromoteAt;
+		const cooldownRemainingMs =
+			typeof lastPromoteAt === "number" ?
+				Math.max(0, STRATEGY_AUTO_PROMOTE_COOLDOWN_MS - (nowMs - lastPromoteAt))
+			:	0;
+		const cooldownRemainingMin = Math.ceil(cooldownRemainingMs / 60000);
 
 		const blocked = (): string => {
 			console.log("[strategy] auto promote run blocked", {
@@ -3547,12 +3624,18 @@ at: ${at}`;
 
 		if (candidate === null) return blocked();
 		if (decision === "keep_active") {
+			await writeStrategyAutoPromoteGuard(env, {
+				lastDecision: decision,
+				confirmCount,
+				...(typeof lastPromoteAt === "number" ? { lastPromoteAt } : {}),
+			});
 			console.log("[strategy] auto promote run no_action", {
 				decision,
 				delta,
 				changedFields,
 				reason,
 				confidence,
+				confirmCount,
 			});
 			return `MO Strategy Auto Promote Run
 
@@ -3564,15 +3647,72 @@ reason: ${reason}
 confidence: ${confidence}
 auto promote skipped: active config already matches candidate
 decisionSource: ${decisionSource}
+confirmCount: ${confirmCount}/${STRATEGY_AUTO_PROMOTE_CONFIRM_REQUIRED}
 at: ${at}`;
 		}
-		if (decision !== "promote_candidate") return blocked();
+		if (decision !== "promote_candidate") {
+			await writeStrategyAutoPromoteGuard(env, {
+				lastDecision: decision,
+				confirmCount,
+				...(typeof lastPromoteAt === "number" ? { lastPromoteAt } : {}),
+			});
+			return blocked();
+		}
+
+		// promote_candidate 的穩定機制：先累積 confirm 次數，再檢查 cooldown
+		if (confirmCount < STRATEGY_AUTO_PROMOTE_CONFIRM_REQUIRED) {
+			await writeStrategyAutoPromoteGuard(env, {
+				lastDecision: decision,
+				confirmCount,
+				...(typeof lastPromoteAt === "number" ? { lastPromoteAt } : {}),
+			});
+			console.log("[strategy] auto promote run guarded", {
+				guard: "confirm_count",
+				confirmCount,
+			});
+			return `MO Strategy Auto Promote Run
+
+result: guarded
+decision: ${decision}
+delta: ${delta}
+changedFields: ${changedFieldsText}
+reason: waiting for confirmation (${confirmCount}/${STRATEGY_AUTO_PROMOTE_CONFIRM_REQUIRED})
+confidence: ${confidence}
+decisionSource: ${decisionSource}
+confirmCount: ${confirmCount}/${STRATEGY_AUTO_PROMOTE_CONFIRM_REQUIRED}
+at: ${at}`;
+		}
+
+		if (cooldownRemainingMs > 0) {
+			await writeStrategyAutoPromoteGuard(env, {
+				lastDecision: decision,
+				confirmCount,
+				...(typeof lastPromoteAt === "number" ? { lastPromoteAt } : {}),
+			});
+			console.log("[strategy] auto promote run guarded", {
+				guard: "cooldown",
+				cooldownRemainingMin,
+			});
+			return `MO Strategy Auto Promote Run
+
+result: guarded
+decision: ${decision}
+delta: ${delta}
+changedFields: ${changedFieldsText}
+reason: cooldown active (${cooldownRemainingMin} min remaining)
+confidence: ${confidence}
+decisionSource: ${decisionSource}
+confirmCount: ${confirmCount}/${STRATEGY_AUTO_PROMOTE_CONFIRM_REQUIRED}
+cooldownRemaining: ${cooldownRemainingMin}m
+at: ${at}`;
+		}
 
 		console.log("[strategy] auto promote run conditions matched", {
 			delta,
 			changedFields,
 			compareDecision: reviewResult.compareDecision,
 			decision,
+			confirmCount,
 		});
 
 		// promotion 寫入（沿用手動 promotion 的最小流程）
@@ -3602,6 +3742,11 @@ at: ${at}`;
 			reason: "auto promotion completed",
 			evaluatedAt: at,
 		});
+		await writeStrategyAutoPromoteGuard(env, {
+			lastDecision: decision,
+			confirmCount,
+			lastPromoteAt: nowMs,
+		});
 
 		await clearStrategyReviewDemoOverride(env, "promotion");
 
@@ -3619,6 +3764,7 @@ changedFields: ${changedFieldsText}
 reason: ${reason}
 confidence: ${confidence}
 decisionSource: auto
+confirmCount: ${confirmCount}/${STRATEGY_AUTO_PROMOTE_CONFIRM_REQUIRED}
 promotedFrom: ${active.config.configVersion}
 promotedTo: ${promotedActive.configVersion}
 at: ${at}`;
