@@ -2050,7 +2050,12 @@ async function runStrategyReview(params: {
 
 	if (diffs.length === 0) {
 		compareDecision = "keep_active";
-		compareReason = "no_material_diff";
+		// 補強可讀性：常見誤判是 balancedMinScore 其實相同（delta=0）
+		const balancedDelta = c.balancedMinScore - a.balancedMinScore;
+		compareReason =
+			params.source === "real" && balancedDelta === 0 ?
+				`no_material_diff (balancedMinScore delta=0; active=${a.balancedMinScore}, candidate=${c.balancedMinScore})`
+			:	"no_material_diff";
 		compareSummary = "active vs candidate same";
 	} else if (isSafeRealPromoteBalancedMinScoreOnly) {
 		compareDecision = "promote_candidate";
@@ -2077,7 +2082,9 @@ async function runStrategyReview(params: {
 		compareDecision = "hold_review";
 		compareReason =
 			params.source === "real" && isBalancedMinScoreOnlyDiff ?
-				`candidate balancedMinScore change but real review conditions not strong enough (delta=${balancedMinScoreDelta})`
+				(balancedMinScoreDelta < 10 ?
+						`balancedMinScore delta is below threshold (delta=${balancedMinScoreDelta}, active=${a.balancedMinScore}, candidate=${c.balancedMinScore}); auto promote requires delta >= 10`
+					:	`candidate balancedMinScore change but real review conditions not strong enough (delta=${balancedMinScoreDelta}, active=${a.balancedMinScore}, candidate=${c.balancedMinScore})`)
 			:	`candidate changes but review conditions not strong enough: ${diffs.join(", ")}`;
 		compareSummary = "active vs candidate differ";
 	}
@@ -2091,6 +2098,14 @@ async function runStrategyReview(params: {
 		isStrongReal: params.source === "real" ? isStrongReal : undefined,
 		isSafeBalancedMinScoreOnlyReal: params.source === "real" ? isSafeBalancedMinScoreOnlyReal : undefined,
 		balancedMinScoreDelta: isBalancedMinScoreOnlyDiff ? balancedMinScoreDelta : undefined,
+		balancedMinScoreActive:
+			params.source === "real" && (isBalancedMinScoreOnlyDiff || diffs.length === 0) ?
+				a.balancedMinScore
+			:	undefined,
+		balancedMinScoreCandidate:
+			params.source === "real" && (isBalancedMinScoreOnlyDiff || diffs.length === 0) ?
+				c.balancedMinScore
+			:	undefined,
 	});
 
 	const nowIso = new Date().toISOString();
@@ -3377,9 +3392,18 @@ at: ${at}`;
 
 		const at = formatStatusPushAtTaipei(new Date());
 		const decisionSource = reviewDecision?.decisionSource ?? "unknown";
+		const activeBalanced = active.config.balancedMinScore;
+		const candidateBalanced = candidate?.balancedMinScore;
+		const delta =
+			typeof candidateBalanced === "number" ? candidateBalanced - activeBalanced : null;
 
 		const blocked = (reason: string): string => {
-			console.log("[strategy] auto promote run blocked", { reason });
+			console.log("[strategy] auto promote run blocked", {
+				reason,
+				balancedMinScoreDelta: delta === null ? "unknown" : delta,
+				activeBalancedMinScore: activeBalanced,
+				candidateBalancedMinScore: candidateBalanced ?? "none",
+			});
 			return `MO Strategy Auto Promote Run
 
 result: blocked
@@ -3398,6 +3422,12 @@ at: ${at}`;
 		}
 		// 安全條件 2) decision 必須是 auto_promote_candidate（v1 mapping）
 		if (reviewDecision.decision !== "auto_promote_candidate") {
+			// 補強可讀性：常見原因是沒有實質差異或 delta 不足
+			if (delta !== null && delta < 10) {
+				return blocked(
+					`balancedMinScore delta is ${delta}; auto promote requires delta >= 10 (active=${activeBalanced}, candidate=${candidateBalanced})`
+				);
+			}
 			return blocked(`decision is not auto_promote_candidate (decision=${reviewDecision.decision})`);
 		}
 		// 安全條件 3) demo override 必須為 off
@@ -3426,12 +3456,16 @@ at: ${at}`;
 		if (typeof a.balancedMinScore !== "number" || typeof c.balancedMinScore !== "number") {
 			return blocked("balancedMinScore is not a number");
 		}
-		const delta = c.balancedMinScore - a.balancedMinScore;
-		if (delta < 10) return blocked(`balancedMinScore delta < 10 (delta=${delta})`);
+		const delta2 = c.balancedMinScore - a.balancedMinScore;
+		if (delta2 < 10) {
+			return blocked(
+				`balancedMinScore delta is ${delta2}; auto promote requires delta >= 10 (active=${a.balancedMinScore}, candidate=${c.balancedMinScore})`
+			);
+		}
 
 		console.log("[strategy] auto promote run conditions matched", {
 			field: "balancedMinScore",
-			delta,
+			delta: delta2,
 			compareDecision: reviewResult.compareDecision,
 			decision: reviewDecision.decision,
 		});
