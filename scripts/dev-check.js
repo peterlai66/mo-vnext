@@ -406,6 +406,35 @@ function deriveMoLiveCycleStatus(fetched, dbWrite, options) {
 }
 
 /**
+ * LINE /status 與 Worker 共用：依 D1 最新快照組出 Live market 區塊（多行純文字，不含 section 標題）。
+ *
+ * @param {{
+ *   trade_date: string;
+ *   source: string;
+ *   payload_summary: string;
+ *   created_at: string;
+ * } | null} row
+ * @param {{ d1ReadError?: string }} [options]
+ * @returns {string}
+ */
+function formatMoLiveMarketStatusBlock(row, options) {
+	if (options && options.d1ReadError) {
+		return `d1 read failed: ${options.d1ReadError}\ncycle: fetch_failed`;
+	}
+	if (row === null) {
+		return "snapshot: none（尚無 mo_live 資料；可先觸發一次資料寫入）\ncycle: waiting_data";
+	}
+	const cycle = deriveMoLiveCycleStatus(true, true);
+	return [
+		`tradeDate: ${row.trade_date}`,
+		`source: ${row.source}`,
+		`summary: ${row.payload_summary}`,
+		`storedAt: ${row.created_at}`,
+		`cycle: ${cycle}`,
+	].join("\n");
+}
+
+/**
  * @typedef {{
  *  active: StrategyShape;
  *  candidate: StrategyShape;
@@ -559,6 +588,32 @@ function runDevCheckMain() {
 	}
 
 	runMoLiveCycleDevChecks();
+	passCount += 1;
+
+	function runMoLiveStatusSummaryDevChecks() {
+		console.log("[mo-live] status summary builder");
+		const none = formatMoLiveMarketStatusBlock(null, {});
+		if (!none.includes("waiting_data") || !none.includes("snapshot:")) {
+			throw new Error(`[mo-live status] expected waiting snapshot: ${none}`);
+		}
+		const err = formatMoLiveMarketStatusBlock(null, { d1ReadError: "unit" });
+		if (!err.includes("fetch_failed") || !err.includes("d1 read failed")) {
+			throw new Error(`[mo-live status] expected d1 error: ${err}`);
+		}
+		const row = {
+			trade_date: "20260101",
+			source: MO_LIVE_SOURCE_TWSE_MI_INDEX,
+			payload_summary: "stat=OK;date=20260101;tableDataRows=1",
+			created_at: "2026-01-01T00:00:00.000Z",
+		};
+		const ok = formatMoLiveMarketStatusBlock(row, {});
+		if (!ok.includes("success") || !ok.includes("20260101") || !ok.includes("TWSE_MI_INDEX")) {
+			throw new Error(`[mo-live status] expected success block: ${ok}`);
+		}
+		console.log("[mo-live] status summary ok");
+	}
+
+	runMoLiveStatusSummaryDevChecks();
 	passCount += 1;
 
 	let guardState = /** @type {PromoteGuardState} */ ({ confirmCount: 0 });
@@ -737,6 +792,7 @@ module.exports = {
 	deriveMoLiveCycleStatus,
 	summarizeTwseMiIndexPayload,
 	isTwseMiIndexPayloadOk,
+	formatMoLiveMarketStatusBlock,
 };
 
 if (

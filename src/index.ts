@@ -9,6 +9,7 @@ import {
 	deriveMoLiveCycleStatus,
 	summarizeTwseMiIndexPayload,
 	isTwseMiIndexPayloadOk,
+	formatMoLiveMarketStatusBlock,
 } from "../scripts/dev-check.js";
 
 interface KVListKey {
@@ -939,15 +940,67 @@ type MoStatusState = {
 	lastPushBlock: string;
 	decisionBlock: string;
 	reportBlock: string;
+	liveMarketBlock: string;
 };
 
+type MoLiveSnapshotRow = {
+	trade_date: string;
+	source: string;
+	payload_summary: string;
+	created_at: string;
+};
+
+async function readLatestMoLiveMarketSnapshot(
+	env: Env
+): Promise<{ kind: "ok"; row: MoLiveSnapshotRow | null } | { kind: "error"; message: string }> {
+	try {
+		const r = await env.MO_DB.prepare(
+			`SELECT trade_date, source, payload_summary, created_at
+			 FROM mo_live_market_snapshots
+			 ORDER BY id DESC
+			 LIMIT 1`
+		).first<Record<string, unknown>>();
+		if (r === null) {
+			return { kind: "ok", row: null };
+		}
+		const td = r.trade_date;
+		const src = r.source;
+		const ps = r.payload_summary;
+		const ca = r.created_at;
+		if (
+			typeof td !== "string" ||
+			typeof src !== "string" ||
+			typeof ps !== "string" ||
+			typeof ca !== "string"
+		) {
+			return { kind: "error", message: "invalid mo_live row shape" };
+		}
+		return {
+			kind: "ok",
+			row: { trade_date: td, source: src, payload_summary: ps, created_at: ca },
+		};
+	} catch (err: unknown) {
+		const message = err instanceof Error ? err.message : String(err);
+		return { kind: "error", message };
+	}
+}
+
+async function buildMoLiveMarketStatusBlock(env: Env): Promise<string> {
+	const read = await readLatestMoLiveMarketSnapshot(env);
+	if (read.kind === "error") {
+		return formatMoLiveMarketStatusBlock(null, { d1ReadError: read.message });
+	}
+	return formatMoLiveMarketStatusBlock(read.row, {});
+}
+
 async function buildMoStatusState(env: Env, userId: string): Promise<MoStatusState> {
-	const [lastPushBlock, decisionBlock, reportBlock] = await Promise.all([
+	const [lastPushBlock, decisionBlock, reportBlock, liveMarketBlock] = await Promise.all([
 		formatLastPushStatusBlock(env, userId),
 		formatLastStrategyDecisionStatusBlock(env, userId),
 		formatLastReportSummaryStatusBlock(env, userId),
+		buildMoLiveMarketStatusBlock(env),
 	]);
-	return { lastPushBlock, decisionBlock, reportBlock };
+	return { lastPushBlock, decisionBlock, reportBlock, liveMarketBlock };
 }
 
 function renderMoStatusText(params: {
@@ -981,9 +1034,27 @@ ${formatSection("Push", params.state.lastPushBlock)}
 
 ${formatSection("Decision", params.state.decisionBlock)}
 
-${formatSection("Report", params.state.reportBlock)}`;
+${formatSection("Report", params.state.reportBlock)}
+
+${formatSection("Live market", params.state.liveMarketBlock)}`;
 	// safeguard: 避免標題被意外多出字元（例如 eMO Status）
 	return statusText.replace(/^eMO Status/u, "MO Status");
+}
+
+async function buildMoStatusReplyText(env: Env, userId: string): Promise<string> {
+	const s = await getSystemStatus(env, userId);
+	const statusUserLine = s.user === "ok" ? `ok (${userId})` : "none";
+	const state = await buildMoStatusState(env, userId);
+	return renderMoStatusText({
+		app: s.app,
+		version: "dev",
+		command: s.command,
+		kv: s.kv,
+		d1: s.d1,
+		userLine: statusUserLine,
+		noteCount: s.noteCount,
+		state,
+	});
 }
 
 function renderMoReportText(params: {
@@ -4403,19 +4474,7 @@ reason: forced debug strategy change`;
 ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 	  }
 	  case "/status": {
-		const s = await getSystemStatus(env, userId);
-		const statusUserLine = s.user === "ok" ? `ok (${userId})` : "none";
-		const state = await buildMoStatusState(env, userId);
-		return renderMoStatusText({
-			app: s.app,
-			version: "dev",
-			command: s.command,
-			kv: s.kv,
-			d1: s.d1,
-			userLine: statusUserLine,
-			noteCount: s.noteCount,
-			state,
-		});
+		return await buildMoStatusReplyText(env, userId);
 	  }
 	  case "/report-test-change":
 	  case "/report": {
@@ -4866,6 +4925,22 @@ async function getReplyText(
 		debugLog(env, "[fetch] hit");
 		debugLog(env, "[fetch] path", new URL(request.url).pathname);
 		const url = new URL(request.url);
+
+		if (url.pathname === "/admin/status-preview" && request.method === "GET") {
+			const uid = url.searchParams.get("userId") ?? "preview-user";
+			try {
+				const text = await buildMoStatusReplyText(env, uid);
+				return new Response(text, {
+					headers: { "Content-Type": "text/plain; charset=utf-8" },
+				});
+			} catch (err: unknown) {
+				const message = err instanceof Error ? err.message : String(err);
+				return new Response(`status preview error: ${message}`, {
+					status: 500,
+					headers: { "Content-Type": "text/plain; charset=utf-8" },
+				});
+			}
+		}
 
 		if (url.pathname === "/admin/run" && request.method === "GET") {
 			try {
