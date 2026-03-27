@@ -2893,12 +2893,83 @@ compareReason: ${r.compareReason}`;
 	  case "/strategy-review-run": {
 		// real review 不應繼承舊的 demo override（避免 stale state 影響 auto promote）
 		await clearStrategyReviewDemoOverride(env, "real_review");
-		const r = await runStrategyReview({
-			env,
-			userId,
-			source: "real",
-			allowDemoOverride: false,
-		});
+		const [activeCfg, candidateCfg, existingResult] = await Promise.all([
+			readActiveStrategyConfig(env),
+			readCandidateStrategyConfig(env),
+			readStrategyReviewResult(env),
+		]);
+		const buildReviewResultView = (params: {
+			active: StrategyActiveConfig;
+			candidate: StrategyActiveConfig | null;
+			compareDecision: StrategyCompareDecision;
+			compareReason: string;
+		}): {
+			activeScore: number;
+			candidateScore: number;
+			delta: number;
+			changedFields: string[];
+			reason: string;
+			decision: StrategyCompareDecision;
+			confidence: "high" | "medium";
+		} => {
+			const a = params.active;
+			const c = params.candidate;
+			const activeScore = a.balancedMinScore * 1 + a.freshnessWeight * 10 + a.volumeWeight * 10;
+			const candidateScore =
+				c === null ? 0 : c.balancedMinScore * 1 + c.freshnessWeight * 10 + c.volumeWeight * 10;
+			const delta = candidateScore - activeScore;
+			const changedFields: string[] = [];
+			if (c !== null) {
+				if (a.balancedMinScore !== c.balancedMinScore) changedFields.push("balancedMinScore");
+				if (a.freshnessWeight !== c.freshnessWeight) changedFields.push("freshnessWeight");
+				if (a.volumeWeight !== c.volumeWeight) changedFields.push("volumeWeight");
+			}
+			const confidence: "high" | "medium" =
+				(params.compareDecision === "promote_candidate" && delta >= 10) ||
+				(params.compareDecision === "keep_active" && delta === 0) ?
+					"high"
+				:	"medium";
+			return {
+				activeScore,
+				candidateScore,
+				delta,
+				changedFields,
+				reason: params.compareReason,
+				decision: params.compareDecision,
+				confidence,
+			};
+		};
+		const r =
+			existingResult !== null && existingResult.comparedAt.trim() !== "" ?
+				{
+					comparedAt: existingResult.comparedAt,
+					compareDecision: existingResult.compareDecision,
+					compareReason: existingResult.compareReason,
+					finalDecision:
+						existingResult.compareDecision === "promote_candidate" ? "promote_candidate"
+						: existingResult.compareDecision === "keep_active" ? "keep_active"
+						: "hold_review",
+					reviewResult: buildReviewResultView({
+						active: activeCfg.config,
+						candidate: candidateCfg,
+						compareDecision: existingResult.compareDecision,
+						compareReason: existingResult.compareReason,
+					}),
+				}
+			:	(await (async () => {
+					const computed = await runStrategyReview({
+						env,
+						userId,
+						source: "real",
+						allowDemoOverride: false,
+					});
+					console.log("[strategy] review computed on demand", {
+						activeConfigVersion: activeCfg.config.configVersion,
+						candidateConfigVersion: candidateCfg?.configVersion ?? "none",
+						comparedAt: computed.comparedAt,
+					});
+					return computed;
+				})());
 		const rr =
 			r.reviewResult ??
 			{
