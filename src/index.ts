@@ -3489,94 +3489,73 @@ at: ${at}`;
 	  }
 	  case "/strategy-auto-promote-run": {
 		console.log("[strategy] auto promote run start");
-		const [active, candidate, reviewState, reviewResult, reviewDecision, demoOverride] =
+		const [active, candidate, reviewState, reviewResult, reviewDecision] =
 			await Promise.all([
 				readActiveStrategyConfig(env),
 				readCandidateStrategyConfig(env),
 				readStrategyReviewState(env),
 				readStrategyReviewResult(env),
 				readStrategyReviewDecision(env),
-				readStrategyReviewDemoOverride(env),
 			]);
 
 		const at = formatStatusPushAtTaipei(new Date());
 		const decisionSource = reviewDecision?.decisionSource ?? "unknown";
-		const activeBalanced = active.config.balancedMinScore;
-		const candidateBalanced = candidate?.balancedMinScore;
-		const delta =
-			typeof candidateBalanced === "number" ? candidateBalanced - activeBalanced : null;
 
-		const blocked = (reason: string): string => {
+		const a = active.config;
+		const c = candidate;
+		const changedFields: string[] = [];
+		if (c !== null) {
+			if (a.balancedMinScore !== c.balancedMinScore) changedFields.push("balancedMinScore");
+			if (a.freshnessWeight !== c.freshnessWeight) changedFields.push("freshnessWeight");
+			if (a.volumeWeight !== c.volumeWeight) changedFields.push("volumeWeight");
+		}
+		const activeScore = a.balancedMinScore * 1 + a.freshnessWeight * 10 + a.volumeWeight * 10;
+		const candidateScore =
+			c === null ? activeScore : c.balancedMinScore * 1 + c.freshnessWeight * 10 + c.volumeWeight * 10;
+		const delta = candidateScore - activeScore;
+		const decision: StrategyCompareDecision =
+			reviewResult?.compareDecision ?? "hold_review";
+		const reason =
+			reviewResult?.compareReason && reviewResult.compareReason.trim() !== "" ?
+				reviewResult.compareReason
+			:	(changedFields.length === 0 ? "no strategy changes" : `candidate changes: ${changedFields.join(", ")}`);
+		const confidence: "high" | "medium" =
+			(decision === "promote_candidate" && delta >= 10) ||
+			(decision === "keep_active" && delta === 0) ?
+				"high"
+			:	"medium";
+		const changedFieldsText = changedFields.length === 0 ? "none" : changedFields.join(", ");
+
+		const blocked = (): string => {
 			console.log("[strategy] auto promote run blocked", {
+				decision,
+				delta,
+				changedFields,
 				reason,
-				balancedMinScoreDelta: delta === null ? "unknown" : delta,
-				activeBalancedMinScore: activeBalanced,
-				candidateBalancedMinScore: candidateBalanced ?? "none",
+				confidence,
 			});
 			return `MO Strategy Auto Promote Run
 
 result: blocked
+decision: ${decision}
+delta: ${delta}
+changedFields: ${changedFieldsText}
 reason: ${reason}
+confidence: ${confidence}
+auto promote blocked: review decision is not promote_candidate
 decisionSource: ${decisionSource}
 at: ${at}`;
 		};
 
-		if (candidate === null) return blocked("candidate config not found");
-		if (reviewResult === null) return blocked("strategy_review_result not found");
-		if (reviewDecision === null) return blocked("strategy_review_decision not found");
-
-		// 安全條件 1) 必須是 real review
-		if (reviewResult.source !== "real") {
-			return blocked(`review_result.source is not real (source=${reviewResult.source ?? "unknown"})`);
-		}
-		// 安全條件 2) decision 必須是 auto_promote_candidate（v1 mapping）
-		if (reviewDecision.decision !== "auto_promote_candidate") {
-			// 補強可讀性：常見原因是沒有實質差異或 delta 不足
-			if (delta !== null && delta < 10) {
-				return blocked(
-					`balancedMinScore delta is ${delta}; auto promote requires delta >= 10 (active=${activeBalanced}, candidate=${candidateBalanced})`
-				);
-			}
-			return blocked(`decision is not auto_promote_candidate (decision=${reviewDecision.decision})`);
-		}
-		// 安全條件 3) demo override 必須為 off
-		if (demoOverride !== null) {
-			return blocked("demoOverride is on");
-		}
-
-		// 安全條件 4) diff 必須只包含 balancedMinScore
-		const a = active.config;
-		const c = candidate;
-		const diffs: string[] = [];
-		if (a.freshnessWeight !== c.freshnessWeight) diffs.push("freshnessWeight");
-		if (a.volumeWeight !== c.volumeWeight) diffs.push("volumeWeight");
-		if (a.simulationWeight !== c.simulationWeight) diffs.push("simulationWeight");
-		if (a.aggressiveMinScore !== c.aggressiveMinScore) diffs.push("aggressiveMinScore");
-		if (a.balancedMinScore !== c.balancedMinScore) diffs.push("balancedMinScore");
-		if (a.freshnessIdleThresholdMs !== c.freshnessIdleThresholdMs) diffs.push("freshnessIdleThresholdMs");
-
-		if (diffs.length !== 1 || diffs[0] !== "balancedMinScore") {
-			return blocked(
-				diffs.length === 0 ? "diff not found" : `diff must be balancedMinScore only (diff=${diffs.join(",")})`
-			);
-		}
-
-		// 安全條件 5) delta >= 10（candidate - active）
-		if (typeof a.balancedMinScore !== "number" || typeof c.balancedMinScore !== "number") {
-			return blocked("balancedMinScore is not a number");
-		}
-		const delta2 = c.balancedMinScore - a.balancedMinScore;
-		if (delta2 < 10) {
-			return blocked(
-				`balancedMinScore delta is ${delta2}; auto promote requires delta >= 10 (active=${a.balancedMinScore}, candidate=${c.balancedMinScore})`
-			);
-		}
+		if (candidate === null) return blocked();
+		if (reviewResult === null) return blocked();
+		if (decision !== "promote_candidate") return blocked();
 
 		console.log("[strategy] auto promote run conditions matched", {
-			field: "balancedMinScore",
-			delta: delta2,
+			delta,
+			changedFields,
 			compareDecision: reviewResult.compareDecision,
-			decision: reviewDecision.decision,
+			decision,
 		});
 
 		// promotion 寫入（沿用手動 promotion 的最小流程）
@@ -3617,6 +3596,11 @@ at: ${at}`;
 		return `MO Strategy Auto Promote Run
 
 result: promoted
+decision: ${decision}
+delta: ${delta}
+changedFields: ${changedFieldsText}
+reason: ${reason}
+confidence: ${confidence}
 decisionSource: auto
 promotedFrom: ${active.config.configVersion}
 promotedTo: ${promotedActive.configVersion}
