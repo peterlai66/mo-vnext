@@ -1,13 +1,63 @@
-const active = 60;
+/**
+ * @typedef {"promote_candidate" | "keep_active" | "hold_review"} Decision
+ */
+
+/**
+ * @typedef {{
+ *  balancedMinScore: number;
+ *  freshnessWeight: number;
+ *  volumeWeight: number;
+ * }} StrategyShape
+ */
+
+/**
+ * @typedef {{
+ *  active: StrategyShape;
+ *  candidate: StrategyShape;
+ *  expectedDecision: Decision;
+ * }} TestCase
+ */
+
+/**
+ * @param {StrategyShape} strategy
+ * @returns {number}
+ */
+function calcScore(strategy) {
+	return (
+		strategy.balancedMinScore * 1 +
+		strategy.freshnessWeight * 10 +
+		strategy.volumeWeight * 10
+	);
+}
+
+/** @type {TestCase[]} */
 const testCases = [
-	{ candidate: 50, expectedDecision: "hold_review" },
-	{ candidate: 60, expectedDecision: "keep_active" },
-	{ candidate: 65, expectedDecision: "hold_review" },
-	{ candidate: 70, expectedDecision: "promote_candidate" },
+	{
+		active: { balancedMinScore: 60, freshnessWeight: 1, volumeWeight: 1 },
+		candidate: { balancedMinScore: 50, freshnessWeight: 1, volumeWeight: 1 },
+		expectedDecision: "hold_review",
+	},
+	{
+		active: { balancedMinScore: 60, freshnessWeight: 1, volumeWeight: 1 },
+		candidate: { balancedMinScore: 60, freshnessWeight: 1, volumeWeight: 1 },
+		expectedDecision: "keep_active",
+	},
+	{
+		active: { balancedMinScore: 60, freshnessWeight: 1, volumeWeight: 1 },
+		candidate: { balancedMinScore: 65, freshnessWeight: 1, volumeWeight: 1 },
+		expectedDecision: "hold_review",
+	},
+	{
+		active: { balancedMinScore: 60, freshnessWeight: 1, volumeWeight: 1 },
+		candidate: { balancedMinScore: 60, freshnessWeight: 2, volumeWeight: 1 },
+		expectedDecision: "promote_candidate",
+	},
 ];
 
-const results = testCases.map(({ candidate, expectedDecision }) => {
-	const delta = candidate - active;
+const results = testCases.map(({ active, candidate, expectedDecision }) => {
+	const activeScore = calcScore(active);
+	const candidateScore = calcScore(candidate);
+	const delta = candidateScore - activeScore;
 	let decision;
 
 	if (delta >= 10) {
@@ -18,7 +68,15 @@ const results = testCases.map(({ candidate, expectedDecision }) => {
 		decision = "hold_review";
 	}
 
-	return { active, candidate, delta, decision, expectedDecision };
+	return {
+		active,
+		candidate,
+		activeScore,
+		candidateScore,
+		delta,
+		decision,
+		expectedDecision,
+	};
 });
 
 for (const item of results) {
