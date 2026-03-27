@@ -1,6 +1,9 @@
 /**
  * @typedef {"promote_candidate" | "keep_active" | "hold_review"} Decision
  */
+/**
+ * @typedef {"high" | "medium"} Confidence
+ */
 
 /**
  * @typedef {{
@@ -17,6 +20,7 @@
  *  expectedDecision: Decision;
  *  expectedChangedFields: Array<keyof StrategyShape>;
  *  expectedReason: string;
+ *  expectedConfidence: Confidence;
  * }} TestCase
  */
 
@@ -63,6 +67,57 @@ function buildReviewReason(changedFields) {
 	return `candidate changes: ${changedFields.join(", ")}`;
 }
 
+/**
+ * @param {Decision} decision
+ * @param {number} delta
+ * @returns {Confidence}
+ */
+function buildReviewConfidence(decision, delta) {
+	if (decision === "promote_candidate" && delta >= 10) return "high";
+	if (decision === "keep_active" && delta === 0) return "high";
+	return "medium";
+}
+
+/**
+ * @param {StrategyShape} active
+ * @param {StrategyShape} candidate
+ * @returns {{
+ *  activeScore: number;
+ *  candidateScore: number;
+ *  delta: number;
+ *  changedFields: Array<keyof StrategyShape>;
+ *  reason: string;
+ *  decision: Decision;
+ *  confidence: Confidence;
+ * }}
+ */
+function buildReviewResult(active, candidate) {
+	const activeScore = calcScore(active);
+	const candidateScore = calcScore(candidate);
+	const delta = candidateScore - activeScore;
+	const changedFields = compareStrategyFields(active, candidate);
+	const reason = buildReviewReason(changedFields);
+	/** @type {Decision} */
+	let decision;
+	if (delta >= 10) {
+		decision = "promote_candidate";
+	} else if (delta === 0) {
+		decision = "keep_active";
+	} else {
+		decision = "hold_review";
+	}
+	const confidence = buildReviewConfidence(decision, delta);
+	return {
+		activeScore,
+		candidateScore,
+		delta,
+		changedFields,
+		reason,
+		decision,
+		confidence,
+	};
+}
+
 /** @type {TestCase[]} */
 const testCases = [
 	{
@@ -71,6 +126,7 @@ const testCases = [
 		expectedDecision: "hold_review",
 		expectedChangedFields: ["balancedMinScore"],
 		expectedReason: "candidate changes: balancedMinScore",
+		expectedConfidence: "medium",
 	},
 	{
 		active: { balancedMinScore: 60, freshnessWeight: 1, volumeWeight: 1 },
@@ -78,6 +134,7 @@ const testCases = [
 		expectedDecision: "keep_active",
 		expectedChangedFields: [],
 		expectedReason: "no strategy changes",
+		expectedConfidence: "high",
 	},
 	{
 		active: { balancedMinScore: 60, freshnessWeight: 1, volumeWeight: 1 },
@@ -85,6 +142,7 @@ const testCases = [
 		expectedDecision: "hold_review",
 		expectedChangedFields: ["balancedMinScore"],
 		expectedReason: "candidate changes: balancedMinScore",
+		expectedConfidence: "medium",
 	},
 	{
 		active: { balancedMinScore: 60, freshnessWeight: 1, volumeWeight: 1 },
@@ -92,6 +150,7 @@ const testCases = [
 		expectedDecision: "promote_candidate",
 		expectedChangedFields: ["freshnessWeight"],
 		expectedReason: "candidate changes: freshnessWeight",
+		expectedConfidence: "high",
 	},
 ];
 
@@ -102,34 +161,18 @@ const results = testCases.map(
 		expectedDecision,
 		expectedChangedFields,
 		expectedReason,
+		expectedConfidence,
 	}) => {
-	const activeScore = calcScore(active);
-	const candidateScore = calcScore(candidate);
-	const delta = candidateScore - activeScore;
-	const changedFields = compareStrategyFields(active, candidate);
-	const reason = buildReviewReason(changedFields);
-	let decision;
-
-	if (delta >= 10) {
-		decision = "promote_candidate";
-	} else if (delta === 0) {
-		decision = "keep_active";
-	} else {
-		decision = "hold_review";
-	}
+	const reviewResult = buildReviewResult(active, candidate);
 
 	return {
 		active,
 		candidate,
-		activeScore,
-		candidateScore,
-		delta,
-		changedFields,
-		expectedChangedFields,
-		reason,
-		expectedReason,
-		decision,
+		reviewResult,
 		expectedDecision,
+		expectedChangedFields,
+		expectedReason,
+		expectedConfidence,
 	};
 	}
 );
@@ -142,12 +185,15 @@ let passCount = 0;
 let failCount = 0;
 for (const item of results) {
 	const fieldsMatch =
-		item.changedFields.length === item.expectedChangedFields.length &&
-		item.changedFields.every((field, index) => field === item.expectedChangedFields[index]);
-	const reasonMatch = item.reason === item.expectedReason;
-	const decisionMatch = item.decision === item.expectedDecision;
+		item.reviewResult.changedFields.length === item.expectedChangedFields.length &&
+		item.reviewResult.changedFields.every(
+			(field, index) => field === item.expectedChangedFields[index]
+		);
+	const reasonMatch = item.reviewResult.reason === item.expectedReason;
+	const decisionMatch = item.reviewResult.decision === item.expectedDecision;
+	const confidenceMatch = item.reviewResult.confidence === item.expectedConfidence;
 
-	if (!decisionMatch || !fieldsMatch || !reasonMatch) {
+	if (!decisionMatch || !fieldsMatch || !reasonMatch || !confidenceMatch) {
 		console.error("❌ mismatch", item);
 		failCount += 1;
 	} else {
@@ -157,9 +203,9 @@ for (const item of results) {
 
 const summary = results.reduce(
 	(acc, item) => {
-		if (item.decision === "promote_candidate") acc.promote += 1;
-		if (item.decision === "hold_review") acc.hold += 1;
-		if (item.decision === "keep_active") acc.keep += 1;
+		if (item.reviewResult.decision === "promote_candidate") acc.promote += 1;
+		if (item.reviewResult.decision === "hold_review") acc.hold += 1;
+		if (item.reviewResult.decision === "keep_active") acc.keep += 1;
 		return acc;
 	},
 	{ total: results.length, promote: 0, hold: 0, keep: 0 }
