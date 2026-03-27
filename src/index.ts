@@ -4,6 +4,11 @@ import {
 	shouldRefreshStrategyReviewKv,
 	STRATEGY_AUTO_PROMOTE_CONFIRM_REQUIRED,
 	STRATEGY_AUTO_PROMOTE_COOLDOWN_MS,
+	MO_LIVE_SOURCE_TWSE_MI_INDEX,
+	getTaipeiYYYYMMDDMinusDaysFromToday,
+	deriveMoLiveCycleStatus,
+	summarizeTwseMiIndexPayload,
+	isTwseMiIndexPayloadOk,
 } from "../scripts/dev-check.js";
 
 interface KVListKey {
@@ -2724,6 +2729,146 @@ async function getSystemStatus(env: Env, userId: string): Promise<SystemStatus> 
 	};
 }
 
+type MoLiveCycleStatus = "success" | "partial" | "fetch_failed" | "waiting_data";
+
+type MoLiveCycleResult = {
+	ok: boolean;
+	tradeDate: string;
+	source: string;
+	fetched: boolean;
+	dbWrite: boolean;
+	cycleStatus: MoLiveCycleStatus;
+	note: string;
+};
+
+function truncateUtf16ForMoLive(s: string, max: number): string {
+	if (s.length <= max) return s;
+	return `${s.slice(0, max)}…(truncated)`;
+}
+
+async function ensureMoLiveMarketSnapshotsTable(env: Env): Promise<void> {
+	await env.MO_DB.prepare(
+		`CREATE TABLE IF NOT EXISTS mo_live_market_snapshots (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			trade_date TEXT NOT NULL,
+			source TEXT NOT NULL,
+			payload_summary TEXT NOT NULL,
+			raw_payload TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		)`
+	).run();
+}
+
+async function executeMoLiveDataCycle(env: Env): Promise<MoLiveCycleResult> {
+	const source = MO_LIVE_SOURCE_TWSE_MI_INDEX;
+	try {
+		await ensureMoLiveMarketSnapshotsTable(env);
+	} catch (err: unknown) {
+		const message = err instanceof Error ? err.message : String(err);
+		return {
+			ok: false,
+			tradeDate: "",
+			source,
+			fetched: false,
+			dbWrite: false,
+			cycleStatus: "fetch_failed",
+			note: `d1 schema: ${message}`,
+		};
+	}
+
+	let jsonSeen = false;
+	let lastNote = "";
+	let tradeDate = "";
+	let parsed: unknown = null;
+	let rawText = "";
+	let fetched = false;
+
+	for (let i = 0; i < 14; i++) {
+		const td = getTaipeiYYYYMMDDMinusDaysFromToday(i);
+		const url =
+			`https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date=${td}&selectType=MS&response=json`;
+		try {
+			const res = await fetch(url, {
+				headers: {
+					"User-Agent": "Mozilla/5.0 (compatible; MO-vNext/1.0)",
+				},
+			});
+			if (!res.ok) {
+				lastNote = `http ${String(res.status)} for ${td}`;
+				continue;
+			}
+			const text = await res.text();
+			rawText = text;
+			let j: unknown;
+			try {
+				j = JSON.parse(text) as unknown;
+			} catch {
+				lastNote = `json parse failed for ${td}`;
+				continue;
+			}
+			jsonSeen = true;
+			if (isTwseMiIndexPayloadOk(j)) {
+				tradeDate = td;
+				parsed = j;
+				fetched = true;
+				break;
+			}
+			lastNote = `stat not OK or empty tables for ${td}`;
+		} catch (err: unknown) {
+			lastNote = err instanceof Error ? err.message : String(err);
+		}
+	}
+
+	if (!fetched) {
+		const noTrading = jsonSeen;
+		const cycleStatus = deriveMoLiveCycleStatus(
+			false,
+			false,
+			noTrading ? { noTradingDataInWindow: true } : undefined
+		);
+		return {
+			ok: false,
+			tradeDate: "",
+			source,
+			fetched: false,
+			dbWrite: false,
+			cycleStatus,
+			note: lastNote || "no MI_INDEX in lookback",
+		};
+	}
+
+	const summary = summarizeTwseMiIndexPayload(parsed);
+	const createdAt = new Date().toISOString();
+	const rawStore = truncateUtf16ForMoLive(rawText, 12000);
+	let dbWrite = false;
+	let dbNote = "";
+	try {
+		await env.MO_DB
+			.prepare(
+				`INSERT INTO mo_live_market_snapshots (trade_date, source, payload_summary, raw_payload, created_at)
+				 VALUES (?, ?, ?, ?, ?)`
+			)
+			.bind(tradeDate, source, summary, rawStore, createdAt)
+			.run();
+		dbWrite = true;
+	} catch (err: unknown) {
+		dbNote = err instanceof Error ? err.message : String(err);
+	}
+
+	const cycleStatus = deriveMoLiveCycleStatus(true, dbWrite);
+	const ok = cycleStatus === "success" || cycleStatus === "partial";
+	const note = dbWrite ? "TWSE MI_INDEX fetched and stored" : `fetch ok; db: ${dbNote}`;
+	return {
+		ok,
+		tradeDate,
+		source,
+		fetched: true,
+		dbWrite,
+		cycleStatus,
+		note,
+	};
+}
+
 async function handleCommand(
 	command: string | null,
 	messageText: string,
@@ -4721,6 +4866,29 @@ async function getReplyText(
 		debugLog(env, "[fetch] hit");
 		debugLog(env, "[fetch] path", new URL(request.url).pathname);
 		const url = new URL(request.url);
+
+		if (url.pathname === "/admin/run" && request.method === "GET") {
+			try {
+				const result = await executeMoLiveDataCycle(env);
+				return new Response(JSON.stringify(result), {
+					headers: { "Content-Type": "application/json" },
+				});
+			} catch (err: unknown) {
+				const message = err instanceof Error ? err.message : String(err);
+				return new Response(
+					JSON.stringify({
+						ok: false,
+						tradeDate: "",
+						source: MO_LIVE_SOURCE_TWSE_MI_INDEX,
+						fetched: false,
+						dbWrite: false,
+						cycleStatus: "fetch_failed",
+						note: message,
+					}),
+					{ status: 500, headers: { "Content-Type": "application/json" } }
+				);
+			}
+		}
 
 		if (url.pathname === "/admin/strategy/test-auto-promote") {
 			console.log("[strategy] admin strategy test start");

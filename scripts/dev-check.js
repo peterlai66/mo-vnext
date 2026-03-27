@@ -318,6 +318,93 @@ function shouldRefreshStrategyReviewKv(existingResult, activeVersion, candidateV
 	return false;
 }
 
+/** TWSE 大盤 MI_INDEX（與 Worker /admin/run 一致） */
+const MO_LIVE_SOURCE_TWSE_MI_INDEX = "TWSE_MI_INDEX";
+
+/**
+ * 台北日曆往回推 daysAgo 天，回傳 YYYYMMDD（與 /admin/run 相同算法）。
+ * @param {number} daysAgo
+ * @returns {string}
+ */
+function getTaipeiYYYYMMDDMinusDaysFromToday(daysAgo) {
+	const parts = new Intl.DateTimeFormat("en-US", {
+		timeZone: "Asia/Taipei",
+		year: "numeric",
+		month: "numeric",
+		day: "numeric",
+	}).formatToParts(new Date());
+	const y = Number(parts.find((p) => p.type === "year")?.value ?? "1970");
+	const m = Number(parts.find((p) => p.type === "month")?.value ?? "1");
+	const d = Number(parts.find((p) => p.type === "day")?.value ?? "1");
+	const dt = new Date(Date.UTC(y, m - 1, d));
+	dt.setUTCDate(dt.getUTCDate() - daysAgo);
+	const yy = dt.getUTCFullYear();
+	const mm = String(dt.getUTCMonth() + 1).padStart(2, "0");
+	const dd = String(dt.getUTCDate()).padStart(2, "0");
+	return `${yy}${mm}${dd}`;
+}
+
+/**
+ * @param {unknown} parsed
+ * @returns {boolean}
+ */
+function isTwseMiIndexPayloadOk(parsed) {
+	if (typeof parsed !== "object" || parsed === null) return false;
+	const obj = /** @type {Record<string, unknown>} */ (parsed);
+	if (!("stat" in obj)) return false;
+	if (String(obj.stat).toUpperCase() !== "OK") return false;
+	const tables = obj.tables;
+	if (!Array.isArray(tables)) return false;
+	for (let i = 0; i < tables.length; i++) {
+		const t = tables[i];
+		if (typeof t === "object" && t !== null) {
+			const row = /** @type {Record<string, unknown>} */ (t);
+			if ("data" in row && Array.isArray(row.data) && row.data.length > 0) return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * @param {unknown} parsed
+ * @returns {string}
+ */
+function summarizeTwseMiIndexPayload(parsed) {
+	if (typeof parsed !== "object" || parsed === null) return "invalid";
+	const obj = /** @type {Record<string, unknown>} */ (parsed);
+	const stat = "stat" in obj ? String(obj.stat) : "";
+	const date = "date" in obj ? String(obj.date) : "";
+	let tableRows = 0;
+	if ("tables" in obj && Array.isArray(obj.tables)) {
+		for (const t of obj.tables) {
+			if (
+				typeof t === "object" &&
+				t !== null &&
+				"data" in t &&
+				Array.isArray(/** @type {Record<string, unknown>} */ (t).data)
+			) {
+				tableRows += /** @type {unknown[]} */ (/** @type {Record<string, unknown>} */ (t).data).length;
+			}
+		}
+	}
+	return `stat=${stat};date=${date};tableDataRows=${tableRows}`;
+}
+
+/**
+ * @param {boolean} fetched
+ * @param {boolean} dbWrite
+ * @param {{ noTradingDataInWindow?: boolean }} [options]
+ * @returns {"success" | "partial" | "fetch_failed" | "waiting_data"}
+ */
+function deriveMoLiveCycleStatus(fetched, dbWrite, options) {
+	if (!fetched) {
+		if (options && options.noTradingDataInWindow) return "waiting_data";
+		return "fetch_failed";
+	}
+	if (!dbWrite) return "partial";
+	return "success";
+}
+
 /**
  * @typedef {{
  *  active: StrategyShape;
@@ -441,6 +528,38 @@ function runDevCheckMain() {
 	);
 
 	console.log(summary);
+
+	function runMoLiveCycleDevChecks() {
+		console.log("[mo-live] dev-check helpers");
+		const td0 = getTaipeiYYYYMMDDMinusDaysFromToday(0);
+		if (!/^\d{8}$/.test(td0)) {
+			throw new Error(`[mo-live] invalid YYYYMMDD: ${td0}`);
+		}
+		if (deriveMoLiveCycleStatus(true, true) !== "success") {
+			throw new Error("[mo-live] derive success");
+		}
+		if (deriveMoLiveCycleStatus(true, false) !== "partial") {
+			throw new Error("[mo-live] derive partial");
+		}
+		if (deriveMoLiveCycleStatus(false, false) !== "fetch_failed") {
+			throw new Error("[mo-live] derive fetch_failed");
+		}
+		if (deriveMoLiveCycleStatus(false, false, { noTradingDataInWindow: true }) !== "waiting_data") {
+			throw new Error("[mo-live] derive waiting_data");
+		}
+		const sample = { stat: "OK", tables: [{ data: [["row"]] }] };
+		if (!isTwseMiIndexPayloadOk(sample)) {
+			throw new Error("[mo-live] isTwseMiIndexPayloadOk");
+		}
+		const sum = summarizeTwseMiIndexPayload(sample);
+		if (!sum.includes("stat=OK")) {
+			throw new Error(`[mo-live] summarize: ${sum}`);
+		}
+		console.log("[mo-live] dev-check ok", { tradeDate: td0, cycleStatus: "success" });
+	}
+
+	runMoLiveCycleDevChecks();
+	passCount += 1;
 
 	let guardState = /** @type {PromoteGuardState} */ ({ confirmCount: 0 });
 	const t0 = 1_700_000_000_000;
@@ -613,6 +732,11 @@ module.exports = {
 	STRATEGY_AUTO_PROMOTE_CONFIRM_REQUIRED,
 	STRATEGY_AUTO_PROMOTE_COOLDOWN_MS,
 	normalizeStrategyConfigForCore,
+	MO_LIVE_SOURCE_TWSE_MI_INDEX,
+	getTaipeiYYYYMMDDMinusDaysFromToday,
+	deriveMoLiveCycleStatus,
+	summarizeTwseMiIndexPayload,
+	isTwseMiIndexPayloadOk,
 };
 
 if (
