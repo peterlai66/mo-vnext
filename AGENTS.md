@@ -26,6 +26,10 @@
 - Existing commands must not break when adding new commands
 - Non-command text should keep current expected behavior unless requested otherwise
 
+## Strategy validation rules
+- 當修改 strategy 相關邏輯（包含 review / decision / auto promote / status readiness）後，必須先執行 `npm run dev:check`
+- 回報結果時，需附上 `dev:check` 輸出摘要（至少包含 total / promote / hold / keep）
+
 ## Git rules
 - **Commit message 必須使用中文**（標題與內文；建議繁體中文）
 - 使用 **Conventional Commits**：`type` 為英文（`feat`、`fix`、`chore`、`refactor` 等），**說明為中文**，格式如 `feat(scope): 說明` 或 `chore: 說明`

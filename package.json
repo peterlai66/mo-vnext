@@ -6,6 +6,8 @@
 		"deploy": "wrangler deploy",
 		"dev": "wrangler dev",
 		"start": "wrangler dev",
+		"dev:check": "node scripts/dev-check.js",
+		"check:strategy": "npm run dev:check",
 		"test": "vitest",
 		"cf-typegen": "wrangler types",
 		"ac": "git add . && sh -c 'git commit -m \"${1:-chore: 提交變更}\"' --",
