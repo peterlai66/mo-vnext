@@ -2059,11 +2059,25 @@ async function runStrategyReview(params: {
 	const state = await readStrategyReviewState(params.env);
 
 	if (candidate === null || state === null) {
+		console.log("[strategy] review safe fallback triggered", {
+			activeConfigVersion: active.config.configVersion,
+			candidateConfigVersion: candidate?.configVersion ?? state?.candidateConfigVersion ?? "none",
+			reason: "review result not ready",
+		});
 		return {
 			comparedAt: "",
 			compareDecision: "hold_review",
-			compareReason: "skipped: candidate_strategy_config 或 strategy_review_state 不存在",
+			compareReason: "review result not ready",
 			finalDecision: "hold_review",
+			reviewResult: {
+				activeScore: 0,
+				candidateScore: 0,
+				delta: 0,
+				changedFields: [],
+				reason: "review result not ready",
+				decision: "hold_review",
+				confidence: "medium",
+			},
 		};
 	}
 
@@ -2885,15 +2899,33 @@ compareReason: ${r.compareReason}`;
 			source: "real",
 			allowDemoOverride: false,
 		});
+		const rr =
+			r.reviewResult ??
+			{
+				activeScore: 0,
+				candidateScore: 0,
+				delta: 0,
+				changedFields: [],
+				reason: "review result not ready",
+				decision: "hold_review" as StrategyCompareDecision,
+				confidence: "medium" as const,
+			};
+		if (!r.reviewResult) {
+			console.log("[strategy] review safe fallback triggered", {
+				activeConfigVersion: "unknown",
+				candidateConfigVersion: "unknown",
+				reason: "review result not ready",
+			});
+		}
 
 		// 只做提示：不自動 promotion；在 review 回覆中明確告知 auto promote 條件是否達成
 		let autoPromoteHintBlock = "";
 		try {
 			const demoOverride = await readStrategyReviewDemoOverride(env);
-			const delta = r.reviewResult.delta;
+			const delta = rr.delta;
 			const source = "real";
-			const finalDecision: StrategyCompareDecision = r.reviewResult.decision;
-			const changedFields = r.reviewResult.changedFields;
+			const finalDecision: StrategyCompareDecision = rr.decision;
+			const changedFields = rr.changedFields;
 
 			const autoPromoteEligible =
 				source === "real" &&
@@ -2930,13 +2962,13 @@ source: real
 comparedAt: ${r.comparedAt}
 compareDecision: ${r.compareDecision}
 compareReason: ${r.compareReason}
-activeScore: ${r.reviewResult.activeScore}
-candidateScore: ${r.reviewResult.candidateScore}
-delta: ${r.reviewResult.delta}
-changedFields: ${r.reviewResult.changedFields.length === 0 ? "none" : r.reviewResult.changedFields.join(", ")}
-reason: ${r.reviewResult.reason}
-decision: ${r.reviewResult.decision}
-confidence: ${r.reviewResult.confidence}${autoPromoteHintBlock}`;
+activeScore: ${rr.activeScore}
+candidateScore: ${rr.candidateScore}
+delta: ${rr.delta}
+changedFields: ${rr.changedFields.length === 0 ? "none" : rr.changedFields.join(", ")}
+reason: ${rr.reason}
+decision: ${rr.decision}
+confidence: ${rr.confidence}${autoPromoteHintBlock}`;
 	  }
 	  case "/strategy-review-decision": {
 		const d = await readStrategyReviewDecision(env);
