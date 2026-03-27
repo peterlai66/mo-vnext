@@ -16,9 +16,9 @@ import {
 	buildActionText as moReportActionLine,
 	getMoLiveCycleStatusFromSnapshotRead,
 	formatDisplayDateFromYyyymmdd,
-	buildMoUpdatePushMessage,
-	fingerprintMoPushContent,
-	evaluateMoPushDecision,
+	evaluateMoPushEventDecision,
+	MO_PUSH_COOLDOWN_MS_DEFAULT,
+	MO_PUSH_COOLDOWN_MS_P3_ONLY,
 } from "../scripts/dev-check.js";
 
 interface KVListKey {
@@ -81,8 +81,10 @@ export interface Env {
 	MO_NOTES: KVNamespace;
 	MO_DB: D1Database;
 	OPENAI_API_KEY: string;
-	LINE_MODE?: "normal" | "reply_only";
+	LINE_MODE?: "normal" | "reply_only" | "push_enabled";
 	DEBUG_LOG?: string;
+	/** 僅測試用：非空時覆寫 /report 與 push 決策用的 actionLine（未設定則維持 buildActionText(score)） */
+	MO_FORCE_REPORT_ACTION_LINE?: string;
 }
 
 function isDebugLogEnabled(env: Env): boolean {
@@ -253,8 +255,8 @@ const MO_USER_KV_PREFIX = {
 	moPushAudit: "mo_push_audit",
 } as const;
 
-/** 正式 strategy notify：兩次推播嘗試最短間隔（毫秒） */
-const STRATEGY_NOTIFY_COOLDOWN_MS = 10 * 60 * 1000;
+/** 正式 strategy notify：兩次推播嘗試最短間隔（毫秒）；與 dev-check MO_PUSH_COOLDOWN_MS_DEFAULT 一致 */
+const STRATEGY_NOTIFY_COOLDOWN_MS = MO_PUSH_COOLDOWN_MS_DEFAULT;
 
 /** notify 併發鎖租約（毫秒）；應涵蓋 push 往返時間，逾時由 KV expiration 回收 */
 const STRATEGY_NOTIFY_LOCK_LEASE_MS = 3 * 60 * 1000;
@@ -262,6 +264,8 @@ const STRATEGY_NOTIFY_LOCK_LEASE_MS = 3 * 60 * 1000;
 type StrategyNotifyGateRecord = {
 	lastNotifyMessage: string;
 	lastNotifyAt: number;
+	/** 數字愈小愈高優先（與 MO_PUSH_PRIORITY 一致） */
+	lastNotifyPriority?: number;
 };
 
 function getStrategyNotifyGateKey(userId: string): string {
@@ -312,9 +316,19 @@ function parseStrategyNotifyGateRecord(raw: string): StrategyNotifyGateRecord | 
 		) {
 			return null;
 		}
+		let lastNotifyPriority: number | undefined;
+		if (
+			"lastNotifyPriority" in parsed &&
+			typeof (parsed as Record<string, unknown>).lastNotifyPriority === "number" &&
+			Number.isFinite((parsed as Record<string, unknown>).lastNotifyPriority as number)
+		) {
+			lastNotifyPriority = (parsed as Record<string, unknown>)
+				.lastNotifyPriority as number;
+		}
 		return {
 			lastNotifyMessage: parsed.lastNotifyMessage,
 			lastNotifyAt: parsed.lastNotifyAt,
+			...(lastNotifyPriority !== undefined ? { lastNotifyPriority } : {}),
 		};
 	} catch {
 		return null;
@@ -427,12 +441,14 @@ async function recordStrategyNotifyGateAttempt(
 	env: Env,
 	userId: string,
 	message: string,
-	atMs: number
+	atMs: number,
+	notifyPriority?: number
 ): Promise<void> {
 	try {
 		const rec: StrategyNotifyGateRecord = {
 			lastNotifyMessage: message,
 			lastNotifyAt: atMs,
+			...(notifyPriority !== undefined ? { lastNotifyPriority: notifyPriority } : {}),
 		};
 		await env.MO_NOTES.put(
 			getStrategyNotifyGateKey(userId),
@@ -545,20 +561,27 @@ function parseStrategyNotifyStatusRecord(raw: string): StrategyNotifyStatusRecor
 
 type MoPushEvaluationResult = {
 	shouldNotify: boolean;
-	pushType: "mo_update";
+	triggeredEvents: Array<{ type: string; summary: string }>;
+	primaryPushType: string | null;
+	pushPriority: number | null;
 	pushReason: string;
 	pushResult: string;
 	pushMessage: string;
+	mergedMessage: string;
 	cooldownRemainingMs: number | null;
+	fingerprint: string;
 	comparedState: {
 		fingerprint: string;
 		marketLine: string;
 		actionLine: string;
+		currentPromoteKey: string;
 	};
 };
 
 type MoPushAuditRecord = {
-	lastPushType: "mo_update";
+	lastPushType: string;
+	lastPushEventsSummary: string;
+	lastPushPriority: number | null;
 	lastPushResult: string;
 	lastPushReason: string;
 	lastPushAt: string;
@@ -567,6 +590,9 @@ type MoPushAuditRecord = {
 	cooldownRemainingMs: number | null;
 	lastPushedFingerprint: string | null;
 	comparedFingerprint: string;
+	lastEvaluatedMarketLine: string | null;
+	lastEvaluatedActionLine: string | null;
+	lastEvaluatedPromoteKey: string | null;
 };
 
 function getMoPushAuditKey(userId: string): string {
@@ -583,7 +609,7 @@ function parseMoPushAuditRecord(raw: string): MoPushAuditRecord | null {
 		const parsed: unknown = JSON.parse(raw);
 		if (typeof parsed !== "object" || parsed === null) return null;
 		const o = parsed as Record<string, unknown>;
-		if (o.lastPushType !== "mo_update") return null;
+		if (typeof o.lastPushType !== "string") return null;
 		if (typeof o.lastPushResult !== "string") return null;
 		if (typeof o.lastPushReason !== "string") return null;
 		if (typeof o.lastPushAt !== "string") return null;
@@ -599,8 +625,48 @@ function parseMoPushAuditRecord(raw: string): MoPushAuditRecord | null {
 			return null;
 		}
 		if (typeof o.comparedFingerprint !== "string") return null;
+		let lastPushEventsSummary = "";
+		if (typeof o.lastPushEventsSummary === "string") {
+			lastPushEventsSummary = o.lastPushEventsSummary;
+		}
+		let lastPushPriority: number | null = null;
+		if ("lastPushPriority" in o && o.lastPushPriority !== undefined) {
+			if (o.lastPushPriority === null) {
+				lastPushPriority = null;
+			} else if (
+				typeof o.lastPushPriority === "number" &&
+				Number.isFinite(o.lastPushPriority)
+			) {
+				lastPushPriority = o.lastPushPriority;
+			} else {
+				return null;
+			}
+		}
+		let lastEvaluatedMarketLine: string | null = null;
+		if ("lastEvaluatedMarketLine" in o) {
+			if (o.lastEvaluatedMarketLine === null) lastEvaluatedMarketLine = null;
+			else if (typeof o.lastEvaluatedMarketLine === "string") {
+				lastEvaluatedMarketLine = o.lastEvaluatedMarketLine;
+			} else return null;
+		}
+		let lastEvaluatedActionLine: string | null = null;
+		if ("lastEvaluatedActionLine" in o) {
+			if (o.lastEvaluatedActionLine === null) lastEvaluatedActionLine = null;
+			else if (typeof o.lastEvaluatedActionLine === "string") {
+				lastEvaluatedActionLine = o.lastEvaluatedActionLine;
+			} else return null;
+		}
+		let lastEvaluatedPromoteKey: string | null = null;
+		if ("lastEvaluatedPromoteKey" in o) {
+			if (o.lastEvaluatedPromoteKey === null) lastEvaluatedPromoteKey = null;
+			else if (typeof o.lastEvaluatedPromoteKey === "string") {
+				lastEvaluatedPromoteKey = o.lastEvaluatedPromoteKey;
+			} else return null;
+		}
 		return {
-			lastPushType: "mo_update",
+			lastPushType: o.lastPushType,
+			lastPushEventsSummary,
+			lastPushPriority,
 			lastPushResult: o.lastPushResult,
 			lastPushReason: o.lastPushReason,
 			lastPushAt: o.lastPushAt,
@@ -609,6 +675,9 @@ function parseMoPushAuditRecord(raw: string): MoPushAuditRecord | null {
 			cooldownRemainingMs: o.cooldownRemainingMs === null ? null : o.cooldownRemainingMs,
 			lastPushedFingerprint: o.lastPushedFingerprint === null ? null : o.lastPushedFingerprint,
 			comparedFingerprint: o.comparedFingerprint,
+			lastEvaluatedMarketLine,
+			lastEvaluatedActionLine,
+			lastEvaluatedPromoteKey,
 		};
 	} catch {
 		return null;
@@ -636,10 +705,37 @@ function moPushAuditFromEvaluation(
 		snapshotTimeIso: string;
 		messagePreview: string;
 		lastPushResultOverride?: string;
+		lastPushTypeOverride?: string | null;
+		lastEvaluatedSnapshot?: {
+			marketLine: string;
+			actionLine: string;
+			promoteKey: string;
+		} | null;
+		previousAudit: MoPushAuditRecord | null;
 	}
 ): MoPushAuditRecord {
+	const primary =
+		params.lastPushTypeOverride ??
+		(evaluation.primaryPushType === null ? "none" : evaluation.primaryPushType);
+	const eventsSummary = evaluation.triggeredEvents.map((e) => e.type).join(",");
+	const evSnap = params.lastEvaluatedSnapshot;
+	const prev = params.previousAudit;
+	const lastEvaluatedMarketLine =
+		evSnap !== undefined && evSnap !== null ? evSnap.marketLine
+		: prev !== null ? prev.lastEvaluatedMarketLine
+		: null;
+	const lastEvaluatedActionLine =
+		evSnap !== undefined && evSnap !== null ? evSnap.actionLine
+		: prev !== null ? prev.lastEvaluatedActionLine
+		: null;
+	const lastEvaluatedPromoteKey =
+		evSnap !== undefined && evSnap !== null ? evSnap.promoteKey
+		: prev !== null ? prev.lastEvaluatedPromoteKey
+		: null;
 	return {
-		lastPushType: "mo_update",
+		lastPushType: primary,
+		lastPushEventsSummary: eventsSummary,
+		lastPushPriority: evaluation.pushPriority,
 		lastPushResult: params.lastPushResultOverride ?? evaluation.pushResult,
 		lastPushReason: evaluation.pushReason,
 		lastPushAt: params.snapshotTimeIso,
@@ -648,6 +744,9 @@ function moPushAuditFromEvaluation(
 		cooldownRemainingMs: evaluation.cooldownRemainingMs,
 		lastPushedFingerprint: params.lastPushedFingerprint,
 		comparedFingerprint: evaluation.comparedState.fingerprint,
+		lastEvaluatedMarketLine,
+		lastEvaluatedActionLine,
+		lastEvaluatedPromoteKey,
 	};
 }
 
@@ -793,6 +892,47 @@ function parseLastPushNotifyRecord(raw: string): LastPushNotifyRecord | null {
 }
 
 /** 將 push 結果寫入 KV（與 decision 相同命名空間），供 /status 跨 isolate 讀取 */
+function moPushEventPriorityForDisplay(t: string): number {
+	if (t === "strategy_promoted") return 1;
+	if (t === "report_action_changed") return 2;
+	if (t === "market_status_changed") return 3;
+	return 99;
+}
+
+/** 由 v2 fingerprint 還原主要事件型別（與 dev-check primary 規則一致） */
+function derivePrimaryMoPushTypeFromV2Fingerprint(fp: string): string | null {
+	if (!fp.startsWith("v2|")) return null;
+	const second = fp.split("|")[1];
+	if (second === undefined || second === "") return null;
+	const types = second.split(",").filter((x) => x !== "");
+	if (types.length === 0) return null;
+	let best = types[0];
+	let bestP = moPushEventPriorityForDisplay(best);
+	for (const t of types) {
+		const p = moPushEventPriorityForDisplay(t);
+		if (p < bestP) {
+			best = t;
+			bestP = p;
+		}
+	}
+	return best;
+}
+
+function eventSummaryFromV2Fingerprint(fp: string): string | null {
+	if (!fp.startsWith("v2|")) return null;
+	const second = fp.split("|")[1];
+	return second === undefined ? null : second;
+}
+
+/** 舊版 KV（mo_update / 舊 reason / 非 v2 fingerprint）在顯示時需正規化，避免 /status 仍像走舊 decision */
+function isLegacyMoPushAuditSnapshot(rec: MoPushAuditRecord): boolean {
+	return (
+		rec.lastPushType === "mo_update" ||
+		rec.lastPushReason === "market_or_action_changed" ||
+		!rec.comparedFingerprint.startsWith("v2|")
+	);
+}
+
 async function recordLinePushOutcomeForStatus(
 	env: Env,
 	userId: string,
@@ -823,7 +963,8 @@ async function formatLastPushStatusBlock(
 	env: Env,
 	userId: string
 ): Promise<string> {
-	const lineMode = env.LINE_MODE === "reply_only" ? "reply_only" : "normal";
+	const lineMode =
+		env.LINE_MODE === undefined || env.LINE_MODE === "" ? "normal" : env.LINE_MODE;
 	if (!hasMoStatusUserId(userId)) {
 		return [
 			`lineMode: ${lineMode}`,
@@ -879,11 +1020,45 @@ async function formatLastPushStatusBlock(
 	if (moAudit === null) {
 		lines.push("moPushAudit: none");
 	} else {
-		lines.push(`moPushType: ${moAudit.lastPushType}`);
+		let displayType = moAudit.lastPushType;
+		let displayReason = moAudit.lastPushReason;
+		let displayEvents = moAudit.lastPushEventsSummary;
+		let displayPriority = moAudit.lastPushPriority;
+		if (isLegacyMoPushAuditSnapshot(moAudit)) {
+			const fromFp = derivePrimaryMoPushTypeFromV2Fingerprint(moAudit.comparedFingerprint);
+			const evFromFp = eventSummaryFromV2Fingerprint(moAudit.comparedFingerprint);
+			if (fromFp !== null) {
+				displayType = fromFp;
+			} else if (moAudit.lastPushType === "mo_update") {
+				displayType = "legacy_unmigrated";
+			}
+			if (evFromFp !== null && displayEvents.trim() === "") {
+				displayEvents = evFromFp;
+			}
+			if (displayPriority === null && fromFp !== null) {
+				displayPriority = moPushEventPriorityForDisplay(fromFp);
+			}
+			if (moAudit.lastPushReason === "market_or_action_changed") {
+				displayReason =
+					"legacy_market_or_action_changed（已停用；事件型紀錄將於下次 /report 或推播寫入後更新）";
+			}
+		}
+		lines.push(`moPushType: ${displayType}`);
+		if (displayEvents.trim() !== "") {
+			lines.push(`moPushEvents: ${displayEvents.replace(/\s+/gu, " ").trim()}`);
+		}
+		if (displayPriority !== null) {
+			lines.push(`moPushPriority: ${String(displayPriority)}`);
+		}
 		lines.push(`moPushResult: ${moAudit.lastPushResult}`);
-		lines.push(`moPushReason: ${moAudit.lastPushReason}`);
+		lines.push(`moPushReason: ${displayReason}`);
 		lines.push(`moPushAt: ${moAudit.lastPushAt}`);
 		lines.push(`moPushDryRun: ${moAudit.lastPushDryRun ? "yes" : "no"}`);
+		const fpOne = moAudit.comparedFingerprint.replace(/\s+/gu, " ").trim();
+		if (fpOne !== "") {
+			const fpShow = fpOne.length > 160 ? `${fpOne.slice(0, 160)}…` : fpOne;
+			lines.push(`moPushFingerprint: ${fpShow}`);
+		}
 		if (moAudit.cooldownRemainingMs !== null) {
 			lines.push(`moPushCooldownRemainingMs: ${String(moAudit.cooldownRemainingMs)}`);
 		}
@@ -891,6 +1066,15 @@ async function formatLastPushStatusBlock(
 			const previewOneLine = moAudit.lastPushMessagePreview.replace(/\s+/gu, " ").trim();
 			lines.push(`moPushPreview: ${previewOneLine}`);
 		}
+	}
+	if (
+		lineMode === "reply_only" &&
+		n !== null &&
+		n.lastNotifyResult === "success"
+	) {
+		lines.push(
+			"pushModeNote: reply_only 與 lastNotifyResult=success 並存異常，請確認 LINE_MODE 是否曾變更"
+		);
 	}
 	return lines.join("\n");
 }
@@ -3059,6 +3243,9 @@ async function computeMoPushEvaluationForUser(
 	actionLine: string;
 	moMessage: string;
 	fingerprint: string;
+	currentPromoteKey: string;
+	strategyPromotedFrom?: string;
+	strategyPromotedTo?: string;
 	evaluation: MoPushEvaluationResult;
 	snapshotTimeIso: string;
 	prevTrimForReport: string;
@@ -3210,22 +3397,53 @@ async function computeMoPushEvaluationForUser(
 		hasAdequateData,
 		recReason
 	);
-	const actionLine = buildActionText(score);
-	const moMessage = buildMoUpdatePushMessage(marketStatusLine, actionLine, displayDate);
-	const fingerprint = fingerprintMoPushContent(marketStatusLine, actionLine);
+	const actionLineBase = buildActionText(score);
+	const forcedActionLine = (env.MO_FORCE_REPORT_ACTION_LINE ?? "").trim();
+	const actionLine =
+		forcedActionLine !== "" ? forcedActionLine : actionLineBase;
 	const audit = await readMoPushAudit(env, userId);
+	const strategyReview = await readStrategyReviewState(env);
+	let currentPromoteKey = "";
+	let promotedFrom: string | undefined;
+	let promotedTo: string | undefined;
+	if (
+		strategyReview !== null &&
+		strategyReview.reviewStatus === "promoted" &&
+		strategyReview.promotedFrom !== undefined &&
+		strategyReview.promotedTo !== undefined &&
+		strategyReview.promotedFrom !== "" &&
+		strategyReview.promotedTo !== ""
+	) {
+		currentPromoteKey = `${strategyReview.promotedFrom}|${strategyReview.promotedTo}`;
+		promotedFrom = strategyReview.promotedFrom;
+		promotedTo = strategyReview.promotedTo;
+	}
 	const gate = await readStrategyNotifyGateFromKv(env, userId);
 	const nowMs = Date.now();
-	const evaluation = evaluateMoPushDecision({
+	const gatePriority =
+		gate !== null && gate.lastNotifyPriority !== undefined ?
+			gate.lastNotifyPriority
+		:	3;
+	const evaluation = evaluateMoPushEventDecision({
+		displayDate,
 		marketLine: marketStatusLine,
 		actionLine,
-		message: moMessage,
+		currentPromoteKey,
+		promotedFrom,
+		promotedTo,
+		lastEvaluatedMarketLine: audit === null ? null : audit.lastEvaluatedMarketLine,
+		lastEvaluatedActionLine: audit === null ? null : audit.lastEvaluatedActionLine,
+		lastEvaluatedPromoteKey: audit === null ? null : audit.lastEvaluatedPromoteKey,
 		lastPushedFingerprint: audit === null ? null : audit.lastPushedFingerprint,
 		gateMessage: gate === null ? null : gate.lastNotifyMessage,
 		gateAtMs: gate === null ? null : gate.lastNotifyAt,
+		gatePriority,
 		nowMs,
-		cooldownMs: STRATEGY_NOTIFY_COOLDOWN_MS,
+		cooldownMsDefault: STRATEGY_NOTIFY_COOLDOWN_MS,
+		cooldownMsP3Only: MO_PUSH_COOLDOWN_MS_P3_ONLY,
 	});
+	const moMessage = evaluation.mergedMessage;
+	const fingerprint = evaluation.fingerprint;
 	const snapshotTimeIso = new Date().toISOString();
 
 	let reportPreviousStrategy = "none";
@@ -3262,6 +3480,9 @@ async function computeMoPushEvaluationForUser(
 		actionLine,
 		moMessage,
 		fingerprint,
+		currentPromoteKey,
+		strategyPromotedFrom: promotedFrom,
+		strategyPromotedTo: promotedTo,
 		evaluation,
 		snapshotTimeIso,
 		prevTrimForReport,
@@ -4859,6 +5080,16 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 		const lastFpPersist: string | null =
 			ctx.auditBeforeEvaluate === null ? null : ctx.auditBeforeEvaluate.lastPushedFingerprint;
 
+		const reportEvaluatedSnapshot = {
+			marketLine: ctx.marketStatusLine,
+			actionLine: ctx.actionLine,
+			promoteKey: ctx.currentPromoteKey,
+		};
+		const reportAuditOpts = {
+			previousAudit: ctx.auditBeforeEvaluate,
+			lastEvaluatedSnapshot: reportEvaluatedSnapshot,
+		};
+
 		if (hasUserId && userId !== "unknown-user") {
 			if (!ctx.evaluation.shouldNotify) {
 				console.log("[notify] skipped: mo_push_decision", {
@@ -4873,6 +5104,7 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 						lastPushedFingerprint: lastFpPersist,
 						snapshotTimeIso: ctx.snapshotTimeIso,
 						messagePreview: ctx.moMessage,
+						...reportAuditOpts,
 					})
 				);
 			} else if (strategyNotifyPushBody === null) {
@@ -4885,11 +5117,15 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 					await recordStrategyNotifyOutcomeForStatus(env, userId, "in_progress", "");
 					const inProg: MoPushEvaluationResult = {
 						shouldNotify: false,
-						pushType: "mo_update",
+						triggeredEvents: [],
+						primaryPushType: null,
+						pushPriority: null,
 						pushReason: "parallel_notify_lock_active",
 						pushResult: "skipped_in_progress",
 						pushMessage: ctx.moMessage,
+						mergedMessage: ctx.moMessage,
 						cooldownRemainingMs: null,
+						fingerprint: ctx.fingerprint,
 						comparedState: ctx.evaluation.comparedState,
 					};
 					await recordMoPushAudit(
@@ -4900,6 +5136,8 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 							lastPushedFingerprint: lastFpPersist,
 							snapshotTimeIso: ctx.snapshotTimeIso,
 							messagePreview: ctx.moMessage,
+							lastPushTypeOverride: "none",
+							...reportAuditOpts,
 						})
 					);
 				} else {
@@ -4907,15 +5145,36 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 					try {
 						const gate = await readStrategyNotifyGateFromKv(env, userId);
 						const nowMs = Date.now();
-						const evalInLock = evaluateMoPushDecision({
+						const gatePriIn =
+							gate !== null && gate.lastNotifyPriority !== undefined ?
+								gate.lastNotifyPriority
+							:	3;
+						const evalInLock = evaluateMoPushEventDecision({
+							displayDate: ctx.displayDate,
 							marketLine: ctx.marketStatusLine,
 							actionLine: ctx.actionLine,
-							message: ctx.moMessage,
+							currentPromoteKey: ctx.currentPromoteKey,
+							promotedFrom: ctx.strategyPromotedFrom,
+							promotedTo: ctx.strategyPromotedTo,
+							lastEvaluatedMarketLine:
+								ctx.auditBeforeEvaluate === null ?
+									null
+								:	ctx.auditBeforeEvaluate.lastEvaluatedMarketLine,
+							lastEvaluatedActionLine:
+								ctx.auditBeforeEvaluate === null ?
+									null
+								:	ctx.auditBeforeEvaluate.lastEvaluatedActionLine,
+							lastEvaluatedPromoteKey:
+								ctx.auditBeforeEvaluate === null ?
+									null
+								:	ctx.auditBeforeEvaluate.lastEvaluatedPromoteKey,
 							lastPushedFingerprint: lastFpPersist,
 							gateMessage: gate === null ? null : gate.lastNotifyMessage,
 							gateAtMs: gate === null ? null : gate.lastNotifyAt,
+							gatePriority: gatePriIn,
 							nowMs,
-							cooldownMs: STRATEGY_NOTIFY_COOLDOWN_MS,
+							cooldownMsDefault: STRATEGY_NOTIFY_COOLDOWN_MS,
+							cooldownMsP3Only: MO_PUSH_COOLDOWN_MS_P3_ONLY,
 						});
 						if (!evalInLock.shouldNotify) {
 							console.log("[notify] skipped: mo_push_recheck", evalInLock.pushResult);
@@ -4927,6 +5186,7 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 									lastPushedFingerprint: lastFpPersist,
 									snapshotTimeIso: ctx.snapshotTimeIso,
 									messagePreview: ctx.moMessage,
+									...reportAuditOpts,
 								})
 							);
 							if (evalInLock.pushResult === "skipped_cooldown") {
@@ -4947,7 +5207,14 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 							}
 						} else {
 							console.log("[notify] start", { userId });
-							await recordStrategyNotifyGateAttempt(env, userId, notifyBody, nowMs);
+							const pri = evalInLock.pushPriority ?? 3;
+							await recordStrategyNotifyGateAttempt(
+								env,
+								userId,
+								notifyBody,
+								nowMs,
+								pri
+							);
 							const notifyPush = await lineBotPushTextMessage(env, userId, notifyBody);
 							await recordLinePushOutcomeForStatus(env, userId, notifyPush);
 							const ns = linePushOutcomeToStrategyNotifyStatus(notifyPush);
@@ -4961,12 +5228,13 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 								await recordMoPushAudit(
 									env,
 									userId,
-									moPushAuditFromEvaluation(ctx.evaluation, {
+									moPushAuditFromEvaluation(evalInLock, {
 										dryRun: false,
-										lastPushedFingerprint: ctx.fingerprint,
+										lastPushedFingerprint: evalInLock.fingerprint,
 										snapshotTimeIso: ctx.snapshotTimeIso,
-										messagePreview: ctx.moMessage,
+										messagePreview: evalInLock.mergedMessage,
 										lastPushResultOverride: "line_success",
+										...reportAuditOpts,
 									})
 								);
 							} else {
@@ -4978,12 +5246,13 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 								await recordMoPushAudit(
 									env,
 									userId,
-									moPushAuditFromEvaluation(ctx.evaluation, {
+									moPushAuditFromEvaluation(evalInLock, {
 										dryRun: false,
 										lastPushedFingerprint: lastFpPersist,
 										snapshotTimeIso: ctx.snapshotTimeIso,
-										messagePreview: ctx.moMessage,
+										messagePreview: evalInLock.mergedMessage,
 										lastPushResultOverride: lineLabel,
+										...reportAuditOpts,
 									})
 								);
 							}
@@ -5083,17 +5352,24 @@ async function buildMoPushPreviewJsonResponse(
 				snapshotTimeIso: ctx.snapshotTimeIso,
 				messagePreview: ctx.moMessage,
 				lastPushResultOverride: previewResult,
+				previousAudit: audit,
 			})
 		);
+		const primary =
+			ctx.evaluation.primaryPushType === null ? "none" : ctx.evaluation.primaryPushType;
 		const body = {
 			ok: true,
 			dryRun: true,
 			shouldNotify: ctx.evaluation.shouldNotify,
-			pushType: ctx.evaluation.pushType,
+			triggeredEvents: ctx.evaluation.triggeredEvents,
+			primaryPushType: primary,
+			pushPriority: ctx.evaluation.pushPriority,
 			pushReason: ctx.evaluation.pushReason,
 			pushResult: previewResult,
 			cooldownRemainingMs: ctx.evaluation.cooldownRemainingMs,
 			message: ctx.moMessage,
+			mergedMessage: ctx.evaluation.mergedMessage,
+			fingerprint: ctx.evaluation.fingerprint,
 			comparedState: ctx.evaluation.comparedState,
 			snapshotTime: ctx.snapshotTimeIso,
 		};

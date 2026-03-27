@@ -6,7 +6,7 @@
 		"enabled": true,
 	},
 	"vars":{
-		"LINE_MODE":"reply_only"
+		"LINE_MODE":"push_enabled"
 	},
 	"kv_namespaces": [
 		{

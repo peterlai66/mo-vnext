@@ -561,23 +561,345 @@ function buildMoReportText(p) {
 }
 
 /**
- * MO 主動推播文案（與 Worker push 一致）；含 MO Update、市場狀態、建議。
+ * @typedef {"market_status_changed" | "report_action_changed" | "strategy_promoted"} MoPushEventType
+ */
+
+/** P 數字愈小愈高優先（strategy 1、report 2、market 3） */
+const MO_PUSH_PRIORITY = {
+	strategy_promoted: 1,
+	report_action_changed: 2,
+	market_status_changed: 3,
+};
+
+const MO_PUSH_COOLDOWN_MS_DEFAULT = 10 * 60 * 1000;
+/** 僅低優先級（市場）事件時可套用較嚴格視窗 */
+const MO_PUSH_COOLDOWN_MS_P3_ONLY = 30 * 60 * 1000;
+
+/**
+ * @param {string} t
+ * @returns {number}
+ */
+function moPushPriorityValue(t) {
+	if (t === "strategy_promoted") return MO_PUSH_PRIORITY.strategy_promoted;
+	if (t === "report_action_changed") return MO_PUSH_PRIORITY.report_action_changed;
+	if (t === "market_status_changed") return MO_PUSH_PRIORITY.market_status_changed;
+	return 99;
+}
+
+/**
+ * 預留：風險層級變化（未來 report_risk_changed）請掛在此，不要塞進單一巨大 if。
  *
+ * @param {{ prevRiskLabel: string; nextRiskLabel: string }} _p
+ * @returns {Array<{ type: MoPushEventType; summary: string }>}
+ */
+function detectReportRiskChangedForMoPush(_p) {
+	return [];
+}
+
+/**
+ * @param {{
+ *   lastEvaluatedMarketLine: string | null;
+ *   lastEvaluatedActionLine: string | null;
+ *   lastEvaluatedPromoteKey: string | null;
+ *   marketLine: string;
+ *   actionLine: string;
+ *   currentPromoteKey: string;
+ *   promotedFrom?: string;
+ *   promotedTo?: string;
+ * }} p
+ * @returns {Array<{ type: MoPushEventType; summary: string }>}
+ */
+function detectMoPushTriggeredEvents(p) {
+	const prevM = p.lastEvaluatedMarketLine ?? "";
+	const prevA = p.lastEvaluatedActionLine ?? "";
+	const prevPr = p.lastEvaluatedPromoteKey ?? "";
+	const events = [];
+	if (p.marketLine !== prevM) {
+		events.push({
+			type: "market_status_changed",
+			summary: "市場狀態文字已變更",
+		});
+	}
+	if (p.actionLine !== prevA) {
+		events.push({
+			type: "report_action_changed",
+			summary: "建議文字已變更",
+		});
+	}
+	if (p.currentPromoteKey !== "" && p.currentPromoteKey !== prevPr) {
+		const from = p.promotedFrom ?? "";
+		const to = p.promotedTo ?? "";
+		events.push({
+			type: "strategy_promoted",
+			summary: `策略已自動升級（${from}→${to}）`,
+		});
+	}
+	return events;
+}
+
+/**
+ * @param {Array<{ type: MoPushEventType; summary: string }>} events
+ * @returns {MoPushEventType | null}
+ */
+function primaryMoPushTypeFromEvents(events) {
+	if (events.length === 0) return null;
+	let best = events[0].type;
+	let bestPv = moPushPriorityValue(best);
+	for (let i = 1; i < events.length; i += 1) {
+		const t = events[i].type;
+		const pv = moPushPriorityValue(t);
+		if (pv < bestPv) {
+			best = t;
+			bestPv = pv;
+		}
+	}
+	return best;
+}
+
+/**
+ * @param {{
+ *   displayDate: string;
+ *   marketLine: string;
+ *   actionLine: string;
+ *   events: Array<{ type: MoPushEventType; summary: string }>;
+ *   promotedFrom?: string;
+ *   promotedTo?: string;
+ * }} p
+ * @returns {string}
+ */
+function buildMoPushMessage(p) {
+	const sorted = [...p.events].sort((a, b) => moPushPriorityValue(a.type) - moPushPriorityValue(b.type));
+	const lines = ["MO Update", ""];
+	if (p.displayDate.trim() !== "") {
+		lines.push(`日期：${p.displayDate}`, "");
+	}
+	const has = (/** @type {MoPushEventType} */ t) => sorted.some((e) => e.type === t);
+	if (has("strategy_promoted")) {
+		const from = p.promotedFrom ?? "（前版）";
+		const to = p.promotedTo ?? "（新版）";
+		lines.push("【策略更新】", `已自動套用新策略：${from} → ${to}。`, "");
+	}
+	if (has("report_action_changed")) {
+		lines.push("【建議】", p.actionLine, "");
+	}
+	if (has("market_status_changed")) {
+		lines.push("【市場狀態】", p.marketLine, "");
+	}
+	return lines.join("\n").replace(/\n+$/u, "").trimEnd();
+}
+
+/**
+ * @param {{
+ *   triggeredEvents: Array<{ type: MoPushEventType; summary: string }>;
+ *   marketLine: string;
+ *   actionLine: string;
+ *   currentPromoteKey: string;
+ * }} p
+ * @returns {string}
+ */
+function fingerprintMoPushPayload(p) {
+	const types = [...new Set(p.triggeredEvents.map((e) => e.type))].sort().join(",");
+	return `v2|${types}|${p.marketLine}|${p.actionLine}|${p.currentPromoteKey}`;
+}
+
+/**
+ * 與 Worker STRATEGY_NOTIFY_COOLDOWN_MS 對齊的純決策（不含 LINE、不含鎖）。
+ *
+ * @param {{
+ *   displayDate: string;
+ *   marketLine: string;
+ *   actionLine: string;
+ *   currentPromoteKey: string;
+ *   promotedFrom?: string;
+ *   promotedTo?: string;
+ *   lastEvaluatedMarketLine: string | null;
+ *   lastEvaluatedActionLine: string | null;
+ *   lastEvaluatedPromoteKey: string | null;
+ *   lastPushedFingerprint: string | null;
+ *   gateMessage: string | null;
+ *   gateAtMs: number | null;
+ *   gatePriority: number;
+ *   nowMs: number;
+ *   cooldownMsDefault: number;
+ *   cooldownMsP3Only: number;
+ * }} p
+ * @returns {{
+ *   shouldNotify: boolean;
+ *   triggeredEvents: Array<{ type: MoPushEventType; summary: string }>;
+ *   primaryPushType: MoPushEventType | null;
+ *   pushPriority: number | null;
+ *   pushReason: string;
+ *   pushResult: string;
+ *   pushMessage: string;
+ *   mergedMessage: string;
+ *   cooldownRemainingMs: number | null;
+ *   fingerprint: string;
+ *   comparedState: { fingerprint: string; marketLine: string; actionLine: string; currentPromoteKey: string };
+ * }}
+ */
+function evaluateMoPushEventDecision(p) {
+	const riskExtra = detectReportRiskChangedForMoPush({
+		prevRiskLabel: "",
+		nextRiskLabel: "",
+	});
+	const triggeredEvents = detectMoPushTriggeredEvents({
+		lastEvaluatedMarketLine: p.lastEvaluatedMarketLine,
+		lastEvaluatedActionLine: p.lastEvaluatedActionLine,
+		lastEvaluatedPromoteKey: p.lastEvaluatedPromoteKey,
+		marketLine: p.marketLine,
+		actionLine: p.actionLine,
+		currentPromoteKey: p.currentPromoteKey,
+		promotedFrom: p.promotedFrom,
+		promotedTo: p.promotedTo,
+	}).concat(riskExtra);
+
+	const primaryPushType = primaryMoPushTypeFromEvents(triggeredEvents);
+	const pushPriority =
+		primaryPushType === null ? null : moPushPriorityValue(primaryPushType);
+
+	const mergedMessage = buildMoPushMessage({
+		displayDate: p.displayDate,
+		marketLine: p.marketLine,
+		actionLine: p.actionLine,
+		events: triggeredEvents,
+		promotedFrom: p.promotedFrom,
+		promotedTo: p.promotedTo,
+	});
+
+	const fingerprint = fingerprintMoPushPayload({
+		triggeredEvents,
+		marketLine: p.marketLine,
+		actionLine: p.actionLine,
+		currentPromoteKey: p.currentPromoteKey,
+	});
+
+	const comparedState = {
+		fingerprint,
+		marketLine: p.marketLine,
+		actionLine: p.actionLine,
+		currentPromoteKey: p.currentPromoteKey,
+	};
+
+	if (triggeredEvents.length === 0) {
+		return {
+			shouldNotify: false,
+			triggeredEvents,
+			primaryPushType: null,
+			pushPriority: null,
+			pushReason: "no_events_vs_last_evaluated_snapshot",
+			pushResult: "skipped_no_change",
+			pushMessage: mergedMessage,
+			mergedMessage,
+			cooldownRemainingMs: null,
+			fingerprint,
+			comparedState,
+		};
+	}
+
+	if (p.lastPushedFingerprint !== null && fingerprint === p.lastPushedFingerprint) {
+		return {
+			shouldNotify: false,
+			triggeredEvents,
+			primaryPushType,
+			pushPriority,
+			pushReason: "content_unchanged_since_last_successful_push",
+			pushResult: "skipped_same_content",
+			pushMessage: mergedMessage,
+			mergedMessage,
+			cooldownRemainingMs: null,
+			fingerprint,
+			comparedState,
+		};
+	}
+
+	const onlyLowPriority =
+		triggeredEvents.length > 0 &&
+		triggeredEvents.every((e) => e.type === "market_status_changed");
+	const effectiveCooldownMs = onlyLowPriority ? p.cooldownMsP3Only : p.cooldownMsDefault;
+
+	const gatePri = Number.isFinite(p.gatePriority) ? p.gatePriority : MO_PUSH_PRIORITY.market_status_changed;
+
+	if (p.gateAtMs !== null) {
+		const elapsed = p.nowMs - p.gateAtMs;
+		if (elapsed < effectiveCooldownMs) {
+			if (pushPriority !== null && pushPriority < gatePri) {
+				return {
+					shouldNotify: true,
+					triggeredEvents,
+					primaryPushType,
+					pushPriority,
+					pushReason: "higher_priority_overrides_low_priority_cooldown",
+					pushResult: "would_push",
+					pushMessage: mergedMessage,
+					mergedMessage,
+					cooldownRemainingMs: null,
+					fingerprint,
+					comparedState,
+				};
+			}
+			if (p.gateMessage !== null && p.gateMessage === mergedMessage) {
+				return {
+					shouldNotify: false,
+					triggeredEvents,
+					primaryPushType,
+					pushPriority,
+					pushReason: "same_message_within_cooldown",
+					pushResult: "skipped_cooldown",
+					pushMessage: mergedMessage,
+					mergedMessage,
+					cooldownRemainingMs: Math.max(0, effectiveCooldownMs - elapsed),
+					fingerprint,
+					comparedState,
+				};
+			}
+		} else if (p.gateMessage !== null && p.gateMessage === mergedMessage) {
+			return {
+				shouldNotify: false,
+				triggeredEvents,
+				primaryPushType,
+				pushPriority,
+				pushReason: "duplicate_push_body_after_cooldown",
+				pushResult: "skipped_same_content",
+				pushMessage: mergedMessage,
+				mergedMessage,
+				cooldownRemainingMs: null,
+				fingerprint,
+				comparedState,
+			};
+		}
+	}
+
+	return {
+		shouldNotify: true,
+		triggeredEvents,
+		primaryPushType,
+		pushPriority,
+		pushReason: "events_merged",
+		pushResult: "would_push",
+		pushMessage: mergedMessage,
+		mergedMessage,
+		cooldownRemainingMs: null,
+		fingerprint,
+		comparedState,
+	};
+}
+
+/**
  * @param {string} marketLine
  * @param {string} actionLine
  * @param {string} displayDate
  * @returns {string}
  */
 function buildMoUpdatePushMessage(marketLine, actionLine, displayDate) {
-	return `MO Update
-
-日期：${displayDate}
-
-【市場狀態】
-${marketLine}
-
-【建議】
-${actionLine}`;
+	return buildMoPushMessage({
+		displayDate,
+		marketLine,
+		actionLine,
+		events: [
+			{ type: "market_status_changed", summary: "" },
+			{ type: "report_action_changed", summary: "" },
+		],
+	});
 }
 
 /**
@@ -586,82 +908,15 @@ ${actionLine}`;
  * @returns {string}
  */
 function fingerprintMoPushContent(marketLine, actionLine) {
-	return `${marketLine}\n${actionLine}`;
-}
-
-/**
- * 與 Worker STRATEGY_NOTIFY_COOLDOWN_MS 對齊的純決策（不含 LINE、不含鎖）。
- *
- * @param {{
- *   marketLine: string;
- *   actionLine: string;
- *   message: string;
- *   lastPushedFingerprint: string | null;
- *   gateMessage: string | null;
- *   gateAtMs: number | null;
- *   nowMs: number;
- *   cooldownMs: number;
- * }} p
- * @returns {{
- *   shouldNotify: boolean;
- *   pushType: "mo_update";
- *   pushReason: string;
- *   pushResult: string;
- *   pushMessage: string;
- *   cooldownRemainingMs: number | null;
- *   comparedState: { fingerprint: string; marketLine: string; actionLine: string };
- * }}
- */
-function evaluateMoPushDecision(p) {
-	const fp = fingerprintMoPushContent(p.marketLine, p.actionLine);
-	const comparedState = {
-		fingerprint: fp,
-		marketLine: p.marketLine,
-		actionLine: p.actionLine,
-	};
-	if (p.lastPushedFingerprint !== null && fp === p.lastPushedFingerprint) {
-		return {
-			shouldNotify: false,
-			pushType: "mo_update",
-			pushReason: "content_unchanged_since_last_successful_push",
-			pushResult: "skipped_no_change",
-			pushMessage: p.message,
-			cooldownRemainingMs: null,
-			comparedState,
-		};
-	}
-	if (p.gateMessage !== null && p.gateMessage === p.message && p.gateAtMs !== null) {
-		const elapsed = p.nowMs - p.gateAtMs;
-		if (elapsed < p.cooldownMs) {
-			return {
-				shouldNotify: false,
-				pushType: "mo_update",
-				pushReason: "same_message_within_cooldown",
-				pushResult: "skipped_cooldown",
-				pushMessage: p.message,
-				cooldownRemainingMs: Math.max(0, p.cooldownMs - elapsed),
-				comparedState,
-			};
-		}
-		return {
-			shouldNotify: false,
-			pushType: "mo_update",
-			pushReason: "duplicate_push_body_after_cooldown",
-			pushResult: "skipped_same_content",
-			pushMessage: p.message,
-			cooldownRemainingMs: null,
-			comparedState,
-		};
-	}
-	return {
-		shouldNotify: true,
-		pushType: "mo_update",
-		pushReason: "market_or_action_changed",
-		pushResult: "would_push",
-		pushMessage: p.message,
-		cooldownRemainingMs: null,
-		comparedState,
-	};
+	return fingerprintMoPushPayload({
+		triggeredEvents: [
+			{ type: "market_status_changed", summary: "" },
+			{ type: "report_action_changed", summary: "" },
+		],
+		marketLine,
+		actionLine,
+		currentPromoteKey: "",
+	});
 }
 
 /**
@@ -892,97 +1147,212 @@ function runDevCheckMain() {
 
 	function runMoPushDryRunDevChecks() {
 		console.log("[mo-push] dry-run dev-check");
-		const cd = 600000;
+		const cd = MO_PUSH_COOLDOWN_MS_DEFAULT;
 		const m0 = "資料已更新，市場正常，可供參考。";
+		const m1 = "尚未取得最新資料（可能非交易時段或尚未寫入）。";
 		const a0 = "建議保守";
+		const a2 = "可提高部位";
 		const d0 = "2026/03/27";
-		const msg0 = buildMoUpdatePushMessage(m0, a0, d0);
-		if (!msg0.includes("MO Update") || !msg0.includes("市場狀態") || !msg0.includes("建議")) {
+		const base = {
+			displayDate: d0,
+			cooldownMsDefault: MO_PUSH_COOLDOWN_MS_DEFAULT,
+			cooldownMsP3Only: MO_PUSH_COOLDOWN_MS_P3_ONLY,
+			gatePriority: MO_PUSH_PRIORITY.market_status_changed,
+			nowMs: 1_000_000,
+		};
+
+		const msgFull = buildMoUpdatePushMessage(m0, a0, d0);
+		if (
+			!msgFull.includes("MO Update") ||
+			!msgFull.includes("市場狀態") ||
+			!msgFull.includes("建議")
+		) {
 			throw new Error("[mo-push] message shape");
 		}
-		const fp0 = fingerprintMoPushContent(m0, a0);
-		const first = evaluateMoPushDecision({
+
+		const msgPromo = buildMoPushMessage({
+			displayDate: d0,
 			marketLine: m0,
 			actionLine: a0,
-			message: msg0,
-			lastPushedFingerprint: null,
-			gateMessage: null,
-			gateAtMs: null,
-			nowMs: 1_000_000,
-			cooldownMs: cd,
+			events: [{ type: "strategy_promoted", summary: "" }],
+			promotedFrom: "a",
+			promotedTo: "b",
 		});
-		if (!first.shouldNotify || first.pushResult !== "would_push") {
-			throw new Error(`[mo-push] first push: ${JSON.stringify(first)}`);
+		if (!msgPromo.includes("策略更新")) {
+			throw new Error("[mo-push] strategy section");
 		}
-		const m1 = "尚未取得最新資料（可能非交易時段或尚未寫入）。";
-		const msg1 = buildMoUpdatePushMessage(m1, a0, d0);
-		const marketChange = evaluateMoPushDecision({
+
+		// 1) market status changed
+		const marketEv = evaluateMoPushEventDecision({
+			...base,
 			marketLine: m1,
 			actionLine: a0,
-			message: msg1,
-			lastPushedFingerprint: fp0,
+			currentPromoteKey: "",
+			lastEvaluatedMarketLine: m0,
+			lastEvaluatedActionLine: a0,
+			lastEvaluatedPromoteKey: "",
+			lastPushedFingerprint: null,
 			gateMessage: null,
 			gateAtMs: null,
-			nowMs: 1_000_000,
-			cooldownMs: cd,
+			promotedFrom: undefined,
+			promotedTo: undefined,
 		});
-		if (!marketChange.shouldNotify) {
-			throw new Error("[mo-push] market change");
+		if (!marketEv.shouldNotify || marketEv.primaryPushType !== "market_status_changed") {
+			throw new Error(`[mo-push] market status changed: ${JSON.stringify(marketEv)}`);
 		}
-		const a2 = "可提高部位";
-		const msg2 = buildMoUpdatePushMessage(m0, a2, d0);
-		const actionChange = evaluateMoPushDecision({
+
+		// 2) report action changed
+		const actionEv = evaluateMoPushEventDecision({
+			...base,
 			marketLine: m0,
 			actionLine: a2,
-			message: msg2,
-			lastPushedFingerprint: fp0,
+			currentPromoteKey: "",
+			lastEvaluatedMarketLine: m0,
+			lastEvaluatedActionLine: a0,
+			lastEvaluatedPromoteKey: "",
+			lastPushedFingerprint: null,
 			gateMessage: null,
 			gateAtMs: null,
-			nowMs: 1_000_000,
-			cooldownMs: cd,
 		});
-		if (!actionChange.shouldNotify) {
-			throw new Error("[mo-push] action change");
+		if (!actionEv.shouldNotify || actionEv.primaryPushType !== "report_action_changed") {
+			throw new Error(`[mo-push] report action changed: ${JSON.stringify(actionEv)}`);
 		}
-		const noChange = evaluateMoPushDecision({
+
+		// 3) strategy promoted — priority 高於 market / report
+		const stratEv = evaluateMoPushEventDecision({
+			...base,
 			marketLine: m0,
 			actionLine: a0,
-			message: msg0,
-			lastPushedFingerprint: fp0,
+			currentPromoteKey: "demo-v1|demo-v2",
+			lastEvaluatedMarketLine: m0,
+			lastEvaluatedActionLine: a0,
+			lastEvaluatedPromoteKey: "",
+			lastPushedFingerprint: null,
 			gateMessage: null,
 			gateAtMs: null,
-			nowMs: 1_000_000,
-			cooldownMs: cd,
+			promotedFrom: "demo-v1",
+			promotedTo: "demo-v2",
 		});
-		if (noChange.shouldNotify || noChange.pushResult !== "skipped_no_change") {
-			throw new Error("[mo-push] no change");
+		if (!stratEv.shouldNotify || stratEv.primaryPushType !== "strategy_promoted") {
+			throw new Error(`[mo-push] strategy promoted: ${JSON.stringify(stratEv)}`);
 		}
-		const tGate = 1_000_000;
-		const cool = evaluateMoPushDecision({
+		if (
+			stratEv.pushPriority === null ||
+			marketEv.pushPriority === null ||
+			actionEv.pushPriority === null ||
+			stratEv.pushPriority >= marketEv.pushPriority ||
+			stratEv.pushPriority >= actionEv.pushPriority
+		) {
+			throw new Error("[mo-push] priority ordering");
+		}
+
+		// 4) 完全沒變化（與上次評估快照相同）
+		const noEv = evaluateMoPushEventDecision({
+			...base,
+			marketLine: m0,
+			actionLine: a0,
+			currentPromoteKey: "",
+			lastEvaluatedMarketLine: m0,
+			lastEvaluatedActionLine: a0,
+			lastEvaluatedPromoteKey: "",
+			lastPushedFingerprint: null,
+			gateMessage: null,
+			gateAtMs: null,
+		});
+		if (noEv.shouldNotify || noEv.pushResult !== "skipped_no_change") {
+			throw new Error(`[mo-push] no change: ${JSON.stringify(noEv)}`);
+		}
+
+		// 5) 相同內容（fingerprint）已推過
+		const refActionFp = evaluateMoPushEventDecision({
+			...base,
 			marketLine: m0,
 			actionLine: a2,
-			message: msg2,
+			currentPromoteKey: "",
+			lastEvaluatedMarketLine: m0,
+			lastEvaluatedActionLine: a0,
+			lastEvaluatedPromoteKey: "",
 			lastPushedFingerprint: null,
-			gateMessage: msg2,
+			gateMessage: null,
+			gateAtMs: null,
+		});
+		const fpDup = evaluateMoPushEventDecision({
+			...base,
+			marketLine: m0,
+			actionLine: a2,
+			currentPromoteKey: "",
+			lastEvaluatedMarketLine: m0,
+			lastEvaluatedActionLine: a0,
+			lastEvaluatedPromoteKey: "",
+			lastPushedFingerprint: refActionFp.fingerprint,
+			gateMessage: null,
+			gateAtMs: null,
+		});
+		if (fpDup.shouldNotify || fpDup.pushResult !== "skipped_same_content") {
+			throw new Error(`[mo-push] duplicate fp: ${JSON.stringify(fpDup)}`);
+		}
+
+		// 5b) cooldown（同文、同優先級窗口內）
+		const mergedGate = buildMoPushMessage({
+			displayDate: d0,
+			marketLine: m0,
+			actionLine: a2,
+			events: [{ type: "report_action_changed", summary: "" }],
+		});
+		const tGate = 1_000_000;
+		const cool = evaluateMoPushEventDecision({
+			...base,
+			marketLine: m0,
+			actionLine: a2,
+			currentPromoteKey: "",
+			lastEvaluatedMarketLine: m0,
+			lastEvaluatedActionLine: a0,
+			lastEvaluatedPromoteKey: "",
+			lastPushedFingerprint: null,
+			gateMessage: mergedGate,
 			gateAtMs: tGate,
 			nowMs: tGate + 60_000,
-			cooldownMs: cd,
+			gatePriority: MO_PUSH_PRIORITY.report_action_changed,
 		});
 		if (cool.shouldNotify || cool.pushResult !== "skipped_cooldown") {
-			throw new Error("[mo-push] cooldown");
+			throw new Error(`[mo-push] cooldown: ${JSON.stringify(cool)}`);
 		}
-		const sameAfter = evaluateMoPushDecision({
+
+		// 6) 高優先級覆蓋低優先級 gate 時間窗（同一段文案、gate 為較低優先級）
+		const highPri = evaluateMoPushEventDecision({
+			...base,
 			marketLine: m0,
-			actionLine: a2,
-			message: msg2,
+			actionLine: a0,
+			currentPromoteKey: "a|b",
+			lastEvaluatedMarketLine: m0,
+			lastEvaluatedActionLine: a0,
+			lastEvaluatedPromoteKey: "",
 			lastPushedFingerprint: null,
-			gateMessage: msg2,
+			gateMessage: msgPromo,
 			gateAtMs: tGate,
-			nowMs: tGate + cd + 1,
-			cooldownMs: cd,
+			nowMs: tGate + 60_000,
+			gatePriority: MO_PUSH_PRIORITY.market_status_changed,
+			promotedFrom: "a",
+			promotedTo: "b",
 		});
-		if (sameAfter.shouldNotify || sameAfter.pushResult !== "skipped_same_content") {
-			throw new Error("[mo-push] same content");
+		if (!highPri.shouldNotify || highPri.pushReason !== "higher_priority_overrides_low_priority_cooldown") {
+			throw new Error(`[mo-push] priority bypass: ${JSON.stringify(highPri)}`);
+		}
+
+		// 7) buildMoPushMessage 非空且含區塊標題
+		const built = buildMoPushMessage({
+			displayDate: d0,
+			marketLine: m0,
+			actionLine: a0,
+			events: [
+				{ type: "market_status_changed", summary: "" },
+				{ type: "report_action_changed", summary: "" },
+			],
+		});
+		if (built.trim().length === 0) throw new Error("[mo-push] empty message");
+		if (!built.includes("MO Update")) throw new Error("[mo-push] title");
+		if (!built.includes("市場狀態") && !built.includes("建議") && !built.includes("策略更新")) {
+			throw new Error("[mo-push] section keyword");
 		}
 		console.log("[mo-push] dry-run ok");
 	}
@@ -1175,9 +1545,16 @@ module.exports = {
 	buildSystemDecisionText,
 	buildActionText,
 	buildMoReportText,
+	buildMoPushMessage,
 	buildMoUpdatePushMessage,
+	fingerprintMoPushPayload,
 	fingerprintMoPushContent,
-	evaluateMoPushDecision,
+	evaluateMoPushEventDecision,
+	MO_PUSH_PRIORITY,
+	MO_PUSH_COOLDOWN_MS_DEFAULT,
+	MO_PUSH_COOLDOWN_MS_P3_ONLY,
+	detectMoPushTriggeredEvents,
+	detectReportRiskChangedForMoPush,
 };
 
 if (
