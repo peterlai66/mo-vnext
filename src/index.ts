@@ -2806,7 +2806,7 @@ compareReason: ${r.compareReason}`;
 
 			const delta =
 				c !== null && typeof c.balancedMinScore === "number" ?
-					c.balancedMinScore - a.balancedMinScore
+					Math.abs(c.balancedMinScore - a.balancedMinScore)
 				:	null;
 			const source = reviewResult?.source ?? "none";
 			const finalDecision: StrategyReviewDecisionLabel = r.finalDecision;
