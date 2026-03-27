@@ -1,7 +1,12 @@
 const active = 60;
-const candidates = [50, 60, 65, 70];
+const testCases = [
+	{ candidate: 50, expectedDecision: "hold_review" },
+	{ candidate: 60, expectedDecision: "keep_active" },
+	{ candidate: 65, expectedDecision: "hold_review" },
+	{ candidate: 70, expectedDecision: "promote_candidate" },
+];
 
-const results = candidates.map((candidate) => {
+const results = testCases.map(({ candidate, expectedDecision }) => {
 	const delta = candidate - active;
 	let decision;
 
@@ -13,11 +18,22 @@ const results = candidates.map((candidate) => {
 		decision = "hold_review";
 	}
 
-	return { active, candidate, delta, decision };
+	return { active, candidate, delta, decision, expectedDecision };
 });
 
 for (const item of results) {
 	console.log(item);
+}
+
+let passCount = 0;
+let failCount = 0;
+for (const item of results) {
+	if (item.decision !== item.expectedDecision) {
+		console.error("❌ mismatch", item);
+		failCount += 1;
+	} else {
+		passCount += 1;
+	}
 }
 
 const summary = results.reduce(
@@ -31,3 +47,10 @@ const summary = results.reduce(
 );
 
 console.log(summary);
+console.log({ passCount, failCount });
+
+if (failCount > 0) {
+	process.exit(1);
+}
+
+console.log("✅ all tests passed");
