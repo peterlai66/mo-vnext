@@ -10,6 +10,12 @@ import {
 	summarizeTwseMiIndexPayload,
 	isTwseMiIndexPayloadOk,
 	formatMoLiveMarketStatusBlock,
+	buildMoReportText as moReportComposeFullText,
+	buildMarketStatusText as moReportMarketLine,
+	buildSystemDecisionText as moReportSystemDecision,
+	buildActionText as moReportActionLine,
+	getMoLiveCycleStatusFromSnapshotRead,
+	formatDisplayDateFromYyyymmdd,
 } from "../scripts/dev-check.js";
 
 interface KVListKey {
@@ -1057,51 +1063,35 @@ async function buildMoStatusReplyText(env: Env, userId: string): Promise<string>
 	});
 }
 
-function renderMoReportText(params: {
-	app: string;
-	command: string;
-	kv: string;
-	d1: string;
-	userLine: string;
-	notesValue: number;
-	debugNotePrefix: string;
-	debugKvListCount: number;
-	debugKvKeysSection: string;
-	strategyChangeBlock: string;
-	summaryBlock: string;
-	recommendationBlock: string;
-	simulationBlock: string;
+/** 與 dev-check 共用之 MO Report 組字（決策導向、無 debug dump） */
+function buildMoReportText(params: {
+	displayDate: string;
+	dataSource: string;
+	marketStatusLine: string;
+	systemDecisionLine: string;
+	actionLine: string;
+	notesLine?: string;
 }): string {
-	return `MO Report
+	return moReportComposeFullText(params);
+}
 
-[System]
+function buildMarketStatusText(
+	cycle: "success" | "waiting_data" | "partial" | "fetch_failed"
+): string {
+	return moReportMarketLine(cycle);
+}
 
-* app: ${params.app}
-* command: ${params.command}
-* storage: kv+d1
-* kv: ${params.kv}
-* d1: ${params.d1}
-* user: ${params.userLine}
-* notes: ${params.notesValue}
-* debugNotePrefix: ${params.debugNotePrefix}
-* debugKvListCount: ${params.debugKvListCount}
-${params.debugKvKeysSection}
+function buildSystemDecisionText(
+	strategy: "aggressive" | "balanced" | "conservative",
+	score: number,
+	hasAdequateData: boolean,
+	recReason: string
+): string {
+	return moReportSystemDecision(strategy, score, hasAdequateData, recReason);
+}
 
-[Strategy]
-
-${params.strategyChangeBlock}
-
-[Summary]
-
-${params.summaryBlock}
-
-[Recommendation]
-
-${params.recommendationBlock}
-
-[Simulation]
-
-${params.simulationBlock}`;
+function buildActionText(score: number): string {
+	return moReportActionLine(score);
 }
 
 function extractNoteContent(storedValue: string): string {
@@ -1126,33 +1116,6 @@ function parseTimestampFromKey(keyName: string): number {
 	const tail = parts[parts.length - 1];
 	const timestamp = Number(tail);
 	return Number.isFinite(timestamp) ? timestamp : 0;
-}
-
-/** 將 key 尾段 timestamp（毫秒）轉為台北本地時間 YYYY-MM-DD HH:mm；失敗則回傳原字串 */
-function formatNoteKeyTimestampForReport(tail: string): string {
-	const n = Number(tail);
-	if (!Number.isFinite(n)) return tail;
-	const d = new Date(n);
-	const ms = d.getTime();
-	if (!Number.isFinite(ms)) return tail;
-	const parts = new Intl.DateTimeFormat("en-CA", {
-		timeZone: "Asia/Taipei",
-		year: "numeric",
-		month: "2-digit",
-		day: "2-digit",
-		hour: "2-digit",
-		minute: "2-digit",
-		hour12: false,
-	}).formatToParts(d);
-	const pick = (type: Intl.DateTimeFormatPart["type"]) =>
-		parts.find((p) => p.type === type)?.value ?? "";
-	const y = pick("year");
-	const mo = pick("month");
-	const day = pick("day");
-	const h = pick("hour");
-	const min = pick("minute");
-	if (y === "" || mo === "" || day === "" || h === "" || min === "") return tail;
-	return `${y}-${mo}-${day} ${h}:${min}`;
 }
 
 function parseUserNote(keyName: string, storedValue: string): UserNote {
@@ -4480,26 +4443,18 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 	  case "/report": {
 		const isReportTestChange = command === "/report-test-change";
 		const s = await getSystemStatus(env, userId);
-		const notesValue = s.noteCount === "error" ? 0 : s.noteCount;
 
 		const hasUserId = userId.trim() !== "";
 		const totalNotesNum = s.noteCount === "error" ? 0 : s.noteCount;
 		let latestNoteMs: number | null = null;
-		let summaryBlock: string;
-		if (!hasUserId) {
-			summaryBlock = `* latestNote: none
-* totalNotes: 0`;
-		} else {
+		if (hasUserId) {
 			try {
 				const list = await env.MO_NOTES.list({
 					prefix: `note:${userId}:`,
 					limit: 20,
 				});
 				const keyNames = list.keys.map((k) => k.name);
-				if (keyNames.length === 0) {
-					summaryBlock = `* latestNote: none
-* totalNotes: 0`;
-				} else {
+				if (keyNames.length > 0) {
 					const sorted = [...keyNames].sort(
 						(a, b) => parseTimestampFromKey(b) - parseTimestampFromKey(a)
 					);
@@ -4515,13 +4470,9 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 							latestNoteMs = ts;
 						}
 					}
-					const latestReadable = formatNoteKeyTimestampForReport(tail);
-					summaryBlock = `* latestNote: ${latestReadable}
-* totalNotes: ${totalNotesNum}`;
 				}
 			} catch {
-				summaryBlock = `* latestNote: none
-* totalNotes: 0`;
+				latestNoteMs = null;
 			}
 		}
 
@@ -4649,15 +4600,8 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 			strategy: strategyFinal,
 		});
 
-		const recommendationBlock = `* score: ${score}
-* strategy: ${strategyFinal}
-* status: ${recStatus}
-* reason: ${recReason}
-* action: ${recAction}`;
 		const noteCountForRec = s.noteCount === "error" ? 0 : s.noteCount;
 		const simReady = noteCountForRec > 0 ? "yes" : "no";
-		const simReason =
-			noteCountForRec > 0 ? "可進行模擬" : "無資料可模擬";
 		let simResult: string;
 		if (noteCountForRec === 0) {
 			simResult = "無法模擬";
@@ -4668,22 +4612,11 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 		} else {
 			simResult = "模擬偏保守策略，建議先觀察";
 		}
-		const simulationBlock = `* ready: ${simReady}
-* reason: ${simReason}
-* result: ${simResult}`;
-
-		let strategyChangeBlock: string;
 		let strategyNotifyPushBody: string | null = null;
 		let reportPreviousStrategy = "none";
 		let reportChanged = false;
 		let reportShouldNotify = false;
-		if (!hasUserId) {
-			strategyChangeBlock = `* current: ${strategyFinal}
-* previous: none
-* changed: no
-* shouldNotify: no
-* notifyMessage: none`;
-		} else {
+		if (hasUserId) {
 			const strategyKey = `strategy:${userId}`;
 			const prevTrim = prevTrimForReport;
 			const previousDisplay = prevTrim === "" ? "none" : prevTrim;
@@ -4695,16 +4628,6 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 			reportChanged = changed === "yes";
 			reportShouldNotify = shouldNotify === "yes";
 			await env.MO_NOTES.put(strategyKey, strategyFinal);
-			const notifyMessageLine =
-				shouldNotify === "yes" ?
-					`* notifyMessage:
-
-MO Strategy Update
-previous: ${previousDisplay}
-current: ${strategyFinal}
-score: ${score}
-action: ${recAction}`
-				:	`* notifyMessage: none`;
 			if (shouldNotify === "yes") {
 				strategyNotifyPushBody = `MO Strategy Update
 previous: ${previousDisplay}
@@ -4719,11 +4642,6 @@ action: ${recAction}`;
 				timestamp: formatStatusPushAtTaipei(new Date()),
 			};
 			await recordStrategyDecision(env, userId, strategyDecision);
-			strategyChangeBlock = `* current: ${strategyFinal}
-* previous: ${previousDisplay}
-* changed: ${changed}
-* shouldNotify: ${shouldNotify}
-${notifyMessageLine}`;
 		}
 
 		if (hasUserId && userId !== "unknown-user") {
@@ -4842,44 +4760,33 @@ ${notifyMessageLine}`;
 			await recordLastReportSummary(env, userId, summary);
 		}
 
-		const reportUserLine = s.user === "ok" ? `ok (${userId})` : "none";
+		const liveRead = await readLatestMoLiveMarketSnapshot(env);
+		const cycleForReport = getMoLiveCycleStatusFromSnapshotRead(liveRead);
+		const marketStatusLine = buildMarketStatusText(cycleForReport);
+		const displayDate =
+			liveRead.kind === "ok" && liveRead.row !== null ?
+				formatDisplayDateFromYyyymmdd(liveRead.row.trade_date)
+			:	formatDisplayDateFromYyyymmdd(getTaipeiYYYYMMDDMinusDaysFromToday(0));
+		const dataSource =
+			liveRead.kind === "ok" && liveRead.row !== null ? liveRead.row.source : "—";
+		const hasAdequateData = totalNotesNum > 0;
+		const systemDecisionLine = buildSystemDecisionText(
+			strategyFinal,
+			score,
+			hasAdequateData,
+			recReason
+		);
+		const actionLine = buildActionText(score);
+		const notesLine =
+			noteCountForRec > 0 ? `模擬顯示：${simResult}` : "";
 
-		const debugNotePrefixStr = `note:${userId}:`;
-		let debugKvListCountForSystem = 0;
-		let debugKvKeysSection = "* debugKvKeys: none";
-		if (hasUserId) {
-			try {
-				const debugKvList = await env.MO_NOTES.list({
-					prefix: debugNotePrefixStr,
-					limit: 20,
-				});
-				debugKvListCountForSystem = debugKvList.keys.length;
-				if (debugKvList.keys.length > 0) {
-					const dkLines = debugKvList.keys
-						.map((k, i) => `  ${i + 1}. ${k.name}`)
-						.join("\n");
-					debugKvKeysSection = `* debugKvKeys:\n${dkLines}`;
-				}
-			} catch {
-				debugKvListCountForSystem = 0;
-				debugKvKeysSection = "* debugKvKeys: none";
-			}
-		}
-
-		return renderMoReportText({
-			app: s.app,
-			command: s.command,
-			kv: s.kv,
-			d1: s.d1,
-			userLine: reportUserLine,
-			notesValue,
-			debugNotePrefix: debugNotePrefixStr,
-			debugKvListCount: debugKvListCountForSystem,
-			debugKvKeysSection,
-			strategyChangeBlock,
-			summaryBlock,
-			recommendationBlock,
-			simulationBlock,
+		return buildMoReportText({
+			displayDate,
+			dataSource,
+			marketStatusLine,
+			systemDecisionLine,
+			actionLine,
+			notesLine: notesLine.trim() !== "" ? notesLine : undefined,
 		});
 	  }
 	  // TODO: later commands
@@ -4936,6 +4843,24 @@ async function getReplyText(
 			} catch (err: unknown) {
 				const message = err instanceof Error ? err.message : String(err);
 				return new Response(`status preview error: ${message}`, {
+					status: 500,
+					headers: { "Content-Type": "text/plain; charset=utf-8" },
+				});
+			}
+		}
+
+		if (url.pathname === "/admin/report-preview" && request.method === "GET") {
+			const uid = url.searchParams.get("userId") ?? "preview-user";
+			const testChange = url.searchParams.get("testChange") === "1";
+			try {
+				const cmd = testChange ? "/report-test-change" : "/report";
+				const text = await handleCommand(cmd, cmd, env, uid);
+				return new Response(text, {
+					headers: { "Content-Type": "text/plain; charset=utf-8" },
+				});
+			} catch (err: unknown) {
+				const message = err instanceof Error ? err.message : String(err);
+				return new Response(`report preview error: ${message}`, {
 					status: 500,
 					headers: { "Content-Type": "text/plain; charset=utf-8" },
 				});

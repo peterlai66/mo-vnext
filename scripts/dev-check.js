@@ -435,6 +435,132 @@ function formatMoLiveMarketStatusBlock(row, options) {
 }
 
 /**
+ * 與 Worker readLatestMoLiveMarketSnapshot 結果對齊，取得 cycle（僅能從 D1 推導 success / waiting_data / fetch_failed）。
+ *
+ * @param {{ kind: "ok"; row: { trade_date?: string } | null } | { kind: "error"; message: string }} read
+ * @returns {"success" | "waiting_data" | "fetch_failed"}
+ */
+function getMoLiveCycleStatusFromSnapshotRead(read) {
+	if (read.kind === "error") return "fetch_failed";
+	if (read.row === null) return "waiting_data";
+	return "success";
+}
+
+/**
+ * @param {"success" | "waiting_data" | "partial" | "fetch_failed"} cycle
+ * @returns {string}
+ */
+function mapMoLiveMarketStatusHuman(cycle) {
+	switch (cycle) {
+		case "success":
+			return "資料已更新，市場正常，可供參考。";
+		case "waiting_data":
+			return "尚未取得最新資料（可能非交易時段或尚未寫入）。";
+		case "partial":
+			return "資料不完整（僅部分更新）。";
+		case "fetch_failed":
+			return "資料取得失敗，請稍後再試。";
+		default:
+			return "市場狀態無法判定。";
+	}
+}
+
+/**
+ * @param {"success" | "waiting_data" | "partial" | "fetch_failed"} cycle
+ * @returns {string}
+ */
+function buildMarketStatusText(cycle) {
+	return mapMoLiveMarketStatusHuman(cycle);
+}
+
+/**
+ * @param {string} yyyymmdd
+ * @returns {string}
+ */
+function formatDisplayDateFromYyyymmdd(yyyymmdd) {
+	if (typeof yyyymmdd !== "string" || !/^\d{8}$/.test(yyyymmdd)) return yyyymmdd;
+	return `${yyyymmdd.slice(0, 4)}/${yyyymmdd.slice(4, 6)}/${yyyymmdd.slice(6, 8)}`;
+}
+
+/**
+ * @param {number} score
+ * @returns {string}
+ */
+function mapScoreToActionLine(score) {
+	const s = Number(score);
+	if (!Number.isFinite(s)) return "維持觀察";
+	if (s >= 90) return "可提高部位";
+	if (s >= 70) return "維持配置";
+	return "建議保守";
+}
+
+/**
+ * @param {"aggressive" | "balanced" | "conservative"} strategy
+ * @param {number} score
+ * @param {boolean} hasAdequateData
+ * @param {string} recReason
+ * @returns {string}
+ */
+function buildSystemDecisionText(strategy, score, hasAdequateData, recReason) {
+	const zh =
+		strategy === "aggressive" ? "積極型" : strategy === "conservative" ? "保守型" : "平衡型";
+	const stance =
+		strategy === "aggressive" ? "偏積極" : strategy === "conservative" ? "偏保守" : "中性平衡";
+	let judgment;
+	if (!hasAdequateData) {
+		judgment = `資料不足（${recReason}），以下判斷僅供參考。`;
+	} else if (strategy === "aggressive") {
+		judgment = "目前訊號可承擔較高風險，但仍須留意波動。";
+	} else if (strategy === "conservative") {
+		judgment = "建議保守因應，優先控管下行風險。";
+	} else {
+		judgment = "中性平衡，可依自身風險承受度調整。";
+	}
+	return `當前策略：${zh}（${stance}）\n綜合評分：${score} 分。\n${judgment}`;
+}
+
+/**
+ * @param {number} score
+ * @returns {string}
+ */
+function buildActionText(score) {
+	return mapScoreToActionLine(score);
+}
+
+/**
+ * @param {{
+ *   displayDate: string;
+ *   dataSource: string;
+ *   marketStatusLine: string;
+ *   systemDecisionLine: string;
+ *   actionLine: string;
+ *   notesLine?: string;
+ * }} p
+ * @returns {string}
+ */
+function buildMoReportText(p) {
+	const parts = [
+		"MO Report",
+		"",
+		`日期：${p.displayDate}`,
+		`資料來源：${p.dataSource}`,
+		"",
+		"【市場狀態】",
+		p.marketStatusLine,
+		"",
+		"【系統判斷】",
+		p.systemDecisionLine,
+		"",
+		"【建議】",
+		p.actionLine,
+	];
+	if (p.notesLine !== undefined && String(p.notesLine).trim() !== "") {
+		parts.push("", "【備註】", String(p.notesLine).trim());
+	}
+	return parts.join("\n");
+}
+
+/**
  * @typedef {{
  *  active: StrategyShape;
  *  candidate: StrategyShape;
@@ -616,6 +742,50 @@ function runDevCheckMain() {
 	runMoLiveStatusSummaryDevChecks();
 	passCount += 1;
 
+	function runMoReportDevChecks() {
+		console.log("[mo-report] dev-check");
+		const hOk = mapMoLiveMarketStatusHuman("success");
+		if (!hOk.includes("資料已更新") || !hOk.includes("市場正常")) {
+			throw new Error(`[mo-report] market success: ${hOk}`);
+		}
+		const hWait = mapMoLiveMarketStatusHuman("waiting_data");
+		if (!hWait.includes("尚未取得")) {
+			throw new Error(`[mo-report] market waiting: ${hWait}`);
+		}
+		const hFail = mapMoLiveMarketStatusHuman("fetch_failed");
+		if (!hFail.includes("失敗")) {
+			throw new Error(`[mo-report] market fetch_failed: ${hFail}`);
+		}
+		if (getMoLiveCycleStatusFromSnapshotRead({ kind: "ok", row: { trade_date: "20260101" } }) !== "success") {
+			throw new Error("[mo-report] snapshot read success");
+		}
+		if (getMoLiveCycleStatusFromSnapshotRead({ kind: "ok", row: null }) !== "waiting_data") {
+			throw new Error("[mo-report] snapshot read waiting");
+		}
+		if (getMoLiveCycleStatusFromSnapshotRead({ kind: "error", message: "x" }) !== "fetch_failed") {
+			throw new Error("[mo-report] snapshot read error");
+		}
+		if (mapScoreToActionLine(95) !== "可提高部位") throw new Error("[mo-report] action 95");
+		if (mapScoreToActionLine(80) !== "維持配置") throw new Error("[mo-report] action 80");
+		if (mapScoreToActionLine(50) !== "建議保守") throw new Error("[mo-report] action 50");
+		const full = buildMoReportText({
+			displayDate: "2026/01/01",
+			dataSource: "TEST",
+			marketStatusLine: buildMarketStatusText("success"),
+			systemDecisionLine: buildSystemDecisionText("balanced", 75, true, "x"),
+			actionLine: buildActionText(75),
+			notesLine: "模擬顯示：測試",
+		});
+		if (full.trim().length === 0) throw new Error("[mo-report] empty");
+		if (!full.includes("MO Report")) throw new Error("[mo-report] title");
+		if (!full.includes("市場狀態")) throw new Error("[mo-report] 市場狀態");
+		if (!full.includes("建議")) throw new Error("[mo-report] 建議");
+		console.log("[mo-report] dev-check ok");
+	}
+
+	runMoReportDevChecks();
+	passCount += 1;
+
 	let guardState = /** @type {PromoteGuardState} */ ({ confirmCount: 0 });
 	const t0 = 1_700_000_000_000;
 	const stabilityCases = [
@@ -793,6 +963,14 @@ module.exports = {
 	summarizeTwseMiIndexPayload,
 	isTwseMiIndexPayloadOk,
 	formatMoLiveMarketStatusBlock,
+	getMoLiveCycleStatusFromSnapshotRead,
+	mapMoLiveMarketStatusHuman,
+	buildMarketStatusText,
+	formatDisplayDateFromYyyymmdd,
+	mapScoreToActionLine,
+	buildSystemDecisionText,
+	buildActionText,
+	buildMoReportText,
 };
 
 if (
