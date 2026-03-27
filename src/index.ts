@@ -2266,7 +2266,8 @@ function computeStrategyReviewDecision(params: {
 		}
 		case "keep_active": {
 			const r = reviewResult.compareReason.trim();
-			if (r === "no_material_diff") {
+			// 允許 no_material_diff 後面帶補充說明（例如 delta/active/candidate）
+			if (r === "no_material_diff" || r.startsWith("no_material_diff")) {
 				return {
 					decision: "hold_review",
 					reason: "active 與 candidate 幾乎無差異，暫不評估 promotion",
