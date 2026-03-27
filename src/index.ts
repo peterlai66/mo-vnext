@@ -2947,10 +2947,23 @@ compareReason: ${r.compareReason}`;
 					compareDecision: existingResult.compareDecision,
 					compareReason: existingResult.compareReason,
 				});
+		const currentCandidateVersion = candidateCfg === null ? "" : candidateCfg.configVersion;
+		const reviewResultVersionsMismatch =
+			existingResult !== null &&
+			(existingResult.activeConfigVersion !== activeCfg.config.configVersion ||
+				existingResult.candidateConfigVersion !== currentCandidateVersion);
+		const compareStaleVsConfigs =
+			existingResult !== null &&
+			existingView !== null &&
+			existingView.changedFields.length === 0 &&
+			existingView.delta === 0 &&
+			existingResult.compareDecision !== "keep_active";
 		const shouldComputeOnDemand =
 			existingResult === null ||
 			existingResult.comparedAt.trim() === "" ||
 			existingResult.compareReason === "review result not ready" ||
+			reviewResultVersionsMismatch ||
+			compareStaleVsConfigs ||
 			(existingView !== null &&
 				(existingView.activeScore === 0 || existingView.candidateScore === 0));
 		if (shouldComputeOnDemand) {
@@ -3666,6 +3679,13 @@ at: ${at}`;
 		// promotion 後收尾：清除 demo override，避免污染後續測試
 		await clearStrategyReviewDemoOverride(env, "promotion");
 
+		await runStrategyReview({
+			env,
+			userId,
+			source: "real",
+			allowDemoOverride: false,
+		});
+
 		console.log("[strategy] promotion decision source", {
 			source: decision.decisionSource ?? "unknown",
 		});
@@ -3905,6 +3925,13 @@ at: ${at}`;
 		});
 
 		await clearStrategyReviewDemoOverride(env, "promotion");
+
+		await runStrategyReview({
+			env,
+			userId,
+			source: "real",
+			allowDemoOverride: false,
+		});
 
 		console.log("[strategy] auto promote run promoted", {
 			promotedFrom: active.config.configVersion,
