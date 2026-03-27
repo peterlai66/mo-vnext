@@ -1,3 +1,11 @@
+import {
+	computeStrategyComparePure,
+	evaluateAutoPromoteCore,
+	shouldRefreshStrategyReviewKv,
+	STRATEGY_AUTO_PROMOTE_CONFIRM_REQUIRED,
+	STRATEGY_AUTO_PROMOTE_COOLDOWN_MS,
+} from "../scripts/dev-check.js";
+
 interface KVListKey {
 	name: string;
 }
@@ -1338,8 +1346,6 @@ const MO_STRATEGY_REVIEW_RESULT_KEY = "strategy_review_result";
 const MO_STRATEGY_REVIEW_DECISION_KEY = "strategy_review_decision";
 const MO_STRATEGY_REVIEW_DEMO_OVERRIDE_KEY = "strategy_review_demo_override";
 const MO_STRATEGY_AUTO_PROMOTE_GUARD_KEY = "strategy_auto_promote_guard";
-const STRATEGY_AUTO_PROMOTE_CONFIRM_REQUIRED = 2;
-const STRATEGY_AUTO_PROMOTE_COOLDOWN_MS = 30 * 60 * 1000;
 
 type StrategyReviewStatus =
 	| "none"
@@ -2085,25 +2091,6 @@ async function runStrategyReview(params: {
 	const a = active.config;
 	const c = candidate;
 
-	const diffs: string[] = [];
-	if (a.freshnessWeight !== c.freshnessWeight) diffs.push("freshnessWeight");
-	if (a.volumeWeight !== c.volumeWeight) diffs.push("volumeWeight");
-	if (a.simulationWeight !== c.simulationWeight) diffs.push("simulationWeight");
-	if (a.aggressiveMinScore !== c.aggressiveMinScore) diffs.push("aggressiveMinScore");
-	if (a.balancedMinScore !== c.balancedMinScore) diffs.push("balancedMinScore");
-	if (a.freshnessIdleThresholdMs !== c.freshnessIdleThresholdMs) diffs.push("freshnessIdleThresholdMs");
-
-	const changedFields: string[] = [];
-	if (a.balancedMinScore !== c.balancedMinScore) changedFields.push("balancedMinScore");
-	if (a.freshnessWeight !== c.freshnessWeight) changedFields.push("freshnessWeight");
-	if (a.volumeWeight !== c.volumeWeight) changedFields.push("volumeWeight");
-
-	const calcCompareScore = (s: StrategyActiveConfig): number =>
-		s.balancedMinScore * 1 + s.freshnessWeight * 10 + s.volumeWeight * 10;
-	const activeScore = calcCompareScore(a);
-	const candidateScore = calcCompareScore(c);
-	const scoreDelta = candidateScore - activeScore;
-
 	const demoOverride =
 		params.allowDemoOverride ? await readStrategyReviewDemoOverride(params.env) : null;
 	const snapshot =
@@ -2113,21 +2100,21 @@ async function runStrategyReview(params: {
 			activeConfig: a,
 		}) : null;
 
-	const isStrongDemo =
-		demoOverride !== null &&
-		demoOverride.status === "active" &&
-		demoOverride.dataFreshnessScore >= 80 &&
-		demoOverride.dataVolumeScore >= 80 &&
-		demoOverride.simulationReadyScore >= 80;
-	const isStrongReal =
-		snapshot !== null &&
-		snapshot.status === "active" &&
-		snapshot.dataFreshnessScore >= 80 &&
-		snapshot.dataVolumeScore >= 80 &&
-		snapshot.simulationReadyScore >= 80;
-	// real compare rule（安全特例）：僅 balancedMinScore 單欄位差異時，允許在較保守的真實條件下 promote_candidate
-	// - 不放寬到多欄位 diff
-	// - 仍需真實資料新鮮且量足夠，且避免 simulationReady 太低
+	const out = computeStrategyComparePure(a, c, params.source, {
+		demoOverride,
+		snapshot,
+	});
+	const {
+		compareDecision,
+		compareReason,
+		compareSummary,
+		activeScore,
+		candidateScore,
+		scoreDelta,
+		changedFields,
+		diffs,
+		reviewConfidence: reviewConfidence,
+	} = out;
 	const isBalancedMinScoreOnlyDiff = diffs.length === 1 && diffs[0] === "balancedMinScore";
 	const balancedMinScoreDelta = c.balancedMinScore - a.balancedMinScore;
 	const isSafeRealPromoteBalancedMinScoreOnly =
@@ -2135,6 +2122,12 @@ async function runStrategyReview(params: {
 		demoOverride === null &&
 		isBalancedMinScoreOnlyDiff &&
 		balancedMinScoreDelta >= 10;
+	const isStrongReal =
+		snapshot !== null &&
+		snapshot.status === "active" &&
+		snapshot.dataFreshnessScore >= 80 &&
+		snapshot.dataVolumeScore >= 80 &&
+		snapshot.simulationReadyScore >= 80;
 	const isSafeBalancedMinScoreOnlyReal =
 		params.source === "real" &&
 		isBalancedMinScoreOnlyDiff &&
@@ -2145,49 +2138,12 @@ async function runStrategyReview(params: {
 		snapshot.dataVolumeScore >= 80 &&
 		snapshot.simulationReadyScore >= 60;
 
-	let compareDecision: StrategyCompareDecision;
-	let compareReason: string;
-	let compareSummary: string;
-
-	if (diffs.length === 0) {
-		compareDecision = "keep_active";
-		// 補強可讀性：常見誤判是 balancedMinScore 其實相同（delta=0）
-		const balancedDelta = c.balancedMinScore - a.balancedMinScore;
-		compareReason =
-			params.source === "real" && balancedDelta === 0 ?
-				`no_material_diff (balancedMinScore delta=0; active=${a.balancedMinScore}, candidate=${c.balancedMinScore})`
-			:	"no_material_diff";
-		compareSummary = "active vs candidate same";
-	} else if (isSafeRealPromoteBalancedMinScoreOnly) {
-		compareDecision = "promote_candidate";
-		compareReason = `real promote condition matched: balancedMinScore delta>=10 (${balancedMinScoreDelta})`;
-		compareSummary = "real safe promotion baseline";
+	if (isSafeRealPromoteBalancedMinScoreOnly) {
 		console.log("[strategy] real promote condition matched", {
 			field: "balancedMinScore",
 			delta: balancedMinScoreDelta,
 			compareDecision,
 		});
-	} else if (
-		(params.source === "demo" && isStrongDemo) ||
-		(params.source === "real" && (isStrongReal || isSafeBalancedMinScoreOnlyReal))
-	) {
-		compareDecision = "promote_candidate";
-		compareReason =
-			params.source === "demo" ?
-				`candidate changes validated under demo review conditions: ${diffs.join(", ")}`
-			:	(isSafeBalancedMinScoreOnlyReal && !isStrongReal) ?
-					`candidate balancedMinScore change validated under safe real review conditions: ${diffs.join(", ")}`
-				:	`candidate changes validated under real review conditions: ${diffs.join(", ")}`;
-		compareSummary = "candidate validated for promotion";
-	} else {
-		compareDecision = "hold_review";
-		compareReason =
-			params.source === "real" && isBalancedMinScoreOnlyDiff ?
-				(balancedMinScoreDelta < 10 ?
-						`balancedMinScore delta is below threshold (delta=${balancedMinScoreDelta}, active=${a.balancedMinScore}, candidate=${c.balancedMinScore}); auto promote requires delta >= 10`
-					:	`candidate balancedMinScore change but real review conditions not strong enough (delta=${balancedMinScoreDelta}, active=${a.balancedMinScore}, candidate=${c.balancedMinScore})`)
-			:	`candidate changes but review conditions not strong enough: ${diffs.join(", ")}`;
-		compareSummary = "active vs candidate differ";
 	}
 
 	console.log("[strategy] review compare computed", {
@@ -2312,12 +2268,6 @@ async function runStrategyReview(params: {
 		decisionSource: params.source,
 	});
 	console.log("[strategy] decision source persisted", { source: params.source });
-
-	const reviewConfidence: "high" | "medium" =
-		(compareDecision === "promote_candidate" && scoreDelta >= 10) ||
-		(compareDecision === "keep_active" && scoreDelta === 0) ?
-			"high"
-		:	"medium";
 
 	return {
 		comparedAt: nowIso,
@@ -2898,74 +2848,33 @@ compareReason: ${r.compareReason}`;
 			readCandidateStrategyConfig(env),
 			readStrategyReviewResult(env),
 		]);
-		const buildReviewResultView = (params: {
-			active: StrategyActiveConfig;
-			candidate: StrategyActiveConfig | null;
-			compareDecision: StrategyCompareDecision;
-			compareReason: string;
-		}): {
-			activeScore: number;
-			candidateScore: number;
-			delta: number;
-			changedFields: string[];
-			reason: string;
-			decision: StrategyCompareDecision;
-			confidence: "high" | "medium";
-		} => {
-			const a = params.active;
-			const c = params.candidate;
-			const activeScore = a.balancedMinScore * 1 + a.freshnessWeight * 10 + a.volumeWeight * 10;
-			const candidateScore =
-				c === null ? 0 : c.balancedMinScore * 1 + c.freshnessWeight * 10 + c.volumeWeight * 10;
-			const delta = candidateScore - activeScore;
-			const changedFields: string[] = [];
-			if (c !== null) {
-				if (a.balancedMinScore !== c.balancedMinScore) changedFields.push("balancedMinScore");
-				if (a.freshnessWeight !== c.freshnessWeight) changedFields.push("freshnessWeight");
-				if (a.volumeWeight !== c.volumeWeight) changedFields.push("volumeWeight");
-			}
-			const confidence: "high" | "medium" =
-				(params.compareDecision === "promote_candidate" && delta >= 10) ||
-				(params.compareDecision === "keep_active" && delta === 0) ?
-					"high"
-				:	"medium";
-			return {
-				activeScore,
-				candidateScore,
-				delta,
-				changedFields,
-				reason: params.compareReason,
-				decision: params.compareDecision,
-				confidence,
-			};
-		};
-		const existingView =
-			existingResult === null ? null
-			:	buildReviewResultView({
-					active: activeCfg.config,
-					candidate: candidateCfg,
-					compareDecision: existingResult.compareDecision,
-					compareReason: existingResult.compareReason,
+		const snapshotForReview =
+			candidateCfg === null ? null : await computeStrategyCurrentSnapshotFromRealData({
+				env,
+				userId,
+				activeConfig: activeCfg.config,
+			});
+		const computedPreview =
+			candidateCfg === null ?
+				null
+			:	computeStrategyComparePure(activeCfg.config, candidateCfg, "real", {
+					demoOverride: null,
+					snapshot: snapshotForReview,
 				});
 		const currentCandidateVersion = candidateCfg === null ? "" : candidateCfg.configVersion;
-		const reviewResultVersionsMismatch =
-			existingResult !== null &&
-			(existingResult.activeConfigVersion !== activeCfg.config.configVersion ||
-				existingResult.candidateConfigVersion !== currentCandidateVersion);
-		const compareStaleVsConfigs =
-			existingResult !== null &&
-			existingView !== null &&
-			existingView.changedFields.length === 0 &&
-			existingView.delta === 0 &&
-			existingResult.compareDecision !== "keep_active";
 		const shouldComputeOnDemand =
 			existingResult === null ||
 			existingResult.comparedAt.trim() === "" ||
 			existingResult.compareReason === "review result not ready" ||
-			reviewResultVersionsMismatch ||
-			compareStaleVsConfigs ||
-			(existingView !== null &&
-				(existingView.activeScore === 0 || existingView.candidateScore === 0));
+			computedPreview === null ||
+			shouldRefreshStrategyReviewKv(
+				existingResult,
+				activeCfg.config.configVersion,
+				currentCandidateVersion,
+				computedPreview
+			) ||
+			computedPreview.activeScore === 0 ||
+			computedPreview.candidateScore === 0;
 		if (shouldComputeOnDemand) {
 			// runStrategyReview 在 candidate 或 review state 缺失時會早退且不寫 KV，導致每次只看到 placeholder。
 			// 補齊與 /strategy-candidate-clone-active 相同的最小前置條件後再進 compare/evaluate。
@@ -3011,16 +2920,24 @@ compareReason: ${r.compareReason}`;
 			}
 		}
 		const r =
-			!shouldComputeOnDemand && existingResult !== null && existingView !== null ?
+			!shouldComputeOnDemand && existingResult !== null && computedPreview !== null ?
 				{
 					comparedAt: existingResult.comparedAt,
-					compareDecision: existingResult.compareDecision,
-					compareReason: existingResult.compareReason,
+					compareDecision: computedPreview.compareDecision,
+					compareReason: computedPreview.compareReason,
 					finalDecision:
-						existingResult.compareDecision === "promote_candidate" ? "promote_candidate"
-						: existingResult.compareDecision === "keep_active" ? "keep_active"
+						computedPreview.compareDecision === "promote_candidate" ? "promote_candidate"
+						: computedPreview.compareDecision === "keep_active" ? "keep_active"
 						: "hold_review",
-					reviewResult: existingView,
+					reviewResult: {
+						activeScore: computedPreview.activeScore,
+						candidateScore: computedPreview.candidateScore,
+						delta: computedPreview.scoreDelta,
+						changedFields: computedPreview.changedFields,
+						reason: computedPreview.compareReason,
+						decision: computedPreview.compareDecision,
+						confidence: computedPreview.reviewConfidence,
+					},
 				}
 			:	(await (async () => {
 					const computed = await runStrategyReview({
@@ -3720,91 +3637,116 @@ at: ${at}`;
 			reviewDecision?.decisionSource ??
 			"computed";
 
-		const a = active.config;
-		const c = candidate;
-		const changedFields: string[] = [];
-		if (c !== null) {
-			if (a.balancedMinScore !== c.balancedMinScore) changedFields.push("balancedMinScore");
-			if (a.freshnessWeight !== c.freshnessWeight) changedFields.push("freshnessWeight");
-			if (a.volumeWeight !== c.volumeWeight) changedFields.push("volumeWeight");
-		}
-		const activeScore = a.balancedMinScore * 1 + a.freshnessWeight * 10 + a.volumeWeight * 10;
-		const candidateScore =
-			c === null ? activeScore : c.balancedMinScore * 1 + c.freshnessWeight * 10 + c.volumeWeight * 10;
-		const delta = candidateScore - activeScore;
-		const decisionFromReviewResult = reviewResult?.compareDecision;
-		const decisionFromReviewDecision =
-			reviewDecision?.decision === "auto_promote_candidate" ?
-				"promote_candidate"
-			: reviewDecision?.decision === "promote_candidate" ||
-				reviewDecision?.decision === "hold_review" ||
-				reviewDecision?.decision === "keep_active" ?
-				reviewDecision.decision
-			:	null;
-		const decision: StrategyCompareDecision =
-			decisionFromReviewResult ?? decisionFromReviewDecision ?? "hold_review";
-		const baseReason =
-			reviewResult?.compareReason && reviewResult.compareReason.trim() !== "" ?
-				reviewResult.compareReason
-			:	reviewDecision?.reason && reviewDecision.reason.trim() !== "" ?
-				reviewDecision.reason
-			:	(changedFields.length === 0 ? "no strategy changes" : `candidate changes: ${changedFields.join(", ")}`);
-		const thresholdReason =
-			c !== null &&
-			changedFields.length === 1 &&
-			changedFields[0] === "balancedMinScore" &&
-			delta < 10 ?
-				`balancedMinScore delta is below threshold (delta=${c.balancedMinScore - a.balancedMinScore}, active=${a.balancedMinScore}, candidate=${c.balancedMinScore}); auto promote requires delta >= 10`
-			:	null;
-		const reason = thresholdReason ?? baseReason;
-		const confidence: "high" | "medium" =
-			(decision === "promote_candidate" && delta >= 10) ||
-			(decision === "keep_active" && delta === 0) ?
-				"high"
-			:	"medium";
-		const changedFieldsText = changedFields.length === 0 ? "none" : changedFields.join(", ");
-		const previousDecision = promoteGuard?.lastDecision ?? null;
-		const previousConfirmCount = promoteGuard?.confirmCount ?? 0;
-		const confirmCount =
-			previousDecision === decision ? previousConfirmCount + 1 : 1;
 		const nowMs = Date.now();
-		const lastPromoteAt = promoteGuard?.lastPromoteAt;
-		const cooldownRemainingMs =
-			typeof lastPromoteAt === "number" ?
-				Math.max(0, STRATEGY_AUTO_PROMOTE_COOLDOWN_MS - (nowMs - lastPromoteAt))
-			:	0;
-		const cooldownRemainingMin = Math.ceil(cooldownRemainingMs / 60000);
 
-		const blocked = (): string => {
+		const blocked = (params: {
+			decision: StrategyCompareDecision;
+			delta: number;
+			changedFieldsText: string;
+			reason: string;
+			confidence: "high" | "medium";
+		}): string => {
 			console.log("[strategy] auto promote run blocked", {
-				decision,
-				decisionFromReviewResult: decisionFromReviewResult ?? "none",
-				decisionFromReviewDecision: decisionFromReviewDecision ?? "none",
-				delta,
-				changedFields,
-				reason,
-				confidence,
+				decision: params.decision,
+				delta: params.delta,
+				changedFields: params.changedFieldsText,
+				reason: params.reason,
+				confidence: params.confidence,
 			});
 			return `MO Strategy Auto Promote Run
 
 result: blocked
-decision: ${decision}
-delta: ${delta}
-changedFields: ${changedFieldsText}
-reason: ${reason}
-confidence: ${confidence}
+decision: ${params.decision}
+delta: ${params.delta}
+changedFields: ${params.changedFieldsText}
+reason: ${params.reason}
+confidence: ${params.confidence}
 auto promote blocked: review decision is not promote_candidate
 decisionSource: ${decisionSource}
 at: ${at}`;
 		};
 
-		if (candidate === null) return blocked();
-		if (decision === "keep_active") {
-			await writeStrategyAutoPromoteGuard(env, {
-				lastDecision: decision,
-				confirmCount,
-				...(typeof lastPromoteAt === "number" ? { lastPromoteAt } : {}),
+		if (candidate === null) {
+			return blocked({
+				decision: "hold_review",
+				delta: 0,
+				changedFieldsText: "none",
+				reason: "candidate config not found",
+				confidence: "medium",
 			});
+		}
+
+		let rr = reviewResult;
+		let snapshot = await computeStrategyCurrentSnapshotFromRealData({
+			env,
+			userId,
+			activeConfig: active.config,
+		});
+		let computed = computeStrategyComparePure(active.config, candidate, "real", {
+			demoOverride: null,
+			snapshot,
+		});
+
+		if (
+			rr === null ||
+			shouldRefreshStrategyReviewKv(
+				rr,
+				active.config.configVersion,
+				candidate.configVersion,
+				computed
+			)
+		) {
+			await runStrategyReview({ env, userId, source: "real", allowDemoOverride: false });
+			rr = await readStrategyReviewResult(env);
+			snapshot = await computeStrategyCurrentSnapshotFromRealData({
+				env,
+				userId,
+				activeConfig: active.config,
+			});
+			computed = computeStrategyComparePure(active.config, candidate, "real", {
+				demoOverride: null,
+				snapshot,
+			});
+		}
+
+		const decision = computed.compareDecision;
+		const delta = computed.scoreDelta;
+		const changedFields = computed.changedFields;
+		const reason = computed.compareReason;
+		const confidence = computed.reviewConfidence;
+		const changedFieldsText = changedFields.length === 0 ? "none" : changedFields.join(", ");
+
+		const guardState: {
+			lastDecision?: StrategyCompareDecision;
+			confirmCount: number;
+			lastPromoteAt?: number;
+		} = {
+			confirmCount: promoteGuard?.confirmCount ?? 0,
+			...(promoteGuard?.lastDecision !== undefined ?
+				{ lastDecision: promoteGuard.lastDecision }
+			:	{}),
+			...(typeof promoteGuard?.lastPromoteAt === "number" ?
+				{ lastPromoteAt: promoteGuard.lastPromoteAt }
+			:	{}),
+		};
+
+		const ap = evaluateAutoPromoteCore(guardState, decision, nowMs);
+		const confirmCount = ap.confirmCount;
+		const cooldownRemainingMs = ap.cooldownRemainingMs;
+		const cooldownRemainingMin = Math.ceil(cooldownRemainingMs / 60000);
+
+		const persistGuard = async (): Promise<void> => {
+			await writeStrategyAutoPromoteGuard(env, {
+				lastDecision: ap.nextState.lastDecision,
+				confirmCount: ap.nextState.confirmCount,
+				...(typeof ap.nextState.lastPromoteAt === "number" ?
+					{ lastPromoteAt: ap.nextState.lastPromoteAt }
+				:	{}),
+			});
+		};
+
+		if (ap.result === "no_action") {
+			await persistGuard();
 			console.log("[strategy] auto promote run no_action", {
 				decision,
 				delta,
@@ -3826,22 +3768,30 @@ decisionSource: ${decisionSource}
 confirmCount: ${confirmCount}/${STRATEGY_AUTO_PROMOTE_CONFIRM_REQUIRED}
 at: ${at}`;
 		}
-		if (decision !== "promote_candidate") {
-			await writeStrategyAutoPromoteGuard(env, {
-				lastDecision: decision,
-				confirmCount,
-				...(typeof lastPromoteAt === "number" ? { lastPromoteAt } : {}),
-			});
-			return blocked();
+		if (ap.result === "blocked") {
+			await persistGuard();
+			return blocked({ decision, delta, changedFieldsText, reason, confidence });
 		}
+		if (ap.result === "guarded") {
+			await persistGuard();
+			if (cooldownRemainingMs > 0) {
+				console.log("[strategy] auto promote run guarded", {
+					guard: "cooldown",
+					cooldownRemainingMin,
+				});
+				return `MO Strategy Auto Promote Run
 
-		// promote_candidate 的穩定機制：先累積 confirm 次數，再檢查 cooldown
-		if (confirmCount < STRATEGY_AUTO_PROMOTE_CONFIRM_REQUIRED) {
-			await writeStrategyAutoPromoteGuard(env, {
-				lastDecision: decision,
-				confirmCount,
-				...(typeof lastPromoteAt === "number" ? { lastPromoteAt } : {}),
-			});
+result: guarded
+decision: ${decision}
+delta: ${delta}
+changedFields: ${changedFieldsText}
+reason: cooldown active (${cooldownRemainingMin} min remaining)
+confidence: ${confidence}
+decisionSource: ${decisionSource}
+confirmCount: ${confirmCount}/${STRATEGY_AUTO_PROMOTE_CONFIRM_REQUIRED}
+cooldownRemaining: ${cooldownRemainingMin}m
+at: ${at}`;
+			}
 			console.log("[strategy] auto promote run guarded", {
 				guard: "confirm_count",
 				confirmCount,
@@ -3859,34 +3809,10 @@ confirmCount: ${confirmCount}/${STRATEGY_AUTO_PROMOTE_CONFIRM_REQUIRED}
 at: ${at}`;
 		}
 
-		if (cooldownRemainingMs > 0) {
-			await writeStrategyAutoPromoteGuard(env, {
-				lastDecision: decision,
-				confirmCount,
-				...(typeof lastPromoteAt === "number" ? { lastPromoteAt } : {}),
-			});
-			console.log("[strategy] auto promote run guarded", {
-				guard: "cooldown",
-				cooldownRemainingMin,
-			});
-			return `MO Strategy Auto Promote Run
-
-result: guarded
-decision: ${decision}
-delta: ${delta}
-changedFields: ${changedFieldsText}
-reason: cooldown active (${cooldownRemainingMin} min remaining)
-confidence: ${confidence}
-decisionSource: ${decisionSource}
-confirmCount: ${confirmCount}/${STRATEGY_AUTO_PROMOTE_CONFIRM_REQUIRED}
-cooldownRemaining: ${cooldownRemainingMin}m
-at: ${at}`;
-		}
-
 		console.log("[strategy] auto promote run conditions matched", {
 			delta,
 			changedFields,
-			compareDecision: reviewResult.compareDecision,
+			compareDecision: rr?.compareDecision ?? "none",
 			decision,
 			confirmCount,
 		});
@@ -3918,11 +3844,7 @@ at: ${at}`;
 			reason: "auto promotion completed",
 			evaluatedAt: at,
 		});
-		await writeStrategyAutoPromoteGuard(env, {
-			lastDecision: decision,
-			confirmCount,
-			lastPromoteAt: nowMs,
-		});
+		await persistGuard();
 
 		await clearStrategyReviewDemoOverride(env, "promotion");
 
