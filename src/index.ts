@@ -2801,11 +2801,12 @@ compareReason: ${r.compareReason}`;
 					c.balancedMinScore - a.balancedMinScore
 				:	null;
 			const source = reviewResult?.source ?? "none";
-			const decision = reviewDecision?.decision ?? "none";
+			const finalDecision = reviewDecision?.decision ?? null;
+			const compareDecision = reviewResult?.compareDecision ?? null;
 
 			const autoPromoteEligible =
 				source === "real" &&
-				decision === "auto_promote_candidate" &&
+				finalDecision === "auto_promote_candidate" &&
 				demoOverride === null &&
 				diffs.length === 1 &&
 				diffs[0] === "balancedMinScore" &&
@@ -2820,11 +2821,17 @@ compareReason: ${r.compareReason}`;
 				const deltaDisplay = delta === null ? "none" : String(delta);
 				const sourceLine =
 					source !== "real" ? `${source}（需為 real）` : source;
+				const decisionLine =
+					finalDecision !== null ?
+						`\n- decision: ${finalDecision}`
+					: compareDecision !== null ?
+						`\n- compareDecision: ${compareDecision}`
+					:	"\n- decision: none";
 				autoPromoteHintBlock =
 					"\n\nAuto Promote 條件未達：" +
 					`\n- delta: ${deltaDisplay}（需 >=10）` +
 					`\n- source: ${sourceLine}` +
-					`\n- decision: ${decision}`;
+					decisionLine;
 			}
 		} catch {
 			// ignore (hint only)
