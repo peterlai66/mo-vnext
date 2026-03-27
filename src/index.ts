@@ -1979,6 +1979,15 @@ async function runStrategyReview(params: {
 	compareDecision: StrategyCompareDecision;
 	compareReason: string;
 	finalDecision: StrategyReviewDecisionLabel;
+	reviewResult: {
+		activeScore: number;
+		candidateScore: number;
+		delta: number;
+		changedFields: string[];
+		reason: string;
+		decision: StrategyCompareDecision;
+		confidence: "high" | "medium";
+	};
 }> {
 	const active = await readActiveStrategyConfig(params.env);
 	const candidate = await readCandidateStrategyConfig(params.env);
@@ -2004,6 +2013,17 @@ async function runStrategyReview(params: {
 	if (a.aggressiveMinScore !== c.aggressiveMinScore) diffs.push("aggressiveMinScore");
 	if (a.balancedMinScore !== c.balancedMinScore) diffs.push("balancedMinScore");
 	if (a.freshnessIdleThresholdMs !== c.freshnessIdleThresholdMs) diffs.push("freshnessIdleThresholdMs");
+
+	const changedFields: string[] = [];
+	if (a.balancedMinScore !== c.balancedMinScore) changedFields.push("balancedMinScore");
+	if (a.freshnessWeight !== c.freshnessWeight) changedFields.push("freshnessWeight");
+	if (a.volumeWeight !== c.volumeWeight) changedFields.push("volumeWeight");
+
+	const calcCompareScore = (s: StrategyActiveConfig): number =>
+		s.balancedMinScore * 1 + s.freshnessWeight * 10 + s.volumeWeight * 10;
+	const activeScore = calcCompareScore(a);
+	const candidateScore = calcCompareScore(c);
+	const scoreDelta = candidateScore - activeScore;
 
 	const demoOverride =
 		params.allowDemoOverride ? await readStrategyReviewDemoOverride(params.env) : null;
@@ -2214,11 +2234,26 @@ async function runStrategyReview(params: {
 	});
 	console.log("[strategy] decision source persisted", { source: params.source });
 
+	const reviewConfidence: "high" | "medium" =
+		(compareDecision === "promote_candidate" && scoreDelta >= 10) ||
+		(compareDecision === "keep_active" && scoreDelta === 0) ?
+			"high"
+		:	"medium";
+
 	return {
 		comparedAt: nowIso,
 		compareDecision,
 		compareReason,
 		finalDecision: finalDecisionRecord.decision,
+		reviewResult: {
+			activeScore,
+			candidateScore,
+			delta: scoreDelta,
+			changedFields,
+			reason: compareReason,
+			decision: compareDecision,
+			confidence: reviewConfidence,
+		},
 	};
 }
 
@@ -2855,7 +2890,14 @@ reviewResultKey: ${MO_STRATEGY_REVIEW_RESULT_KEY}
 source: real
 comparedAt: ${r.comparedAt}
 compareDecision: ${r.compareDecision}
-compareReason: ${r.compareReason}${autoPromoteHintBlock}`;
+compareReason: ${r.compareReason}
+activeScore: ${r.reviewResult.activeScore}
+candidateScore: ${r.reviewResult.candidateScore}
+delta: ${r.reviewResult.delta}
+changedFields: ${r.reviewResult.changedFields.length === 0 ? "none" : r.reviewResult.changedFields.join(", ")}
+reason: ${r.reviewResult.reason}
+decision: ${r.reviewResult.decision}
+confidence: ${r.reviewResult.confidence}${autoPromoteHintBlock}`;
 	  }
 	  case "/strategy-review-decision": {
 		const d = await readStrategyReviewDecision(env);
