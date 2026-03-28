@@ -47,6 +47,7 @@ import {
 import {
 	deriveMoLiveDataGovernanceTyped,
 	type MoLiveDataGovernance,
+	type MoLiveDataUsability,
 	type MoLiveSnapshotRow,
 } from "./mo/governance.js";
 import { buildRecommendationPrecheckResult } from "./mo/recommendation-precheck.js";
@@ -222,6 +223,7 @@ intent 只能是：report、recommendation、status。
 - "ask_why"：為什麼、理由、依據、為何是這個／這些。
 - "ask_risk"：風險、有什麼風險、注意什麼、會不會有問題；**包含「風險是什麼」這類短問**（在 recommendation 脈絡下）。
 - "ask_action"：下一步、該怎麼做、現在要做什麼、怎麼執行（在仍屬推薦語境時）。
+- "ask_timing"：現在適合進場嗎、時機、何時進出、要等多久、該不該現在動（在仍屬推薦語境時）。
 
 【範例：對話脈絡上一則為 recommendation】
 - 使用者：風險是什麼 → intent: recommendation, followUpIntent: ask_risk
@@ -239,7 +241,7 @@ intent 只能是：report、recommendation、status。
 輸出格式（必須遵守）：
 {
   "intent": "report | recommendation | status",
-  "followUpIntent": "none | ask_more_candidates | ask_why | ask_risk | ask_action",
+  "followUpIntent": "none | ask_more_candidates | ask_why | ask_risk | ask_action | ask_timing",
   "context": { "hasPortfolio": true, "riskPreference": "normal" },
   "options": { "mode": "latest" }
 }`;
@@ -358,6 +360,8 @@ function followUpIntentToneHintZh(fu: RecommendationFollowUpIntent): string {
 			return "使用者想了解風險與限制。";
 		case "ask_action":
 			return "使用者想知道下一步可行做法。";
+		case "ask_timing":
+			return "使用者想確認時機或是否適合進場／觀察。";
 		default: {
 			const _e: never = fu;
 			return _e;
@@ -366,14 +370,89 @@ function followUpIntentToneHintZh(fu: RecommendationFollowUpIntent): string {
 }
 
 /**
+ * Follow-up 送進 AI 前之簡短約束句（與 pack 同源），降低 blocker／caution 被渲染混淆的機率。
+ */
+function buildFollowUpGuardFactsEnglish(pack: RecommendationExplainableSummaryPack): string {
+	const blocker =
+		pack.blockedBy === "none"
+			? "primary_blocker=none"
+			: pack.blockedBy === "score"
+				? "primary_blocker=score_threshold"
+				: `primary_blocker=${pack.blockedBy}`;
+	const stance =
+		pack.recommendationMode === "observe_only"
+			? "action_stance=observe_first"
+			: pack.recommendationMode === "blocked"
+				? "action_stance=no_recommendation"
+				: pack.recommendationMode === "actionable_with_caution"
+					? "action_stance=cautious_actionable"
+					: "action_stance=actionable";
+	const simGuard =
+		pack.blockedBy === "score" || pack.blockedBy === "none"
+			? "simulation_role=caution_only_not_primary_blocker_unless_blockedBy_implies_otherwise"
+			: "align_main_story_with_primary_blocker; simulation_may_be_secondary_context_only";
+	return [
+		"GUARD (authoritative; paraphrase ok, do not contradict):",
+		`recommendationMode=${pack.recommendationMode}`,
+		blocker,
+		stance,
+		simGuard,
+		"If primary_blocker is score_threshold: do not describe simulation incompleteness as the main or sole reason for observe_only or for not entering.",
+	].join(" ");
+}
+
+/**
  * MO 依 RecommendationOutput 真實欄位組裝英文事實（供渲染層轉繁中，不得由模型發明）。
+ * 若有 explainable pack，ask_why／ask_risk／ask_timing 與 report／gate 語意對齊。
  */
 function buildRecommendationFollowUpMoFactsEnglish(
 	out: RecommendationOutput,
-	fu: RecommendationFollowUpIntent
+	fu: RecommendationFollowUpIntent,
+	pack: RecommendationExplainableSummaryPack | null
 ): string {
 	if (fu === "none") {
 		return "";
+	}
+	if (pack !== null) {
+		const guard = buildFollowUpGuardFactsEnglish(pack);
+		if (fu === "ask_why") {
+			return [
+				guard,
+				"ask_why facts:",
+				`primaryReason (main story): ${pack.primaryReason}`,
+				`blockedBy: ${pack.blockedBy}`,
+				`semanticCandidateOnly: ${pack.semanticCandidateOnly ? "yes" : "no"} (if yes, do not imply a named actionable pick)`,
+				`candidateSummary: ${pack.candidateSummary}`,
+				`gateSummary: ${pack.gateSummary}`,
+				"If observe_only with score_threshold: the main reason is score vs threshold; simulation is at most supplementary caution, not the primary cause.",
+			].join("\n");
+		}
+		if (fu === "ask_risk") {
+			return [
+				guard,
+				"ask_risk facts:",
+				`blockedBy: ${pack.blockedBy}`,
+				`riskNote: ${pack.riskNote}`,
+				`simulationCaution: ${pack.simulationCautionLine}`,
+				"If blockedBy is score_threshold, major risk narrative must not collapse to 'because simulation is incomplete'; cite data quality / score / threshold and treat simulation as caution overlay.",
+				"If blockedBy is not simulation-related, do not cast simulation as the primary block.",
+			].join("\n");
+		}
+		if (fu === "ask_timing") {
+			const timing =
+				pack.recommendationMode === "observe_only" && pack.blockedBy === "score"
+					? "Timing stance: not suitable to treat as entry mainly because score is below threshold; simulation status is supplementary caution only, not the core 'cannot enter' reason."
+					: "Timing stance: follow recommendationMode and blockedBy; simulation incomplete is caution-only unless diagnostics indicate otherwise.";
+			return [
+				guard,
+				"ask_timing facts:",
+				`recommendationMode: ${pack.recommendationMode}`,
+				`blockedBy: ${pack.blockedBy}`,
+				`actionHint: ${pack.actionHint}`,
+				`primaryReason: ${pack.primaryReason}`,
+				timing,
+			].join("\n");
+		}
 	}
 	const rec = out.recommendation;
 	const alloc = out.allocation;
@@ -419,6 +498,9 @@ function buildRecommendationFollowUpMoFactsEnglish(
 		case "ask_action": {
 			const notes = dec.notes.length > 0 ? dec.notes.join(" | ") : "(no notes)";
 			return `Decision notes: ${notes}. Allocation ready=${String(alloc.ready)}. Simulation executable=${String(sim.executable)}. Explainable action line: ${out.explainableSummary.action}`;
+		}
+		case "ask_timing": {
+			return `Decision readiness: ${dec.readiness}. Stage: ${dec.stage}. Action from summary: ${out.explainableSummary.action}`;
 		}
 		default: {
 			const _e: never = fu;
@@ -1877,6 +1959,489 @@ type MoLiveMarketIntelligenceV1 = {
 	recommendationGateReason: string;
 	simulationGateReason: string;
 };
+
+/** recommendation gate 驗證輔助（與 MO 綜合分數 score 對齊；log／報告用） */
+type RecommendationGateBlockedBy = "none" | "score" | "governance" | "readiness" | "no_candidate";
+
+type RecommendationGateDiagnostics = {
+	candidateScore: number;
+	balancedMinScore: number;
+	scoreEligible: boolean;
+	decisionEligible: boolean;
+	dataUsability: MoLiveDataUsability;
+	recommendationReadiness: MoLiveMarketIntelligenceV1["recommendationReadiness"];
+	simulationReadiness: MoLiveMarketIntelligenceV1["simulationReadiness"];
+	actionableAllowed: boolean;
+	blockedBy: RecommendationGateBlockedBy;
+	gateReasonDetail: string;
+	/** 在 gate 摘要中說明模擬為 caution 或與本次主因關係 */
+	simulationRoleInSummary: string;
+};
+
+/** Explainable summary pack v1（與 recommendationGateDiagnostics 對齊） */
+type RecommendationMode =
+	| "actionable"
+	| "actionable_with_caution"
+	| "observe_only"
+	| "blocked";
+
+type RecommendationExplainableSummaryPack = {
+	recommendationMode: RecommendationMode;
+	/** 與 recommendation gate diagnostics 同源，供對外文案／follow-up 錨點對齊 */
+	blockedBy: RecommendationGateBlockedBy;
+	/** 候選僅為市場級／placeholder 語意，無須點名的具體標的 */
+	semanticCandidateOnly: boolean;
+	primaryReason: string;
+	riskNote: string;
+	actionHint: string;
+	candidateSummary: string;
+	gateSummary: string;
+	simulationCautionLine: string;
+	explainTags: readonly ["ask_why", "ask_risk", "ask_timing"];
+};
+
+function buildRecommendationGateDiagnostics(
+	gov: MoLiveDataGovernance,
+	li: MoLiveMarketIntelligenceV1,
+	score: number,
+	balancedMinScore: number,
+	actionableAllowed: boolean
+): RecommendationGateDiagnostics {
+	const candidateScore = score;
+	const scoreEligible = score >= balancedMinScore;
+	const govOk = gov.decisionEligible === true && gov.dataUsability === "decision_ok";
+	const readinessOk = li.recommendationReadiness === "ready";
+
+	let blockedBy: RecommendationGateBlockedBy = "none";
+	let gateReasonDetail = "";
+	let simulationRoleInSummary = "";
+
+	if (!actionableAllowed) {
+		if (!gov.decisionEligible || gov.dataUsability !== "decision_ok") {
+			blockedBy = "governance";
+			gateReasonDetail = !gov.decisionEligible
+				? "建議未放行：decisionEligible 為 false。"
+				: `建議未放行：dataUsability 為 ${gov.dataUsability}，需為 decision_ok 才進入可放行評估。`;
+			simulationRoleInSummary =
+				li.simulationReadiness !== "ready"
+					? "模擬狀態併存，但本次主因為治理／資料條件"
+					: "—";
+		} else if (!readinessOk) {
+			blockedBy = "readiness";
+			gateReasonDetail = `建議未放行：recommendationReadiness=${li.recommendationReadiness}（${li.recommendationGateReason}）`;
+			simulationRoleInSummary = "與 recommendation 層級相關；模擬為獨立區塊";
+		} else if (!scoreEligible) {
+			blockedBy = "score";
+			gateReasonDetail =
+				candidateScore === 0
+					? `建議未放行：候選／綜合分數為 0，未達門檻 ${balancedMinScore}。simulationReadiness=${li.simulationReadiness} 為獨立維度，非本次未放行主因。`
+					: `建議未放行：候選／綜合分數 ${candidateScore} 未達 balanced 門檻 ${balancedMinScore}。simulationReadiness=${li.simulationReadiness} 非本次主因。`;
+			simulationRoleInSummary =
+				li.simulationReadiness !== "ready"
+					? "模擬未就緒為併存資訊；本次未放行主因為分數／門檻"
+					: "—";
+		} else {
+			gateReasonDetail = "建議未放行：條件異常（應已由邏輯攔截）。";
+			simulationRoleInSummary = "—";
+		}
+	} else {
+		blockedBy = "none";
+		gateReasonDetail =
+			li.simulationReadiness !== "ready"
+				? "建議可行：治理與 recommendation 就緒且分數達門檻；模擬未完成，僅作風險提示（caution），非阻擋主因。"
+				: "建議可行：治理、recommendation、分數達門檻；模擬狀態亦就緒。";
+		simulationRoleInSummary =
+			li.simulationReadiness !== "ready"
+				? "caution（僅風險提示，非 simulation 封鎖 recommendation）"
+				: "ready（非阻擋）";
+	}
+
+	return {
+		candidateScore,
+		balancedMinScore,
+		scoreEligible,
+		decisionEligible: gov.decisionEligible,
+		dataUsability: gov.dataUsability,
+		recommendationReadiness: li.recommendationReadiness,
+		simulationReadiness: li.simulationReadiness,
+		actionableAllowed,
+		blockedBy,
+		gateReasonDetail,
+		simulationRoleInSummary,
+	};
+}
+
+/** 對外摘要用：辨識 loader 產生的市場快照／指數參考等，避免內部名稱直接露出 */
+function candidateLooksLikeSemanticOnlyReference(c: {
+	symbol: string;
+	name: string;
+	rationale: string;
+}): boolean {
+	const sym = c.symbol.trim().toUpperCase();
+	if (sym === "INDEX" || sym === "TAIEX" || sym === "MI_INDEX") {
+		return true;
+	}
+	const name = c.name;
+	if (
+		/\bmo_live\b/iu.test(name) ||
+		/recommendation_loader|placeholder_ready/iu.test(name) ||
+		/market\s+snapshot/iu.test(name) ||
+		/\bINDEX\b/u.test(name) ||
+		/\bMI_INDEX\b/u.test(name) ||
+		/\bTAIEX\b/iu.test(name) ||
+		/（\s*INDEX\s*）/u.test(name)
+	) {
+		return true;
+	}
+	const r = c.rationale;
+	if (
+		/mo_live_market_snapshots|index reference only|not a stock pick|not a ranking|recommendation_loader|placeholder_ready/iu.test(
+			r
+		)
+	) {
+		return true;
+	}
+	return false;
+}
+
+function buildCandidateSummaryForPack(recOut: RecommendationOutput | null): {
+	candidateSummary: string;
+	semanticCandidateOnly: boolean;
+} {
+	if (recOut === null) {
+		return {
+			candidateSummary: "本輪以系統綜合分數與 gate 為主；無另載入獨立候選清單摘要。",
+			semanticCandidateOnly: true,
+		};
+	}
+	if (recOut.blocked) {
+		return {
+			candidateSummary: `建議引擎未啟動（${recOut.blockReason ?? "未知原因"}）。`,
+			semanticCandidateOnly: true,
+		};
+	}
+	const n = recOut.recommendation.candidateCount;
+	if (n === 0) {
+		return {
+			candidateSummary: "目前無足夠入列候選，或候選分數不足以支撐積極建議。",
+			semanticCandidateOnly: true,
+		};
+	}
+	const rows = recOut.recommendation.candidates;
+	const top = rows[0];
+	if (top === undefined) {
+		return {
+			candidateSummary: `系統列管 ${String(n)} 筆候選，詳情以內部排序為準。`,
+			semanticCandidateOnly: true,
+		};
+	}
+	const allSemantic = rows.every((c) =>
+		candidateLooksLikeSemanticOnlyReference({
+			symbol: c.symbol,
+			name: c.name,
+			rationale: c.rationale,
+		})
+	);
+	if (allSemantic) {
+		return {
+			candidateSummary:
+				"目前僅有市場整體與大盤類參考方向可供觀察，尚無須點名的個股或基金標的列入可執行名單（屬方向性線索，非個別標的推薦）。",
+			semanticCandidateOnly: true,
+		};
+	}
+	const topSemantic = candidateLooksLikeSemanticOnlyReference({
+		symbol: top.symbol,
+		name: top.name,
+		rationale: top.rationale,
+	});
+	if (topSemantic) {
+		return {
+			candidateSummary:
+				"目前候選仍偏概略，尚未形成可逐檔指名的配置清單；請以排序與分數為參考，不宜視為已點名的正式標的。",
+			semanticCandidateOnly: true,
+		};
+	}
+	// 可辨識之上市／上櫃代號型態（來源無關，不依賴資料商名稱）
+	const symOk = /^\d{4}\.TW$/u.test(top.symbol.trim()) || /^[A-Z]{1,5}\d{0,2}\.TW$/u.test(top.symbol.trim());
+	if (symOk) {
+		return {
+			candidateSummary: `可辨識候選：${top.name}（${top.symbol}）；共 ${String(n)} 檔列入排序。`,
+			semanticCandidateOnly: false,
+		};
+	}
+	return {
+		candidateSummary:
+			"目前僅有方向性觀察標的，尚未形成具體可指名配置名單；請以系統排序為準，不宜視為已點名的正式推薦。",
+		semanticCandidateOnly: true,
+	};
+}
+
+function deriveRecommendationMode(
+	gov: MoLiveDataGovernance,
+	li: MoLiveMarketIntelligenceV1,
+	diag: RecommendationGateDiagnostics
+): RecommendationMode {
+	if (
+		!gov.decisionEligible ||
+		gov.dataUsability !== "decision_ok" ||
+		li.recommendationReadiness !== "ready"
+	) {
+		return "blocked";
+	}
+	if (!diag.actionableAllowed) {
+		return "observe_only";
+	}
+	if (li.simulationReadiness === "ready") {
+		return "actionable";
+	}
+	return "actionable_with_caution";
+}
+
+function buildRecommendationExplainableSummaryPack(
+	gov: MoLiveDataGovernance,
+	li: MoLiveMarketIntelligenceV1,
+	diag: RecommendationGateDiagnostics,
+	recOut: RecommendationOutput | null
+): RecommendationExplainableSummaryPack {
+	const mode = deriveRecommendationMode(gov, li, diag);
+	const { candidateSummary, semanticCandidateOnly } = buildCandidateSummaryForPack(recOut);
+	const simulationCautionLine = diag.simulationRoleInSummary;
+
+	let primaryReason = diag.gateReasonDetail;
+	let riskNote = `資料品質層級：${li.marketDataQuality}。${li.marketInterpretation}`;
+	if (li.simulationReadiness !== "ready") {
+		riskNote += ` 模擬驗證尚未完成（${li.simulationGateReason}），僅為風險提示，不視為封鎖建議之主因。`;
+	} else {
+		riskNote += " 模擬狀態就緒，仍非下單建議。";
+	}
+
+	let actionHint = "請依自身風險承受度斟酌，本訊息非交易指令。";
+	if (mode === "blocked") {
+		primaryReason =
+			!gov.decisionEligible
+				? "決策資格未開放，尚不具備對外建議條件。"
+				: gov.dataUsability !== "decision_ok"
+					? `資料可用性為 ${gov.dataUsability}，需 decision_ok 才進入建議流程。`
+					: `recommendation 層級為 ${li.recommendationReadiness}：${li.recommendationGateReason}`;
+		actionHint = "請待資料與治理條件改善後再參考系統更新。";
+	} else if (mode === "observe_only") {
+		const simExtra =
+			li.simulationReadiness !== "ready"
+				? " 模擬驗證狀態為額外資訊（保守提醒），本次不適合積極配置的主因仍是綜合分數未達門檻，請勿將模擬未完成敘述為本次主因。"
+				: "";
+		primaryReason = `目前先觀察：綜合分數 ${String(diag.candidateScore)} 未達門檻 ${String(
+			diag.balancedMinScore
+		)}；主因為分數／門檻不足，非因模擬未完成而阻擋。${simExtra}`;
+		actionHint = semanticCandidateOnly
+			? "可先觀察盤勢與自身部位；目前僅有方向性線索，不宜視為已點名標的或進場信號。"
+			: "可先觀察盤勢與自身部位，不宜視為進場信號。";
+	} else if (mode === "actionable_with_caution") {
+		primaryReason =
+			"資料可決策、分數達門檻；模擬驗證尚未完成，僅作保守風險提醒，不作為本次未放行的主因；建議保守看待、分批觀察。";
+		actionHint = "可留意配置方向，但宜分批、小步試探，避免重倉。";
+	} else {
+		primaryReason =
+			"資料可決策、分數達門檻且模擬層級就緒；仍僅供參考，非保證報酬。";
+		actionHint = "可留意配置與進出節奏，請自行控管風險與部位。";
+	}
+
+	const gateSummary = [
+		`模式 ${mode}：decisionEligible=${gov.decisionEligible ? "是" : "否"}、dataUsability=${gov.dataUsability}、recommendationReadiness=${li.recommendationReadiness}、simulationReadiness=${li.simulationReadiness}。`,
+		`分數 ${String(diag.candidateScore)}／門檻 ${String(diag.balancedMinScore)}，blockedBy=${diag.blockedBy}，actionableAllowed=${diag.actionableAllowed ? "是" : "否"}。`,
+		diag.gateReasonDetail,
+	].join(" ");
+
+	return {
+		recommendationMode: mode,
+		blockedBy: diag.blockedBy,
+		semanticCandidateOnly,
+		primaryReason,
+		riskNote,
+		actionHint,
+		candidateSummary,
+		gateSummary,
+		simulationCautionLine,
+		explainTags: ["ask_why", "ask_risk", "ask_timing"],
+	};
+}
+
+/** LINE 主回覆用短句，與 gate 同源但不貼整段 log（report 附錄仍用 gateSummary） */
+function buildShortDiagnosticAlignmentZh(pack: RecommendationExplainableSummaryPack): string {
+	if (pack.recommendationMode === "observe_only" && pack.blockedBy === "score") {
+		return "與系統判定一致：未達放行主因為綜合分數未達門檻；模擬驗證為額外風險提醒，非本次阻擋理由。";
+	}
+	if (pack.recommendationMode === "actionable_with_caution") {
+		return "與系統判定一致：分數與資料條件已達可留意範圍；模擬未完成僅作保守提醒，不作為主要阻擋理由。";
+	}
+	return "";
+}
+
+function composeRecommendationLineReplyFromPack(pack: RecommendationExplainableSummaryPack): string {
+	const candidateLabel =
+		pack.semanticCandidateOnly && pack.recommendationMode === "observe_only"
+			? "方向性線索／候選概況"
+			: pack.semanticCandidateOnly
+				? "候選概況"
+				: "候選概況";
+	switch (pack.recommendationMode) {
+		case "actionable":
+			return [
+				pack.semanticCandidateOnly
+					? "【可留意】在目前條件下可留意配置與節奏線索（尚無須點名的具體標的時，請勿解讀為已點名推薦）。"
+					: "【可留意】在目前條件下，可考慮留意配置與進出節奏（仍非下單建議）。",
+				`重點：${pack.primaryReason}`,
+				`${candidateLabel}：${pack.candidateSummary}`,
+				`風險：${pack.riskNote}`,
+				`行動提示：${pack.actionHint}`,
+			].join("\n");
+		case "actionable_with_caution": {
+			const align = buildShortDiagnosticAlignmentZh(pack);
+			return [
+				pack.semanticCandidateOnly
+					? "【可考慮但保守】可分批觀察；模擬驗證尚未完成，僅作風險提醒，不作為主要阻擋理由。"
+					: "【可考慮但保守】可分批觀察；模擬驗證尚未完成，請降低預期與部位。",
+				`重點：${pack.primaryReason}`,
+				`${candidateLabel}：${pack.candidateSummary}`,
+				`風險（含模擬提醒）：${pack.riskNote}`,
+				`行動提示：${pack.actionHint}`,
+				...(align === "" ? [] : [align]),
+			].join("\n");
+		}
+		case "observe_only": {
+			const align = buildShortDiagnosticAlignmentZh(pack);
+			return [
+				"【先觀察】目前不建議視為進場依據；主因是綜合分數未達門檻。",
+				`說明：${pack.primaryReason}`,
+				`${candidateLabel}：${pack.candidateSummary}`,
+				...(align === "" ? [] : [align]),
+				`風險：${pack.riskNote}`,
+			].join("\n");
+		}
+		case "blocked":
+			return [
+				"【尚未具備建議條件】請勿依此訊息進出場；原因與治理、資料就緒度或 recommendation 層級條件相關。",
+				`原因：${pack.primaryReason}`,
+				`候選：${pack.candidateSummary}`,
+				`風險：${pack.riskNote}`,
+			].join("\n");
+	}
+}
+
+function recommendationPackToExplainableSummary(
+	pack: RecommendationExplainableSummaryPack
+): RecommendationExplainableSummary {
+	const headline =
+		pack.recommendationMode === "actionable"
+			? "Recommendation mode: actionable"
+			: pack.recommendationMode === "actionable_with_caution"
+				? "Recommendation mode: actionable_with_caution"
+				: pack.recommendationMode === "observe_only"
+					? "Recommendation mode: observe_only"
+					: "Recommendation mode: blocked";
+	return {
+		headline,
+		reasoning: `${pack.primaryReason}\n${pack.gateSummary}`,
+		action: pack.actionHint,
+		risk: pack.riskNote,
+		renderedText: composeRecommendationLineReplyFromPack(pack),
+	};
+}
+
+function buildRecommendationGateReportAppendix(
+	d: RecommendationGateDiagnostics,
+	pack: RecommendationExplainableSummaryPack | null
+): string {
+	const base = [
+		`候選／綜合分數：${String(d.candidateScore)}（balanced 門檻 ${String(d.balancedMinScore)}，scoreEligible=${d.scoreEligible ? "yes" : "no"}）`,
+		`decisionEligible=${d.decisionEligible ? "true" : "false"} dataUsability=${d.dataUsability} recommendationReadiness=${d.recommendationReadiness}`,
+		`actionableAllowed=${d.actionableAllowed ? "true" : "false"} blockedBy=${d.blockedBy}`,
+		d.gateReasonDetail,
+		`【模擬與建議放行】simulationReadiness=${d.simulationReadiness} — ${d.simulationRoleInSummary}`,
+	].join("\n");
+	if (pack === null) {
+		return base;
+	}
+	return `${base}
+
+【語意摘要】recommendationMode=${pack.recommendationMode}
+${pack.gateSummary}`;
+}
+
+/**
+ * 將「可給建議」與 simulationReadiness 脫鉤：治理與 recommendation ready 達標時允許 active；
+ * simulation 僅併入理由／風險補述，不再單獨因模擬未就緒而維持 idle。
+ */
+function applyRecommendationGateIndependentOfSimulation(
+	gov: MoLiveDataGovernance,
+	li: MoLiveMarketIntelligenceV1,
+	score: number,
+	balancedMinScore: number,
+	recStatus: "active" | "idle",
+	recReason: string,
+	recAction: string
+): {
+	recStatus: "active" | "idle";
+	recReason: string;
+	recAction: string;
+	actionableAllowed: boolean;
+	diagnostics: RecommendationGateDiagnostics;
+} {
+	const actionableAllowedBase =
+		gov.decisionEligible === true &&
+		gov.dataUsability === "decision_ok" &&
+		li.recommendationReadiness === "ready" &&
+		score >= balancedMinScore;
+
+	if (!actionableAllowedBase) {
+		const diagnostics = buildRecommendationGateDiagnostics(
+			gov,
+			li,
+			score,
+			balancedMinScore,
+			false
+		);
+		console.log("[mo] recommendation gate", diagnostics);
+		return {
+			recStatus,
+			recReason,
+			recAction,
+			actionableAllowed: false,
+			diagnostics,
+		};
+	}
+
+	let outStatus = recStatus;
+	let outReason = recReason;
+	let outAction = recAction;
+
+	if (recStatus === "idle") {
+		let nextReason = li.recommendationGateReason;
+		if (li.simulationReadiness !== "ready") {
+			nextReason = `${nextReason} 另：模擬驗證尚未完成（${li.simulationGateReason}），建議保守看待。`;
+		}
+		const nextAction =
+			li.simulationReadiness === "ready"
+				? "可參考目前建議與評分語氣；仍非投資顧問意見。"
+				: "可參考目前建議與評分語氣；模擬尚未就緒，請保守參考（仍非投資顧問意見）。";
+		outStatus = "active";
+		outReason = nextReason;
+		outAction = nextAction;
+	} else if (li.simulationReadiness !== "ready") {
+		outReason = `${recReason} 另：模擬驗證尚未完成（${li.simulationGateReason}），建議保守看待。`;
+		outAction = `${recAction}（模擬驗證尚未完成，建議保守看待。）`;
+	}
+
+	const diagnostics = buildRecommendationGateDiagnostics(gov, li, score, balancedMinScore, true);
+	console.log("[mo] recommendation gate", diagnostics);
+
+	return {
+		recStatus: outStatus,
+		recReason: outReason,
+		recAction: outAction,
+		actionableAllowed: true,
+		diagnostics,
+	};
+}
 
 function formatMoLiveGovernanceStatusBlock(
 	row: MoLiveSnapshotRow,
@@ -4868,6 +5433,8 @@ async function computeMoPushEvaluationForUser(
 	liveSnapshotId: number | null;
 	decisionTradeDateYyyymmdd: string;
 	decisionClose: number | null;
+	recommendationGateDiagnostics: RecommendationGateDiagnostics;
+	recommendationExplainablePack: RecommendationExplainableSummaryPack;
 }> {
 	const s = await getSystemStatus(env, userId);
 	const hasUserId = userId.trim() !== "";
@@ -5043,6 +5610,28 @@ async function computeMoPushEvaluationForUser(
 	recStatus = recGated.recStatus;
 	recReason = recGated.recReason;
 	recAction = recGated.recAction;
+
+	const recSimSplit = applyRecommendationGateIndependentOfSimulation(
+		liveDataGovernance,
+		liveMarketIntelligenceV1,
+		score,
+		activeStrategyConfig.balancedMinScore,
+		recStatus,
+		recReason,
+		recAction
+	);
+	recStatus = recSimSplit.recStatus;
+	recReason = recSimSplit.recReason;
+	recAction = recSimSplit.recAction;
+	const recommendationGateDiagnostics = recSimSplit.diagnostics;
+
+	const recommendationExplainablePack = buildRecommendationExplainableSummaryPack(
+		liveDataGovernance,
+		liveMarketIntelligenceV1,
+		recommendationGateDiagnostics,
+		null
+	);
+
 	const simGated = applyLiveIntelligenceToSimulationFields(liveMarketIntelligenceV1, {
 		simResult,
 		simReady,
@@ -5068,9 +5657,8 @@ async function computeMoPushEvaluationForUser(
 	);
 	const forcedActionLine = (env.MO_FORCE_REPORT_ACTION_LINE ?? "").trim();
 	const actionLine =
-		forcedActionLine !== "" ?
-			forcedActionLine
-		:	buildActionLineLiveIntelligence(score, liveMarketIntelligenceV1);
+		forcedActionLine !== "" ? forcedActionLine
+		:	`${recommendationExplainablePack.actionHint}\n${recommendationExplainablePack.primaryReason}`;
 	const audit = await readMoPushAudit(env, userId);
 	const strategyReview = await readStrategyReviewState(env);
 	let currentPromoteKey = "";
@@ -5189,6 +5777,8 @@ async function computeMoPushEvaluationForUser(
 		liveSnapshotId,
 		decisionTradeDateYyyymmdd,
 		decisionClose,
+		recommendationGateDiagnostics,
+		recommendationExplainablePack,
 	};
 }
 async function handleCommand(
@@ -6731,6 +7321,12 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 	  case "/report": {
 		const isReportTestChange = command === "/report-test-change";
 		const ctx = await computeMoPushEvaluationForUser(env, userId, isReportTestChange);
+		console.log("[mo] recommendation summary", {
+			recommendationMode: ctx.recommendationExplainablePack.recommendationMode,
+			primaryReason: ctx.recommendationExplainablePack.primaryReason,
+			riskNote: ctx.recommendationExplainablePack.riskNote,
+			actionHint: ctx.recommendationExplainablePack.actionHint,
+		});
 		const hasUserId = ctx.hasUserId;
 		const totalNotesNum = ctx.totalNotesNum;
 		const score = ctx.score;
@@ -7049,7 +7645,7 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 			ctx.liveMarketIntelligenceV1
 		);
 
-		return moReportComposeFullTextV1({
+		const reportBody = moReportComposeFullTextV1({
 			displayDate: ctx.displayDate,
 			dataSource: ctx.dataSource,
 			dataQualityLine,
@@ -7058,6 +7654,14 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 			actionLine: ctx.actionLine,
 			simulationLine,
 		});
+		const gateAppendix = buildRecommendationGateReportAppendix(
+			ctx.recommendationGateDiagnostics,
+			ctx.recommendationExplainablePack
+		);
+		return `${reportBody}
+
+【建議放行摘要】
+${gateAppendix}`;
 	  }
 	  // TODO: later commands
 	  // case "/help":
@@ -7385,6 +7989,7 @@ async function getReplyText(
 						let replyText: string;
 						if (moInput.intent === "recommendation") {
 							console.log("[mo] reply branch recommendation");
+							const pushCtx = await computeMoPushEvaluationForUser(env, userId, false);
 							const precheckResult = buildRecommendationPrecheckResult(govForLog);
 							console.log("[mo] recommendation precheck", precheckResult);
 							const recommendationOutput = buildRecommendationOutput(
@@ -7395,13 +8000,22 @@ async function getReplyText(
 									snapshotReadOk: snapshot.kind === "ok",
 								}
 							);
-							console.log("[mo] recommendation output", recommendationOutput);
-							console.log("[mo] recommendation explainable summary attached", {
-								headline: recommendationOutput.explainableSummary.headline,
-								renderedTextPresent:
-									recommendationOutput.explainableSummary.renderedText.length > 0,
+							const linePack = buildRecommendationExplainableSummaryPack(
+								pushCtx.liveDataGovernance,
+								pushCtx.liveMarketIntelligenceV1,
+								pushCtx.recommendationGateDiagnostics,
+								recommendationOutput
+							);
+							console.log("[mo] recommendation summary", {
+								recommendationMode: linePack.recommendationMode,
+								primaryReason: linePack.primaryReason,
+								riskNote: linePack.riskNote,
+								actionHint: linePack.actionHint,
+								candidateSummary: linePack.candidateSummary,
 							});
+							console.log("[mo] recommendation output", recommendationOutput);
 							console.log("[mo] recommendation follow-up branch", moInput.followUpIntent);
+							const packSummary = recommendationPackToExplainableSummary(linePack);
 							const followUpRenderCtx: RecommendationFollowUpRenderContext | null =
 								moInput.followUpIntent === "none"
 									? null
@@ -7409,22 +8023,34 @@ async function getReplyText(
 											followUpIntent: moInput.followUpIntent,
 											moFactsEnglish: buildRecommendationFollowUpMoFactsEnglish(
 												recommendationOutput,
-												moInput.followUpIntent
+												moInput.followUpIntent,
+												linePack
 											),
 										};
-							console.log("[ai] rendering start");
-							const zhRender = await renderRecommendationExplainableSummaryZh(
-								env,
-								recommendationOutput.explainableSummary,
-								followUpRenderCtx
-							);
-							if (zhRender.ok) {
-								console.log("[ai] rendering success");
-								replyText = zhRender.text;
+							if (moInput.followUpIntent !== "none") {
+								console.log("[mo] explain followup", {
+									followUpIntent: moInput.followUpIntent,
+									recommendationMode: linePack.recommendationMode,
+									primaryReason: linePack.primaryReason,
+								});
+							}
+							if (moInput.followUpIntent === "none") {
+								replyText = composeRecommendationLineReplyFromPack(linePack);
 							} else {
-								console.log("[ai] rendering fallback");
-								console.warn("openai_fail_timeout_or_empty");
-								replyText = recommendationOutput.explainableSummary.renderedText;
+								console.log("[ai] rendering start");
+								const zhRender = await renderRecommendationExplainableSummaryZh(
+									env,
+									packSummary,
+									followUpRenderCtx
+								);
+								if (zhRender.ok) {
+									console.log("[ai] rendering success");
+									replyText = zhRender.text;
+								} else {
+									console.log("[ai] rendering fallback");
+									console.warn("openai_fail_timeout_or_empty");
+									replyText = composeRecommendationLineReplyFromPack(linePack);
+								}
 							}
 						} else if (moInput.intent === "report") {
 							console.log("[mo] reply branch report");

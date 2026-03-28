@@ -6,7 +6,8 @@ export type RecommendationFollowUpIntent =
 	| "ask_more_candidates"
 	| "ask_why"
 	| "ask_risk"
-	| "ask_action";
+	| "ask_action"
+	| "ask_timing";
 
 export type IntentParseResult = {
 	intent: IntentKind;
@@ -103,7 +104,8 @@ export function normalizeIntentPayload(
 			f === "ask_more_candidates" ||
 			f === "ask_why" ||
 			f === "ask_risk" ||
-			f === "ask_action"
+			f === "ask_action" ||
+			f === "ask_timing"
 		) {
 			followUpIntent = f;
 		}
