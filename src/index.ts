@@ -30,6 +30,7 @@ import {
 	applyLiveIntelligenceToRecommendationFields,
 	applyLiveIntelligenceToSimulationFields,
 	parseNumericCloseFromMoLivePayloadSummary,
+	moLiveExtractMarketValue,
 	finalizeMoReviewFromReturns,
 	evaluateMoPushEventDecision,
 	MO_PUSH_COOLDOWN_MS_DEFAULT,
@@ -3787,20 +3788,71 @@ type MoDecisionReviewPendingFinalizeRow = {
 	decision_close: number | null;
 };
 
-/** 與 /report 相同：自 snapshot 的 v2 payload_summary（必要時 raw_payload）解析收盤價 */
-function parseCloseFromMoLiveSnapshotRow(row: {
-	payload_summary: string;
-	raw_payload: string;
-}): number | null {
-	const fromSummary = parseNumericCloseFromMoLivePayloadSummary(row.payload_summary);
-	if (fromSummary !== null && fromSummary > 0) {
-		return fromSummary;
+/** 與 mo-live 寫入前相同：自 TWSE raw JSON 經 `summarizeTwseMiIndexPayload` 再抽 close（executeMoLiveDataCycle） */
+function parseCloseFromMoLiveRawPayload(rawPayload: string): number | null {
+	if (typeof rawPayload !== "string" || rawPayload.trim() === "") {
+		return null;
 	}
-	const fromRaw = parseNumericCloseFromMoLivePayloadSummary(row.raw_payload);
-	if (fromRaw !== null && fromRaw > 0) {
-		return fromRaw;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(rawPayload);
+	} catch {
+		return null;
 	}
-	return null;
+	const summary = summarizeTwseMiIndexPayload(parsed);
+	const s = moLiveExtractMarketValue(summary);
+	if (s === null) {
+		return null;
+	}
+	const n = Number(s);
+	return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/**
+ * 與 /report 相同來源：
+ * 1) `parseNumericCloseFromMoLivePayloadSummary(payload_summary)`（computeMoPushEvaluationForUser 之 decisionClose）
+ * 2) `moLiveExtractMarketValue(deriveMoLiveDataGovernance(...).legacySummary)`（deriveLiveMarketIntelligenceV1 之行情數值）
+ * 3) `summarizeTwseMiIndexPayload` + `moLiveExtractMarketValue`（與寫入 snapshot 前之 TWSE raw 解析相同）
+ * 4) `tryFinMindTaiexCloseForTradeDate`（與 executeMoLiveDataCycle 在 legacy 無 close 時之補值相同）
+ */
+async function resolveFutureCloseForReviewFinalize(
+	env: Env,
+	row: MoLiveSnapshotRowForReviewFinalize,
+	nowMs: number,
+	todayYyyymmdd: string
+): Promise<number | null> {
+	const fromReportDecision = parseNumericCloseFromMoLivePayloadSummary(row.payload_summary);
+	if (fromReportDecision !== null && fromReportDecision > 0) {
+		return fromReportDecision;
+	}
+	const gov = deriveMoLiveDataGovernanceTyped(
+		{
+			id: row.id,
+			trade_date: row.trade_date,
+			source: row.source,
+			payload_summary: row.payload_summary,
+			created_at: row.created_at,
+		},
+		nowMs,
+		todayYyyymmdd
+	);
+	const fromGovLegacy = moLiveExtractMarketValue(gov.legacySummary);
+	if (fromGovLegacy !== null) {
+		const n = Number(fromGovLegacy);
+		if (Number.isFinite(n) && n > 0) {
+			return n;
+		}
+	}
+	const fromRawSummary = parseCloseFromMoLiveRawPayload(row.raw_payload);
+	if (fromRawSummary !== null && fromRawSummary > 0) {
+		return fromRawSummary;
+	}
+	const finStr = await tryFinMindTaiexCloseForTradeDate(env, row.trade_date);
+	if (finStr === null) {
+		return null;
+	}
+	const finN = Number(finStr);
+	return Number.isFinite(finN) && finN > 0 ? finN : null;
 }
 
 type MoLiveSnapshotRowForReviewFinalize = {
@@ -3840,7 +3892,20 @@ async function finalizePendingDecisionReviews(env: Env): Promise<void> {
 		return;
 	}
 
+	const pendingIdsForLog: number[] = [];
+	for (const pr of pending) {
+		const pn = typeof pr.id === "bigint" ? Number(pr.id) : pr.id;
+		if (Number.isFinite(pn)) {
+			pendingIdsForLog.push(pn);
+		}
+	}
+	console.log("[review] pending ids", {
+		count: pending.length,
+		ids: pendingIdsForLog,
+	});
+
 	const todayYyyymmdd = getTaipeiYYYYMMDDMinusDaysFromToday(0);
+	const nowMs = Date.now();
 
 	for (const row of pending) {
 		const idNum = typeof row.id === "bigint" ? Number(row.id) : row.id;
@@ -3860,36 +3925,65 @@ async function finalizePendingDecisionReviews(env: Env): Promise<void> {
 		}
 
 		if (todayYyyymmdd <= row.trade_date) {
+			console.log("[review] skip not past decision trade day", {
+				id: idNum,
+				tradeDate: row.trade_date,
+				todayYyyymmdd,
+			});
 			continue;
 		}
 
-		let snap: MoLiveSnapshotRowForReviewFinalize | null = null;
+		let candidates: MoLiveSnapshotRowForReviewFinalize[] = [];
 		try {
-			const sq = await env.MO_DB.prepare(
+			const cq = await env.MO_DB.prepare(
 				`SELECT id, trade_date, source, payload_summary, raw_payload, created_at
 				 FROM mo_live_market_snapshots
 				 WHERE trade_date > ?
-				 ORDER BY trade_date DESC, id DESC
-				 LIMIT 1`
+				 ORDER BY trade_date ASC, id ASC`
 			)
 				.bind(row.trade_date)
-				.first<MoLiveSnapshotRowForReviewFinalize>();
-			snap = sq ?? null;
+				.all<MoLiveSnapshotRowForReviewFinalize>();
+			candidates = cq.results ?? [];
 		} catch {
-			snap = null;
+			candidates = [];
 		}
 
-		if (snap === null) {
+		if (candidates.length === 0) {
 			console.log("[review] skip no future snapshot", { id: idNum, tradeDate: row.trade_date });
 			continue;
 		}
 
-		const futureClose = parseCloseFromMoLiveSnapshotRow(snap);
-		if (futureClose === null || futureClose <= 0) {
+		let futureClose: number | null = null;
+		let snap: MoLiveSnapshotRowForReviewFinalize | null = null;
+		for (const candidate of candidates) {
+			const parsed = await resolveFutureCloseForReviewFinalize(
+				env,
+				candidate,
+				nowMs,
+				todayYyyymmdd
+			);
+			console.log("[review] future snapshot parsed", {
+				id: idNum,
+				tradeDate: row.trade_date,
+				snapshotId: candidate.id,
+				snapshotTradeDate: candidate.trade_date,
+				source: candidate.source,
+				hasPayloadSummary: Boolean(candidate.payload_summary),
+				hasRawPayload: Boolean(candidate.raw_payload),
+				parsedClose: parsed ?? null,
+			});
+			if (parsed !== null && parsed > 0) {
+				futureClose = parsed;
+				snap = candidate;
+				break;
+			}
+		}
+
+		if (snap === null || futureClose === null || futureClose <= 0) {
 			console.log("[review] skip no future close", {
 				id: idNum,
 				tradeDate: row.trade_date,
-				snapshotTradeDate: snap.trade_date,
+				triedSnapshots: candidates.length,
 			});
 			continue;
 		}
