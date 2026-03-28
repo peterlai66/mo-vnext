@@ -2,8 +2,10 @@
 
 /** MO live 資料可信度（與 Worker / dev-check 單一推導；規則集中於此） */
 
-const MO_LIVE_GOV_FRESH_MS = 30 * 60 * 1000;
-const MO_LIVE_GOV_AGING_MS = 2 * 60 * 60 * 1000;
+/** 與 Worker arbitration 對齊：floor(ageMin) < 5 → fresh；5～10 → aging；>10 至本上限 → stale */
+const MO_LIVE_GOV_FRESH_MS = 5 * 60 * 1000;
+/** 對外常數：aging 區間上界（分鐘，含）；實際分級以 floor(ageMs/60000) 為準 */
+const MO_LIVE_GOV_AGING_MS = 10 * 60 * 1000;
 const MO_LIVE_GOV_STALE_MS = 6 * 60 * 60 * 1000;
 
 /**
@@ -36,8 +38,9 @@ function moLiveTradeDateLagDays(tradeYyyymmdd, todayYyyymmdd) {
  */
 function moLiveStalenessFromAgeMs(ageMs) {
 	if (!Number.isFinite(ageMs)) return "too_old";
-	if (ageMs <= MO_LIVE_GOV_FRESH_MS) return "fresh";
-	if (ageMs <= MO_LIVE_GOV_AGING_MS) return "aging";
+	const minutes = Math.floor(ageMs / 60000);
+	if (minutes < 5) return "fresh";
+	if (minutes <= 10) return "aging";
 	if (ageMs <= MO_LIVE_GOV_STALE_MS) return "stale";
 	return "too_old";
 }
@@ -213,7 +216,7 @@ function deriveMoLiveDataGovernance(p) {
 		v2.fetchStatus === "success" &&
 		stalenessLevel === "fresh" &&
 		lagDays <= 0 &&
-		ageMs <= MO_LIVE_GOV_FRESH_MS
+		ageMs < MO_LIVE_GOV_FRESH_MS
 	) {
 		pushEligible = true;
 	}

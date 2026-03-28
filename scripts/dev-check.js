@@ -1700,7 +1700,8 @@ function runDevCheckMain() {
 		console.log("[mo-live] governance");
 		const today = getTaipeiYYYYMMDDMinusDaysFromToday(0);
 		const now = Date.now();
-		const isoFresh = new Date(now - 10 * 60 * 1000).toISOString();
+		/** 須落在 governance fresh 區（floor(分) < 5）以維持 push_ok / trusted 測試 */
+		const isoFresh = new Date(now - 3 * 60 * 1000).toISOString();
 		const v2Primary = {
 			v: 2,
 			source: MO_LIVE_SOURCE_TWSE_MI_INDEX,
@@ -1833,11 +1834,186 @@ function runDevCheckMain() {
 	runMoLiveGovernanceDevChecks();
 	passCount += 1;
 
+	/**
+	 * 白盒：governance staleness / freshnessMinutes 與 arbitration（與 Worker index.ts 同邏輯）對齊矩陣
+	 */
+	function resolveArbitrationTwseOnlyForMatrix(row, nowMs) {
+		if (row === null) {
+			return { arbitrationType: "unavailable", chosenSource: "none", confidence: "low" };
+		}
+		const t = Date.parse(row.created_at);
+		if (!Number.isFinite(t)) {
+			return { arbitrationType: "primary_weak", chosenSource: "TWSE", confidence: "medium" };
+		}
+		const fm = Math.floor((nowMs - t) / 60000);
+		if (fm < 5) {
+			return { arbitrationType: "primary_strong", chosenSource: "TWSE", confidence: "high" };
+		}
+		if (fm <= 10) {
+			return { arbitrationType: "primary_moderate", chosenSource: "TWSE", confidence: "medium" };
+		}
+		return { arbitrationType: "primary_weak", chosenSource: "TWSE", confidence: "medium" };
+	}
+
+	function liveDataArbitrationToneZhForMatrix(arbitrationType) {
+		switch (arbitrationType) {
+			case "primary_strong":
+				return "【行情資料語氣】資料穩定。";
+			case "primary_moderate":
+				return "【行情資料語氣】資料略舊，時效屬中等區間。";
+			case "primary_weak":
+				return "【行情資料語氣】時效偏弱，資料偏舊。";
+			default:
+				return `【行情資料語氣】${arbitrationType}`;
+		}
+	}
+
+	function runMoLiveFreshnessArbitrationAlignmentMatrix() {
+		console.log("[mo-live] freshness vs arbitration matrix (white-box)");
+		const today = getTaipeiYYYYMMDDMinusDaysFromToday(0);
+		const now = Date.now();
+		const v2Primary = {
+			v: 2,
+			source: MO_LIVE_SOURCE_TWSE_MI_INDEX,
+			sourceLevel: "primary",
+			fetchStatus: "success",
+			confidence: "high",
+			rawAvailabilityNote: "matrix",
+			legacySummary: "stat=OK;close=18000",
+		};
+		const targets = [3, 5, 8, 10, 11];
+		for (const m of targets) {
+			const iso = new Date(now - m * 60 * 1000).toISOString();
+			const row = {
+				trade_date: today,
+				created_at: iso,
+				payload_summary: JSON.stringify(v2Primary),
+			};
+			const g = deriveMoLiveDataGovernance({
+				row,
+				nowMs: now,
+				todayYyyymmdd: today,
+			});
+			const arb = resolveArbitrationTwseOnlyForMatrix(row, now);
+			const tone = liveDataArbitrationToneZhForMatrix(arb.arbitrationType);
+			const okFresh = m < 5;
+			const okModerate = m >= 5 && m <= 10;
+			const okWeak = m > 10;
+			const expectStrong = okFresh;
+			const expectModerate = okModerate;
+			const expectWeak = okWeak;
+			const arbOk =
+				(expectStrong && arb.arbitrationType === "primary_strong") ||
+				(expectModerate && arb.arbitrationType === "primary_moderate") ||
+				(expectWeak && arb.arbitrationType === "primary_weak");
+			const stalenessOk =
+				(okFresh && g.stalenessLevel === "fresh") ||
+				(okModerate && g.stalenessLevel === "aging") ||
+				(okWeak && g.stalenessLevel === "stale");
+			const displayOk =
+				(okFresh && g.displayFetchStatus === "success" && g.liveFreshness === "ok") ||
+				(okModerate && g.displayFetchStatus === "success" && g.liveFreshness === "aging") ||
+				(okWeak && g.displayFetchStatus === "stale" && g.liveFreshness === "stale");
+			const toneOk =
+				(okFresh && !tone.includes("偏弱") && tone.includes("穩定")) ||
+				(okModerate && !tone.includes("穩定") && !tone.includes("偏弱")) ||
+				(okWeak && tone.includes("偏弱"));
+			console.log("[mo-live] matrix case", {
+				inputTargetMinutes: m,
+				freshnessMinutes: g.freshnessMinutes,
+				displayFetchStatus: g.displayFetchStatus,
+				liveFreshness: g.liveFreshness,
+				stalenessLevel: g.stalenessLevel,
+				arbitrationType: arb.arbitrationType,
+				arbitrationConfidence: arb.confidence,
+				reportTone: tone,
+				expectArbOk: arbOk,
+				expectStalenessOk: stalenessOk,
+				expectDisplayOk: displayOk,
+				expectToneOk: toneOk,
+			});
+			if (!arbOk || !stalenessOk || !displayOk || !toneOk) {
+				throw new Error(`[mo-live] freshness matrix failed at m=${m}`);
+			}
+		}
+		console.log("[mo-live] freshness vs arbitration matrix ok");
+	}
+
+	/** 黑盒：無 D1／LINE，僅用與 Worker 相同之 governance／LI 組字模擬 status／report 片段 */
+	function runMoLiveBlackBoxSyntheticSnippet() {
+		console.log("[mo-live] black-box synthetic (no D1 / no LINE API)");
+		const today = getTaipeiYYYYMMDDMinusDaysFromToday(0);
+		const now = Date.now();
+		const v2Primary = {
+			v: 2,
+			source: MO_LIVE_SOURCE_TWSE_MI_INDEX,
+			sourceLevel: "primary",
+			fetchStatus: "success",
+			confidence: "high",
+			rawAvailabilityNote: "synthetic",
+			legacySummary: "stat=OK;close=18000",
+		};
+		for (const m of [3, 8]) {
+			const iso = new Date(now - m * 60 * 1000).toISOString();
+			const row = {
+				trade_date: today,
+				created_at: iso,
+				payload_summary: JSON.stringify(v2Primary),
+			};
+			const g = deriveMoLiveDataGovernance({
+				row,
+				nowMs: now,
+				todayYyyymmdd: today,
+			});
+			const arb = resolveArbitrationTwseOnlyForMatrix(row, now);
+			const li = deriveLiveMarketIntelligenceV1(g, {
+				rowIsNull: false,
+				noteCountForRec: 3,
+				todayYyyymmdd: today,
+			});
+			const dataQualityLine = `${buildMoReportDataQualityNote(g)}\n${liveDataArbitrationToneZhForMatrix(arb.arbitrationType)}`;
+			const marketSummaryLine = buildMoReportMarketSummarySection(
+				li,
+				g,
+				formatDisplayDateFromYyyymmdd(today),
+				g.source
+			);
+			const statusBlock = [
+				`fetchStatus: ${g.displayFetchStatus}`,
+				`liveFreshness: ${g.liveFreshness}`,
+				`freshnessMinutes: ${g.freshnessMinutes === null ? "n/a" : String(g.freshnessMinutes)}`,
+				`stalenessLevel: ${g.stalenessLevel}`,
+				`arbitrationType: ${arb.arbitrationType}`,
+				`chosenSource: ${arb.chosenSource}`,
+				`arbitrationConfidence: ${arb.confidence}`,
+			].join("\n");
+			console.log(`[mo-live] synthetic [Live market] (age floor=${m} min)\n${statusBlock}`);
+			console.log(
+				`[mo-live] synthetic MO Report excerpt (age floor=${m} min)\n【資料品質】\n${dataQualityLine}\n\n【行情摘要】\n${marketSummaryLine}`
+			);
+			const sysL = buildSystemDecisionLineLiveIntelligence(
+				"balanced",
+				72,
+				true,
+				"近期有活動",
+				li
+			);
+			const actL = buildActionLineLiveIntelligence(72, li);
+			console.log(
+				`[mo-live] synthetic recommendation-style lines (age floor=${m} min)\n【系統判斷】\n${sysL}\n【建議】\n${actL}`
+			);
+		}
+	}
+
+	runMoLiveFreshnessArbitrationAlignmentMatrix();
+	runMoLiveBlackBoxSyntheticSnippet();
+	passCount += 1;
+
 	function runMoLiveIntelligenceV1DevChecks() {
 		console.log("[mo-live] intelligence v1");
 		const today = getTaipeiYYYYMMDDMinusDaysFromToday(0);
 		const now = Date.now();
-		const isoFresh = new Date(now - 10 * 60 * 1000).toISOString();
+		const isoFresh = new Date(now - 3 * 60 * 1000).toISOString();
 		const v2Primary = {
 			v: 2,
 			source: MO_LIVE_SOURCE_TWSE_MI_INDEX,

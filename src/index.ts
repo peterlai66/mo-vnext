@@ -2745,6 +2745,197 @@ async function tryTwseOpenApiMiIndexWeighted(env: Env): Promise<
 	return { ok: false, note: lastNote || "TWSE OpenAPI MI_INDEX empty" };
 }
 
+/** 與 D1 `mo_live_market_snapshots` 列一致；仲裁層與最新快照讀取共用 */
+type SnapshotRow = MoLiveSnapshotRow;
+
+function moLiveSnapshotRowFromDbRecord(r: Record<string, unknown>): SnapshotRow | null {
+	const rid = r.id;
+	const td = r.trade_date;
+	const src = r.source;
+	const ps = r.payload_summary;
+	const ca = r.created_at;
+	if (
+		typeof td !== "string" ||
+		typeof src !== "string" ||
+		typeof ps !== "string" ||
+		typeof ca !== "string"
+	) {
+		return null;
+	}
+	let idNum: number | undefined;
+	if (typeof rid === "number" && Number.isFinite(rid)) {
+		idNum = rid;
+	} else if (typeof rid === "bigint") {
+		idNum = Number(rid);
+	}
+	const row: MoLiveSnapshotRow = {
+		trade_date: td,
+		source: src,
+		payload_summary: ps,
+		created_at: ca,
+	};
+	if (idNum !== undefined) {
+		row.id = idNum;
+	}
+	return row;
+}
+
+/** 與 governance-core freshnessMinutes 一致：Math.floor(ageMs / 60000) */
+function moLiveSnapshotFreshnessMinutes(row: SnapshotRow, nowMs: number): number | null {
+	const t = Date.parse(row.created_at);
+	if (!Number.isFinite(t)) return null;
+	const ageMs = nowMs - t;
+	return Math.floor(ageMs / 60_000);
+}
+
+/**
+ * 資料來源仲裁 v1：TWSE 家族（rwd MI_INDEX／OpenAPI）vs FinMind TAIEX 日線，供 status／report／push 共用語意。
+ */
+function resolveLiveDataArbitration(
+	twse: SnapshotRow | null,
+	finmind: SnapshotRow | null,
+	nowMs: number
+): {
+	arbitrationType: string;
+	chosenSource: string;
+	confidence: "high" | "medium" | "low";
+} {
+	const twseExists = twse !== null;
+	const finExists = finmind !== null;
+
+	if (!twseExists && !finExists) {
+		return { arbitrationType: "unavailable", chosenSource: "none", confidence: "low" };
+	}
+
+	const closeTw =
+		twse !== null ? parseNumericCloseFromMoLivePayloadSummary(twse.payload_summary) : null;
+	const closeFm =
+		finmind !== null ? parseNumericCloseFromMoLivePayloadSummary(finmind.payload_summary) : null;
+
+	if (
+		twseExists &&
+		finExists &&
+		closeTw !== null &&
+		closeFm !== null &&
+		closeTw > 0
+	) {
+		const pct = (Math.abs(closeTw - closeFm) / closeTw) * 100;
+		if (pct > 0.5) {
+			return { arbitrationType: "mixed", chosenSource: "TWSE", confidence: "medium" };
+		}
+	}
+
+	if (!twseExists && finExists) {
+		return { arbitrationType: "fallback_only", chosenSource: "FinMind", confidence: "low" };
+	}
+
+	if (twseExists && twse !== null) {
+		const fm = moLiveSnapshotFreshnessMinutes(twse, nowMs);
+		if (fm === null) {
+			return { arbitrationType: "primary_weak", chosenSource: "TWSE", confidence: "medium" };
+		}
+		/** 與 governance staleness／freshnessMinutes 對齊：5～10 分不得標為 primary_strong */
+		if (fm < 5) {
+			return { arbitrationType: "primary_strong", chosenSource: "TWSE", confidence: "high" };
+		}
+		if (fm <= 10) {
+			return { arbitrationType: "primary_moderate", chosenSource: "TWSE", confidence: "medium" };
+		}
+		return { arbitrationType: "primary_weak", chosenSource: "TWSE", confidence: "medium" };
+	}
+
+	return { arbitrationType: "fallback_only", chosenSource: "FinMind", confidence: "low" };
+}
+
+/**
+ * 仲裁僅依「寫入時間／多源收盤」；governance 另合併交易日落後。
+ * 當合併後 staleness 仍為 stale 時，不得維持 primary_strong（避免與 status／資料品質「偏弱」並存時 report 仍寫「資料穩定」）。
+ */
+function reconcileLiveDataArbitrationWithGovernance(
+	arb: ReturnType<typeof resolveLiveDataArbitration>,
+	gov: MoLiveDataGovernance
+): ReturnType<typeof resolveLiveDataArbitration> {
+	if (gov.stalenessLevel === "too_old") {
+		return { arbitrationType: "unavailable", chosenSource: "none", confidence: "low" };
+	}
+	if (gov.stalenessLevel === "stale" && arb.arbitrationType === "primary_strong") {
+		return {
+			arbitrationType: "primary_moderate",
+			chosenSource: arb.chosenSource,
+			confidence: "medium",
+		};
+	}
+	return arb;
+}
+
+function formatLiveDataArbitrationStatusLines(arb: ReturnType<typeof resolveLiveDataArbitration>): string {
+	return [
+		`arbitrationType: ${arb.arbitrationType}`,
+		`chosenSource: ${arb.chosenSource}`,
+		`arbitrationConfidence: ${arb.confidence}`,
+	].join("\n");
+}
+
+/** Report【資料品質】底下加一行語氣（與 arbitrationType 對齊） */
+function liveDataArbitrationToneZh(arbitrationType: string): string {
+	switch (arbitrationType) {
+		case "primary_strong":
+			return "【行情資料語氣】資料穩定。";
+		case "primary_moderate":
+			return "【行情資料語氣】資料略舊，時效屬中等區間。";
+		case "primary_weak":
+			return "【行情資料語氣】時效偏弱，資料偏舊。";
+		case "fallback_only":
+			return "【行情資料語氣】資料來源有限。";
+		case "mixed":
+			return "【行情資料語氣】資料存在差異。";
+		case "unavailable":
+			return "【行情資料語氣】無法取得可靠資料。";
+		default:
+			return `【行情資料語氣】${arbitrationType}`;
+	}
+}
+
+function isLiveDataArbitrationPushBlocked(arb: ReturnType<typeof resolveLiveDataArbitration>): boolean {
+	return arb.arbitrationType === "primary_weak" || arb.arbitrationType === "fallback_only";
+}
+
+async function readLatestMoLiveSnapshotForTwseFamily(env: Env): Promise<SnapshotRow | null> {
+	try {
+		const r = await env.MO_DB.prepare(
+			`SELECT id, trade_date, source, payload_summary, created_at
+			 FROM mo_live_market_snapshots
+			 WHERE source IN (?, ?)
+			 ORDER BY id DESC
+			 LIMIT 1`
+		)
+			.bind(MO_LIVE_SOURCE_TWSE_MI_INDEX, MO_LIVE_SOURCE_TWSE_OPENAPI_MI_INDEX)
+			.first<Record<string, unknown>>();
+		if (r === null) return null;
+		return moLiveSnapshotRowFromDbRecord(r);
+	} catch {
+		return null;
+	}
+}
+
+async function readLatestMoLiveSnapshotForFinMind(env: Env): Promise<SnapshotRow | null> {
+	try {
+		const r = await env.MO_DB.prepare(
+			`SELECT id, trade_date, source, payload_summary, created_at
+			 FROM mo_live_market_snapshots
+			 WHERE source = ?
+			 ORDER BY id DESC
+			 LIMIT 1`
+		)
+			.bind(MO_LIVE_SOURCE_FINMIND_TAIEX)
+			.first<Record<string, unknown>>();
+		if (r === null) return null;
+		return moLiveSnapshotRowFromDbRecord(r);
+	} catch {
+		return null;
+	}
+}
+
 async function readLatestMoLiveMarketSnapshot(
 	env: Env
 ): Promise<{ kind: "ok"; row: MoLiveSnapshotRow | null } | { kind: "error"; message: string }> {
@@ -2758,33 +2949,9 @@ async function readLatestMoLiveMarketSnapshot(
 		if (r === null) {
 			return { kind: "ok", row: null };
 		}
-		const rid = r.id;
-		const td = r.trade_date;
-		const src = r.source;
-		const ps = r.payload_summary;
-		const ca = r.created_at;
-		if (
-			typeof td !== "string" ||
-			typeof src !== "string" ||
-			typeof ps !== "string" ||
-			typeof ca !== "string"
-		) {
+		const row = moLiveSnapshotRowFromDbRecord(r);
+		if (row === null) {
 			return { kind: "error", message: "invalid mo_live row shape" };
-		}
-		let idNum: number | undefined;
-		if (typeof rid === "number" && Number.isFinite(rid)) {
-			idNum = rid;
-		} else if (typeof rid === "bigint") {
-			idNum = Number(rid);
-		}
-		const row: MoLiveSnapshotRow = {
-			trade_date: td,
-			source: src,
-			payload_summary: ps,
-			created_at: ca,
-		};
-		if (idNum !== undefined) {
-			row.id = idNum;
 		}
 		return {
 			kind: "ok",
@@ -2797,27 +2964,37 @@ async function readLatestMoLiveMarketSnapshot(
 }
 
 async function buildMoLiveMarketStatusBlock(env: Env): Promise<string> {
-	const read = await readLatestMoLiveMarketSnapshot(env);
+	const [read, twseRow, finmindRow] = await Promise.all([
+		readLatestMoLiveMarketSnapshot(env),
+		readLatestMoLiveSnapshotForTwseFamily(env),
+		readLatestMoLiveSnapshotForFinMind(env),
+	]);
 	const nowMs = Date.now();
+	let arb = resolveLiveDataArbitration(twseRow, finmindRow, nowMs);
 	const todayYyyymmdd = getTaipeiYYYYMMDDMinusDaysFromToday(0);
 	if (read.kind === "error") {
-		return formatMoLiveMarketStatusBlock(null, { d1ReadError: read.message });
+		const govErr = deriveMoLiveDataGovernanceTyped(null, nowMs, todayYyyymmdd);
+		arb = reconcileLiveDataArbitrationWithGovernance(arb, govErr);
+		return `${formatMoLiveMarketStatusBlock(null, { d1ReadError: read.message })}\n${formatLiveDataArbitrationStatusLines(arb)}`;
 	}
 	if (read.row === null) {
 		const base = formatMoLiveMarketStatusBlock(null, {});
 		const gov = deriveMoLiveDataGovernanceTyped(null, nowMs, todayYyyymmdd);
-		return `${base}\n${formatMoLiveGovernanceSnapshotOnly(gov)}\nnote: 尚無快照；行情由排程寫入 D1，/report 不會即時抓外部來源。`;
+		arb = reconcileLiveDataArbitrationWithGovernance(arb, gov);
+		return `${base}\n${formatMoLiveGovernanceSnapshotOnly(gov)}\nnote: 尚無快照；行情由排程寫入 D1，/report 不會即時抓外部來源。\n${formatLiveDataArbitrationStatusLines(arb)}`;
 	}
 	const gov = deriveMoLiveDataGovernanceTyped(read.row, nowMs, todayYyyymmdd);
+	arb = reconcileLiveDataArbitrationWithGovernance(arb, gov);
+	const arbLines = `\n${formatLiveDataArbitrationStatusLines(arb)}`;
 	const v2 = parseMoLivePayloadSummaryV2(read.row.payload_summary);
 	if (v2 !== null) {
-		return formatMoLiveGovernanceStatusBlock(read.row, gov);
+		return `${formatMoLiveGovernanceStatusBlock(read.row, gov)}${arbLines}`;
 	}
 	let block = formatMoLiveMarketStatusBlock(read.row, {});
 	if (isMoLiveSnapshotStale(read.row.created_at, nowMs)) {
 		block = `${block}\nstale: yes（快照偏舊，僅供參考）`;
 	}
-	return `${block}\n${formatMoLiveGovernanceStatusBlock(read.row, gov)}`;
+	return `${block}\n${formatMoLiveGovernanceStatusBlock(read.row, gov)}${arbLines}`;
 }
 
 async function buildMoStatusState(env: Env, userId: string): Promise<MoStatusState> {
@@ -5435,6 +5612,7 @@ async function computeMoPushEvaluationForUser(
 	decisionClose: number | null;
 	recommendationGateDiagnostics: RecommendationGateDiagnostics;
 	recommendationExplainablePack: RecommendationExplainableSummaryPack;
+	liveDataArbitration: ReturnType<typeof resolveLiveDataArbitration>;
 }> {
 	const s = await getSystemStatus(env, userId);
 	const hasUserId = userId.trim() !== "";
@@ -5549,6 +5727,14 @@ async function computeMoPushEvaluationForUser(
 		}
 	}
 
+	const [twseArbRow, finmindArbRow] = await Promise.all([
+		readLatestMoLiveSnapshotForTwseFamily(env),
+		readLatestMoLiveSnapshotForFinMind(env),
+	]);
+	const nowMsArb = Date.now();
+	let liveDataArbitration = resolveLiveDataArbitration(twseArbRow, finmindArbRow, nowMsArb);
+	console.log("[mo] live-data arbitration (source rows)", liveDataArbitration);
+
 	const noteCountForRec = s.noteCount === "error" ? 0 : s.noteCount;
 	let simReady = noteCountForRec > 0 ? "yes" : "no";
 	let simResult: string;
@@ -5593,7 +5779,17 @@ async function computeMoPushEvaluationForUser(
 			liveDataGovernance
 		);
 	}
-	const liveMarketPushEligible = liveDataGovernance.pushEligible;
+	liveDataArbitration = reconcileLiveDataArbitrationWithGovernance(
+		liveDataArbitration,
+		liveDataGovernance
+	);
+	console.log("[mo] live-data arbitration (after governance)", liveDataArbitration);
+	if (liveDataArbitration.confidence === "low") {
+		strategyFinal = "conservative";
+	}
+
+	const liveMarketPushEligible =
+		liveDataGovernance.pushEligible && !isLiveDataArbitrationPushBlocked(liveDataArbitration);
 	const liveMarketIntelligenceV1 = deriveLiveMarketIntelligenceV1(
 		liveDataGovernance,
 		{
@@ -5779,6 +5975,7 @@ async function computeMoPushEvaluationForUser(
 		decisionClose,
 		recommendationGateDiagnostics,
 		recommendationExplainablePack,
+		liveDataArbitration,
 	};
 }
 async function handleCommand(
@@ -7327,6 +7524,7 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 			riskNote: ctx.recommendationExplainablePack.riskNote,
 			actionHint: ctx.recommendationExplainablePack.actionHint,
 		});
+		console.log("[mo] live-data arbitration", ctx.liveDataArbitration);
 		const hasUserId = ctx.hasUserId;
 		const totalNotesNum = ctx.totalNotesNum;
 		const score = ctx.score;
@@ -7632,6 +7830,7 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 		} else if (ctx.liveSnapshotStale) {
 			dataQualityLine = `${dataQualityLine}\n（快照時效偏弱，請以 staleness 為準。）`;
 		}
+		dataQualityLine = `${dataQualityLine}\n${liveDataArbitrationToneZh(ctx.liveDataArbitration.arbitrationType)}`;
 
 		const marketSummaryLine = buildMoReportMarketSummarySection(
 			ctx.liveMarketIntelligenceV1,
