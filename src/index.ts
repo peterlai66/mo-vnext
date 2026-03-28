@@ -49,7 +49,10 @@ import {
 	type MoLiveSnapshotRow,
 } from "./mo/governance.js";
 import { buildRecommendationPrecheckResult } from "./mo/recommendation-precheck.js";
-import { buildRecommendationOutput } from "./mo/recommendation-output.js";
+import {
+	buildRecommendationOutput,
+	type RecommendationExplainableSummary,
+} from "./mo/recommendation-output.js";
 
 interface KVListKey {
 	name: string;
@@ -281,6 +284,90 @@ ${text}`;
 	} catch (error: unknown) {
 		console.log("[intent] ai fail", error instanceof Error ? error : new Error(String(error)));
 		return fallback;
+	}
+}
+
+type AiRecommendationRenderResult = { ok: true; text: string } | { ok: false };
+
+/**
+ * AI Rendering Pack v1: localize explainable summary to zh-TW for LINE; does not mutate input.
+ * On failure, caller uses English renderedText.
+ */
+async function renderRecommendationExplainableSummaryZh(
+	env: Env,
+	summary: RecommendationExplainableSummary
+): Promise<AiRecommendationRenderResult> {
+	const key = env.OPENAI_API_KEY?.trim();
+	if (key === undefined || key === "") {
+		return { ok: false };
+	}
+	const model = (env.OPENAI_MODEL ?? "").trim() || "gpt-4o-mini";
+	const payload = JSON.stringify({
+		headline: summary.headline,
+		reasoning: summary.reasoning,
+		action: summary.action,
+		risk: summary.risk,
+		renderedText: summary.renderedText,
+	});
+	const systemPrompt = `You translate and polish MO recommendation explainable summaries.
+Strict rules:
+- Output Traditional Chinese only (zh-TW natural prose).
+- Do NOT add investment advice, new symbols, or targets not present in the input.
+- Do NOT change the substantive conclusion, facts, or risk stance of the input.
+- Language conversion and readability only; tone: rational analysis + conservative reminders.
+- One LINE message body: plain text, short paragraphs; no markdown fences, no role prefixes.`;
+
+	const userPrompt = `Convert the following JSON (English fields) into a single user-facing message in Traditional Chinese.
+
+${payload}`;
+
+	try {
+		const res = await fetch("https://api.openai.com/v1/chat/completions", {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${key}`,
+				"Content-Type": "application/json",
+			},
+			signal: AbortSignal.timeout(25_000),
+			body: JSON.stringify({
+				model,
+				messages: [
+					{ role: "system", content: systemPrompt },
+					{ role: "user", content: userPrompt },
+				],
+			}),
+		});
+		if (!res.ok) {
+			return { ok: false };
+		}
+		const body: unknown = await res.json();
+		if (typeof body !== "object" || body === null) {
+			return { ok: false };
+		}
+		const b = body as Record<string, unknown>;
+		const choices = b.choices;
+		if (!Array.isArray(choices) || choices.length === 0) {
+			return { ok: false };
+		}
+		const c0 = choices[0];
+		if (typeof c0 !== "object" || c0 === null) {
+			return { ok: false };
+		}
+		const msg = (c0 as Record<string, unknown>).message;
+		if (typeof msg !== "object" || msg === null) {
+			return { ok: false };
+		}
+		const contentRaw = (msg as Record<string, unknown>).content;
+		if (typeof contentRaw !== "string") {
+			return { ok: false };
+		}
+		const trimmed = contentRaw.trim();
+		if (trimmed === "") {
+			return { ok: false };
+		}
+		return { ok: true, text: trimmed };
+	} catch {
+		return { ok: false };
 	}
 }
 
@@ -7082,7 +7169,19 @@ async function getReplyText(
 								renderedTextPresent:
 									recommendationOutput.explainableSummary.renderedText.length > 0,
 							});
-							replyText = recommendationOutput.explainableSummary.renderedText;
+							console.log("[ai] rendering start");
+							const zhRender = await renderRecommendationExplainableSummaryZh(
+								env,
+								recommendationOutput.explainableSummary
+							);
+							if (zhRender.ok) {
+								console.log("[ai] rendering success");
+								replyText = zhRender.text;
+							} else {
+								console.log("[ai] rendering fallback");
+								console.warn("openai_fail_timeout_or_empty");
+								replyText = recommendationOutput.explainableSummary.renderedText;
+							}
 						} else if (moInput.intent === "report") {
 							console.log("[mo] reply branch report");
 							replyText = await handleCommand("/report", text, env, userId);
