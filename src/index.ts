@@ -105,6 +105,8 @@ export interface Env {
 	FINMIND_TOKEN?: string;
 	/** 僅驗證用：設為 "1" 時不呼叫 TWSE，直接走 FinMind fallback（正式請勿啟用） */
 	MO_FORCE_TWSE_FAIL_FOR_TEST?: string;
+	/** OpenAI chat 模型（intent 解析）；未設定時預設 gpt-4o-mini */
+	OPENAI_MODEL?: string;
 }
 
 function isDebugLogEnabled(env: Env): boolean {
@@ -114,6 +116,178 @@ function isDebugLogEnabled(env: Env): boolean {
 function debugLog(env: Env, ...args: unknown[]): void {
 	if (!isDebugLogEnabled(env)) return;
 	Reflect.apply(console.log, console, args);
+}
+
+type IntentKind = "report" | "recommendation" | "status";
+
+type IntentParseResult = {
+	intent: IntentKind;
+	userId: string;
+	context: {
+		hasPortfolio: boolean;
+		riskPreference: "normal";
+	};
+	options: {
+		mode: "latest";
+	};
+};
+
+function intentFallbackResult(userId: string): IntentParseResult {
+	return {
+		intent: "status",
+		userId,
+		context: {
+			hasPortfolio: true,
+			riskPreference: "normal",
+		},
+		options: {
+			mode: "latest",
+		},
+	};
+}
+
+function isIntentKind(s: string): s is IntentKind {
+	return s === "report" || s === "recommendation" || s === "status";
+}
+
+function extractAssistantJsonContent(content: string): string {
+	const t = content.trim();
+	const fence = /^```(?:json)?\s*([\s\S]*?)```$/u.exec(t);
+	if (fence !== null) {
+		return fence[1].trim();
+	}
+	return t;
+}
+
+function normalizeIntentPayload(
+	raw: unknown,
+	userId: string
+): IntentParseResult | null {
+	if (typeof raw !== "object" || raw === null) {
+		return null;
+	}
+	const o = raw as Record<string, unknown>;
+	const ir = o.intent;
+	if (typeof ir !== "string" || !isIntentKind(ir)) {
+		return null;
+	}
+	let hasPortfolio = true;
+	const ctx = o.context;
+	if (typeof ctx === "object" && ctx !== null) {
+		const c = ctx as Record<string, unknown>;
+		if (typeof c.hasPortfolio === "boolean") {
+			hasPortfolio = c.hasPortfolio;
+		}
+	}
+	return {
+		intent: ir,
+		userId,
+		context: {
+			hasPortfolio,
+			riskPreference: "normal",
+		},
+		options: {
+			mode: "latest",
+		},
+	};
+}
+
+/**
+ * AI intent 解析（僅 log，不接下游）；失敗時回傳 fallback，不 throw。
+ */
+async function parseIntentWithAI(text: string, userId: string, env: Env): Promise<IntentParseResult> {
+	const fallback = intentFallbackResult(userId);
+	const key = env.OPENAI_API_KEY?.trim();
+	if (key === undefined || key === "") {
+		console.log("[intent] ai fail", new Error("OPENAI_API_KEY unset"));
+		return fallback;
+	}
+	const model = (env.OPENAI_MODEL ?? "").trim() || "gpt-4o-mini";
+	const systemPrompt = `你是一個系統，只負責將使用者輸入轉為 JSON。
+
+規則：
+1. 只能輸出 JSON
+2. 不要任何解釋
+3. intent 只能是：report / recommendation / status
+4. 如果無法判斷，預設為 status
+
+輸出格式：
+{
+  "intent": "...",
+  "context": {
+    "hasPortfolio": true,
+    "riskPreference": "normal"
+  },
+  "options": {
+    "mode": "latest"
+  }
+}`;
+
+	try {
+		const res = await fetch("https://api.openai.com/v1/chat/completions", {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${key}`,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({
+				model,
+				messages: [
+					{ role: "system", content: systemPrompt },
+					{ role: "user", content: text },
+				],
+			}),
+		});
+		if (!res.ok) {
+			const errText = await res.text();
+			console.log("[intent] ai fail", new Error(`OpenAI HTTP ${res.status}: ${errText.slice(0, 500)}`));
+			return fallback;
+		}
+		const body: unknown = await res.json();
+		if (typeof body !== "object" || body === null) {
+			console.log("[intent] ai fail", new Error("OpenAI response not object"));
+			return fallback;
+		}
+		const b = body as Record<string, unknown>;
+		const choices = b.choices;
+		if (!Array.isArray(choices) || choices.length === 0) {
+			console.log("[intent] ai fail", new Error("OpenAI choices empty"));
+			return fallback;
+		}
+		const c0 = choices[0];
+		if (typeof c0 !== "object" || c0 === null) {
+			console.log("[intent] ai fail", new Error("OpenAI choice[0] invalid"));
+			return fallback;
+		}
+		const msg = (c0 as Record<string, unknown>).message;
+		if (typeof msg !== "object" || msg === null) {
+			console.log("[intent] ai fail", new Error("OpenAI message missing"));
+			return fallback;
+		}
+		const contentRaw = (msg as Record<string, unknown>).content;
+		if (typeof contentRaw !== "string") {
+			console.log("[intent] ai fail", new Error("OpenAI content not string"));
+			return fallback;
+		}
+		const jsonStr = extractAssistantJsonContent(contentRaw);
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(jsonStr) as unknown;
+		} catch (e: unknown) {
+			console.log("[intent] ai fail", e instanceof Error ? e : new Error(String(e)));
+			return fallback;
+		}
+		const normalized = normalizeIntentPayload(parsed, userId);
+		if (normalized === null) {
+			console.log("[intent] ai fail", new Error("intent JSON shape invalid"));
+			return fallback;
+		}
+		console.log("[intent] ai result", normalized);
+		return normalized;
+	} catch (error: unknown) {
+		console.log("[intent] ai fail", error instanceof Error ? error : new Error(String(error)));
+		return fallback;
+	}
 }
 
 const LINE_MESSAGE_PUSH_URL = "https://api.line.me/v2/bot/message/push";
@@ -6915,7 +7089,9 @@ async function getReplyText(
 				ctx.waitUntil(
 					(async () => {
 						debugLog(env, "[line webhook] text message:", event.message?.text ?? "");
+						const text = event.message?.text ?? "";
 						const userId = event.source?.userId ?? "unknown-user";
+						console.log("[intent] user message", text);
 						const replyText = await getReplyText(event.message?.text, env, userId);
 						const response = await fetch("https://api.line.me/v2/bot/message/reply", {
 							method: "POST",
@@ -6936,6 +7112,9 @@ async function getReplyText(
 						debugLog(env, "[line reply] status", response.status);
 						debugLog(env, "[line reply] ok", response.ok);
 						debugLog(env, "[line reply] body", await response.text());
+
+						const intent = await parseIntentWithAI(text, userId, env);
+						void intent;
 
 						const pushTestCmd = extractCommand(event.message?.text ?? "");
 						if (
