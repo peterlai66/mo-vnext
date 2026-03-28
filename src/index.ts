@@ -17,7 +17,6 @@ import {
 	buildActionText as moReportActionLine,
 	getMoLiveCycleStatusFromSnapshotRead,
 	formatDisplayDateFromYyyymmdd,
-	deriveMoLiveDataGovernance,
 	buildMoReportDataQualityNote,
 	buildMarketStatusLineWithGovernance,
 	getMoLiveReportCycleFromGovernance,
@@ -36,6 +35,21 @@ import {
 	MO_PUSH_COOLDOWN_MS_DEFAULT,
 	MO_PUSH_COOLDOWN_MS_P3_ONLY,
 } from "../scripts/dev-check.js";
+
+import {
+	buildMoInputFromIntent,
+	intentFallbackResult,
+	normalizeIntentPayload,
+	type IntentParseResult,
+	type MoInput,
+} from "./mo/input.js";
+import {
+	deriveMoLiveDataGovernanceTyped,
+	type MoLiveDataGovernance,
+	type MoLiveSnapshotRow,
+} from "./mo/governance.js";
+import { buildRecommendationPrecheckResult } from "./mo/recommendation-precheck.js";
+import { buildRecommendationOutput } from "./mo/recommendation-output.js";
 
 interface KVListKey {
 	name: string;
@@ -118,65 +132,6 @@ function debugLog(env: Env, ...args: unknown[]): void {
 	Reflect.apply(console.log, console, args);
 }
 
-type IntentKind = "report" | "recommendation" | "status";
-
-type IntentParseResult = {
-	intent: IntentKind;
-	userId: string;
-	context: {
-		hasPortfolio: boolean;
-		riskPreference: "normal";
-	};
-	options: {
-		mode: "latest";
-	};
-};
-
-/** MO Input Schema（與 IntentParseResult 對齊；僅由 buildMoInputFromIntent 產出） */
-type MoInput = {
-	intent: IntentKind;
-	userId: string;
-	context: {
-		hasPortfolio: boolean;
-		riskPreference: "normal";
-	};
-	options: {
-		mode: "latest";
-	};
-};
-
-function buildMoInputFromIntent(intentResult: IntentParseResult): MoInput {
-	return {
-		intent: intentResult.intent,
-		userId: intentResult.userId,
-		context: {
-			hasPortfolio: intentResult.context.hasPortfolio,
-			riskPreference: intentResult.context.riskPreference,
-		},
-		options: {
-			mode: intentResult.options.mode,
-		},
-	};
-}
-
-function intentFallbackResult(userId: string): IntentParseResult {
-	return {
-		intent: "status",
-		userId,
-		context: {
-			hasPortfolio: true,
-			riskPreference: "normal",
-		},
-		options: {
-			mode: "latest",
-		},
-	};
-}
-
-function isIntentKind(s: string): s is IntentKind {
-	return s === "report" || s === "recommendation" || s === "status";
-}
-
 /**
  * trim 後去除 ```json / ``` 包圍，取得可 JSON.parse 的片段。
  */
@@ -200,43 +155,6 @@ function stripAssistantJsonForParse(content: string): string {
 		}
 	}
 	return t;
-}
-
-function normalizeIntentPayload(
-	raw: unknown,
-	userId: string
-): IntentParseResult | null {
-	if (typeof raw !== "object" || raw === null) {
-		return null;
-	}
-	const o = raw as Record<string, unknown>;
-	const irRaw = o.intent;
-	if (typeof irRaw !== "string") {
-		return null;
-	}
-	const ir = irRaw.trim().toLowerCase();
-	if (!isIntentKind(ir)) {
-		return null;
-	}
-	let hasPortfolio = true;
-	const ctx = o.context;
-	if (typeof ctx === "object" && ctx !== null) {
-		const c = ctx as Record<string, unknown>;
-		if (typeof c.hasPortfolio === "boolean") {
-			hasPortfolio = c.hasPortfolio;
-		}
-	}
-	return {
-		intent: ir,
-		userId,
-		context: {
-			hasPortfolio,
-			riskPreference: "normal",
-		},
-		options: {
-			mode: "latest",
-		},
-	};
 }
 
 /**
@@ -1569,14 +1487,6 @@ type MoStatusState = {
 	liveMarketBlock: string;
 };
 
-type MoLiveSnapshotRow = {
-	id?: number;
-	trade_date: string;
-	source: string;
-	payload_summary: string;
-	created_at: string;
-};
-
 /** 與 D1 payload_summary JSON 對齊（v2 正規化） */
 type MoLiveSummaryV2 = {
 	v: 2;
@@ -1641,28 +1551,6 @@ function parseMoLivePayloadSummaryV2(raw: string): MoLiveSummaryV2 | null {
 	}
 }
 
-/** 與 dev-check deriveMoLiveDataGovernance 對齊（單一推導來源） */
-type MoLiveDataUsability = "display_only" | "decision_ok" | "push_ok" | "unusable";
-type MoLiveStalenessLevel = "fresh" | "aging" | "stale" | "too_old";
-
-type MoLiveDataGovernance = {
-	tradeDate: string;
-	source: string;
-	sourceLevel: string;
-	fetchStatus: string;
-	confidence: string;
-	rawAvailabilityNote: string;
-	legacySummary: string;
-	dataUsability: MoLiveDataUsability;
-	stalenessLevel: MoLiveStalenessLevel;
-	freshnessMinutes: number | null;
-	sourcePriority: number;
-	decisionEligible: boolean;
-	pushEligible: boolean;
-	displayFetchStatus: string;
-	liveFreshness: string;
-};
-
 /** Live Market Intelligence v1（與 dev-check deriveLiveMarketIntelligenceV1 對齊） */
 type MoLiveMarketIntelligenceV1 = {
 	marketDataAvailable: boolean;
@@ -1676,19 +1564,6 @@ type MoLiveMarketIntelligenceV1 = {
 	recommendationGateReason: string;
 	simulationGateReason: string;
 };
-
-function deriveMoLiveDataGovernanceTyped(
-	row: MoLiveSnapshotRow | null,
-	nowMs: number,
-	todayYyyymmdd: string
-): MoLiveDataGovernance {
-	const g = deriveMoLiveDataGovernance({
-		row,
-		nowMs,
-		todayYyyymmdd,
-	}) as MoLiveDataGovernance;
-	return g;
-}
 
 function formatMoLiveGovernanceStatusBlock(
 	row: MoLiveSnapshotRow,
@@ -7168,26 +7043,6 @@ async function getReplyText(
 						const text = event.message?.text ?? "";
 						const userId = event.source?.userId ?? "unknown-user";
 						console.log("[intent] user message", text);
-						const replyText = await getReplyText(event.message?.text, env, userId);
-						const response = await fetch("https://api.line.me/v2/bot/message/reply", {
-							method: "POST",
-							headers: {
-								"Content-Type": "application/json",
-								Authorization: `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN}`,
-							},
-							body: JSON.stringify({
-								replyToken: event.replyToken,
-								messages: [
-									{
-										type: "text",
-										text: replyText,
-									},
-								],
-							}),
-						});
-						debugLog(env, "[line reply] status", response.status);
-						debugLog(env, "[line reply] ok", response.ok);
-						debugLog(env, "[line reply] body", await response.text());
 
 						const intent = await parseIntentWithAI(text, userId, env);
 						const moInput = buildMoInputFromIntent(intent);
@@ -7207,6 +7062,49 @@ async function getReplyText(
 							decisionEligible: govForLog.decisionEligible,
 							dataUsability: govForLog.dataUsability,
 						});
+
+						let replyText: string;
+						if (moInput.intent === "recommendation") {
+							const precheckResult = buildRecommendationPrecheckResult(govForLog);
+							console.log("[mo] recommendation precheck", precheckResult);
+							const recommendationOutput = buildRecommendationOutput(
+								moInput,
+								precheckResult,
+								{
+									snapshotRow: rowForGov,
+									snapshotReadOk: snapshot.kind === "ok",
+								}
+							);
+							console.log("[mo] recommendation output", recommendationOutput);
+							console.log("[mo] recommendation explainable summary attached", {
+								headline: recommendationOutput.explainableSummary.headline,
+								renderedTextPresent:
+									recommendationOutput.explainableSummary.renderedText.length > 0,
+							});
+							replyText = recommendationOutput.explainableSummary.renderedText;
+						} else {
+							replyText = await getReplyText(event.message?.text, env, userId);
+						}
+
+						const response = await fetch("https://api.line.me/v2/bot/message/reply", {
+							method: "POST",
+							headers: {
+								"Content-Type": "application/json",
+								Authorization: `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN}`,
+							},
+							body: JSON.stringify({
+								replyToken: event.replyToken,
+								messages: [
+									{
+										type: "text",
+										text: replyText,
+									},
+								],
+							}),
+						});
+						debugLog(env, "[line reply] status", response.status);
+						debugLog(env, "[line reply] ok", response.ok);
+						debugLog(env, "[line reply] body", await response.text());
 
 						const pushTestCmd = extractCommand(event.message?.text ?? "");
 						if (
