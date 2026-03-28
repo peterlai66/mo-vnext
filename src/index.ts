@@ -29,6 +29,8 @@ import {
 	buildMoReportSummaryStatusBlockLines,
 	applyLiveIntelligenceToRecommendationFields,
 	applyLiveIntelligenceToSimulationFields,
+	parseNumericCloseFromMoLivePayloadSummary,
+	finalizeMoReviewFromReturns,
 	evaluateMoPushEventDecision,
 	MO_PUSH_COOLDOWN_MS_DEFAULT,
 	MO_PUSH_COOLDOWN_MS_P3_ONLY,
@@ -493,6 +495,10 @@ lastNotifyAt: none
 lastPush: none`,
 	decision: "decision: none",
 	report: "report: none",
+	review: `recentReviewCount: 0
+successCount: 0
+failCount: 0
+neutralCount: 0`,
 } as const;
 
 function hasMoStatusUserId(userId: string): boolean {
@@ -1308,10 +1314,12 @@ type MoStatusState = {
 	lastPushBlock: string;
 	decisionBlock: string;
 	reportBlock: string;
+	reviewBlock: string;
 	liveMarketBlock: string;
 };
 
 type MoLiveSnapshotRow = {
+	id?: number;
 	trade_date: string;
 	source: string;
 	payload_summary: string;
@@ -1589,6 +1597,59 @@ async function tryFinMindTaiexDaily(env: Env): Promise<
 	return { ok: false, note: lastNote || "FinMind TAIEX daily empty" };
 }
 
+/**
+ * TWSE rwd 產出之 legacySummary 若無 close=，以 FinMind 單日補 TAIEX 收盤（供 Review／指數參考值）
+ */
+async function tryFinMindTaiexCloseForTradeDate(
+	env: Env,
+	tradeDateYyyymmdd: string
+): Promise<string | null> {
+	const token = env.FINMIND_TOKEN?.trim();
+	if (token === undefined || token === "") {
+		return null;
+	}
+	const finDate = yyyymmddToFinMindDate(tradeDateYyyymmdd);
+	if (finDate === null) {
+		return null;
+	}
+	const params = new URLSearchParams({
+		dataset: "TaiwanStockPrice",
+		data_id: "TAIEX",
+		start_date: finDate,
+		end_date: finDate,
+		token,
+	});
+	const url = `https://api.finmindtrade.com/api/v4/data?${params.toString()}`;
+	try {
+		const res = await fetch(url, {
+			headers: {
+				"User-Agent": "Mozilla/5.0 (compatible; MO-vNext/1.0; FinMind-close-supplement)",
+			},
+		});
+		const text = await res.text();
+		if (!res.ok) {
+			return null;
+		}
+		let j: unknown;
+		try {
+			j = JSON.parse(text) as unknown;
+		} catch {
+			return null;
+		}
+		const finParsed = parseFinMindTaiwanStockPriceTaiexResponse(j);
+		if (finParsed === null) {
+			return null;
+		}
+		const m = /close=([\d.]+)/u.exec(finParsed.legacySummary);
+		if (m === null) {
+			return null;
+		}
+		return m[1];
+	} catch {
+		return null;
+	}
+}
+
 /** Open API「日期」欄位：民國 yyyMMdd（7 位數）→ 西元 YYYYMMDD */
 function rocYyyymmddToGregorianYyyymmdd(roc: string): string | null {
 	if (!/^\d{7}$/u.test(roc)) return null;
@@ -1685,7 +1746,7 @@ async function readLatestMoLiveMarketSnapshot(
 ): Promise<{ kind: "ok"; row: MoLiveSnapshotRow | null } | { kind: "error"; message: string }> {
 	try {
 		const r = await env.MO_DB.prepare(
-			`SELECT trade_date, source, payload_summary, created_at
+			`SELECT id, trade_date, source, payload_summary, created_at
 			 FROM mo_live_market_snapshots
 			 ORDER BY id DESC
 			 LIMIT 1`
@@ -1693,6 +1754,7 @@ async function readLatestMoLiveMarketSnapshot(
 		if (r === null) {
 			return { kind: "ok", row: null };
 		}
+		const rid = r.id;
 		const td = r.trade_date;
 		const src = r.source;
 		const ps = r.payload_summary;
@@ -1705,9 +1767,24 @@ async function readLatestMoLiveMarketSnapshot(
 		) {
 			return { kind: "error", message: "invalid mo_live row shape" };
 		}
+		let idNum: number | undefined;
+		if (typeof rid === "number" && Number.isFinite(rid)) {
+			idNum = rid;
+		} else if (typeof rid === "bigint") {
+			idNum = Number(rid);
+		}
+		const row: MoLiveSnapshotRow = {
+			trade_date: td,
+			source: src,
+			payload_summary: ps,
+			created_at: ca,
+		};
+		if (idNum !== undefined) {
+			row.id = idNum;
+		}
 		return {
 			kind: "ok",
-			row: { trade_date: td, source: src, payload_summary: ps, created_at: ca },
+			row,
 		};
 	} catch (err: unknown) {
 		const message = err instanceof Error ? err.message : String(err);
@@ -1740,13 +1817,14 @@ async function buildMoLiveMarketStatusBlock(env: Env): Promise<string> {
 }
 
 async function buildMoStatusState(env: Env, userId: string): Promise<MoStatusState> {
-	const [lastPushBlock, decisionBlock, reportBlock, liveMarketBlock] = await Promise.all([
+	const [lastPushBlock, decisionBlock, reportBlock, reviewBlock, liveMarketBlock] = await Promise.all([
 		formatLastPushStatusBlock(env, userId),
 		formatLastStrategyDecisionStatusBlock(env, userId),
 		formatLastReportSummaryStatusBlock(env, userId),
+		formatMoReviewStatusBlock(env, userId),
 		buildMoLiveMarketStatusBlock(env),
 	]);
-	return { lastPushBlock, decisionBlock, reportBlock, liveMarketBlock };
+	return { lastPushBlock, decisionBlock, reportBlock, reviewBlock, liveMarketBlock };
 }
 
 function renderMoStatusText(params: {
@@ -1781,6 +1859,8 @@ ${formatSection("Push", params.state.lastPushBlock)}
 ${formatSection("Decision", params.state.decisionBlock)}
 
 ${formatSection("Report", params.state.reportBlock)}
+
+${formatSection("Review", params.state.reviewBlock)}
 
 ${formatSection("Live market", params.state.liveMarketBlock)}`;
 	// safeguard: 避免標題被意外多出字元（例如 eMO Status）
@@ -3533,6 +3613,261 @@ async function ensureMoLiveMarketSnapshotsTable(env: Env): Promise<void> {
 	).run();
 }
 
+/** MO Review v1：決策後評估記分板（D1） */
+async function ensureMoDecisionReviewsTable(env: Env): Promise<void> {
+	await env.MO_DB.prepare(
+		`CREATE TABLE IF NOT EXISTS mo_decision_reviews (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id TEXT NOT NULL,
+			trade_date TEXT NOT NULL,
+			decision_at TEXT NOT NULL,
+			market_data_quality TEXT NOT NULL,
+			recommendation_readiness TEXT NOT NULL,
+			simulation_readiness TEXT NOT NULL,
+			strategy TEXT NOT NULL,
+			rec_summary TEXT NOT NULL,
+			note_count INTEGER NOT NULL,
+			snapshot_id INTEGER,
+			decision_close REAL,
+			review_status TEXT NOT NULL DEFAULT 'pending',
+			return_1d REAL,
+			return_3d REAL,
+			return_5d REAL,
+			return_10d REAL,
+			review_score TEXT
+		)`
+	).run();
+}
+
+type MoTradeCloseRow = {
+	trade_date: string;
+	close: number;
+};
+
+async function fetchMoLiveTradeDateCloseSeries(env: Env): Promise<MoTradeCloseRow[]> {
+	const q = await env.MO_DB.prepare(
+		`SELECT m.trade_date, m.payload_summary
+		 FROM mo_live_market_snapshots m
+		 INNER JOIN (
+		   SELECT trade_date, MAX(id) AS max_id FROM mo_live_market_snapshots GROUP BY trade_date
+		 ) t ON m.id = t.max_id
+		 ORDER BY m.trade_date ASC`
+	).all<{ trade_date: string; payload_summary: string }>();
+	const rows = q.results ?? [];
+	const out: MoTradeCloseRow[] = [];
+	for (const row of rows) {
+		const c = parseNumericCloseFromMoLivePayloadSummary(row.payload_summary);
+		if (c !== null && c > 0) {
+			out.push({ trade_date: row.trade_date, close: c });
+		}
+	}
+	return out;
+}
+
+async function processPendingMoDecisionReviews(env: Env): Promise<void> {
+	try {
+		await ensureMoDecisionReviewsTable(env);
+	} catch {
+		return;
+	}
+	let series: MoTradeCloseRow[];
+	try {
+		series = await fetchMoLiveTradeDateCloseSeries(env);
+	} catch {
+		return;
+	}
+	if (series.length === 0) return;
+
+	type PendingRow = {
+		id: number;
+		trade_date: string;
+		decision_close: number | null;
+		recommendation_readiness: string;
+		return_1d: number | null;
+		return_3d: number | null;
+		return_5d: number | null;
+		return_10d: number | null;
+	};
+
+	let pending: PendingRow[];
+	try {
+		const q = await env.MO_DB.prepare(
+			`SELECT id, trade_date, decision_close, recommendation_readiness,
+			        return_1d, return_3d, return_5d, return_10d
+			 FROM mo_decision_reviews
+			 WHERE review_status = 'pending'
+			 LIMIT 100`
+		).all<PendingRow>();
+		pending = q.results ?? [];
+	} catch {
+		return;
+	}
+
+	for (const row of pending) {
+		const decisionClose = row.decision_close;
+		if (decisionClose === null || decisionClose <= 0) continue;
+		const idx = series.findIndex((s) => s.trade_date === row.trade_date);
+		if (idx < 0) continue;
+
+		const horizons = [1, 3, 5, 10] as const;
+		const keys: Array<"return_1d" | "return_3d" | "return_5d" | "return_10d"> = [
+			"return_1d",
+			"return_3d",
+			"return_5d",
+			"return_10d",
+		];
+		let r1 = row.return_1d;
+		let r3 = row.return_3d;
+		let r5 = row.return_5d;
+		let r10 = row.return_10d;
+		for (let i = 0; i < 4; i++) {
+			const h = horizons[i];
+			const key = keys[i];
+			let cur: number | null = null;
+			if (key === "return_1d") cur = r1;
+			else if (key === "return_3d") cur = r3;
+			else if (key === "return_5d") cur = r5;
+			else cur = r10;
+			if (cur !== null && cur !== undefined && Number.isFinite(cur)) continue;
+			const j = idx + h;
+			if (j >= series.length) continue;
+			const pct = (series[j].close / decisionClose - 1) * 100;
+			if (key === "return_1d") r1 = pct;
+			else if (key === "return_3d") r3 = pct;
+			else if (key === "return_5d") r5 = pct;
+			else r10 = pct;
+		}
+
+		const fin = finalizeMoReviewFromReturns({
+			recommendation_readiness: row.recommendation_readiness,
+			return_1d: r1,
+			return_3d: r3,
+			return_5d: r5,
+			return_10d: r10,
+		});
+
+		try {
+			await env.MO_DB
+				.prepare(
+					`UPDATE mo_decision_reviews
+					 SET return_1d = ?, return_3d = ?, return_5d = ?, return_10d = ?,
+					     review_score = ?, review_status = ?
+					 WHERE id = ?`
+				)
+				.bind(
+					r1,
+					r3,
+					r5,
+					r10,
+					fin.review_score,
+					fin.review_status,
+					row.id
+				)
+				.run();
+		} catch {
+			/* skip */
+		}
+	}
+}
+
+async function insertMoDecisionReviewForReport(
+	env: Env,
+	userId: string,
+	p: {
+		decisionAt: string;
+		tradeDate: string;
+		marketDataQuality: string;
+		recommendationReadiness: string;
+		simulationReadiness: string;
+		strategy: "aggressive" | "balanced" | "conservative";
+		recSummary: string;
+		noteCount: number;
+		snapshotId: number | null;
+		decisionClose: number | null;
+	}
+): Promise<void> {
+	console.log("[review] insert start");
+	try {
+		await ensureMoDecisionReviewsTable(env);
+		const rec = p.recSummary.length > 500 ? `${p.recSummary.slice(0, 500)}…` : p.recSummary;
+		console.log("[review] inserting row", {
+			tradeDate: p.tradeDate,
+			strategy: p.strategy,
+			recommendationReadiness: p.recommendationReadiness,
+		});
+		await env.MO_DB
+			.prepare(
+				`INSERT INTO mo_decision_reviews (
+					user_id, trade_date, decision_at, market_data_quality,
+					recommendation_readiness, simulation_readiness, strategy,
+					rec_summary, note_count, snapshot_id, decision_close, review_status
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
+			)
+			.bind(
+				userId,
+				p.tradeDate,
+				p.decisionAt,
+				p.marketDataQuality,
+				p.recommendationReadiness,
+				p.simulationReadiness,
+				p.strategy,
+				rec,
+				p.noteCount,
+				p.snapshotId,
+				p.decisionClose
+			)
+			.run();
+		console.log("[review] insert success");
+	} catch (error: unknown) {
+		console.error("[review] insert error", error);
+	}
+}
+
+async function formatMoReviewStatusBlock(env: Env, userId: string): Promise<string> {
+	if (!hasMoStatusUserId(userId)) return MO_STATUS_DEFAULT_BLOCK.review;
+	try {
+		await ensureMoDecisionReviewsTable(env);
+	} catch {
+		return `recentReviewCount: ${String(0)}
+successCount: ${String(0)}
+failCount: ${String(0)}
+neutralCount: ${String(0)}`;
+	}
+	try {
+		const totalRow = await env.MO_DB.prepare(
+			`SELECT COUNT(*) AS c FROM mo_decision_reviews WHERE user_id = ?`
+		)
+			.bind(userId)
+			.first<{ c: number }>();
+		const recentReviewCount = totalRow !== null && typeof totalRow.c === "number" ? totalRow.c : 0;
+
+		const agg = await env.MO_DB.prepare(
+			`SELECT review_score, COUNT(*) AS c
+			 FROM mo_decision_reviews
+			 WHERE user_id = ? AND review_status = 'done' AND review_score IS NOT NULL
+			 GROUP BY review_score`
+		)
+			.bind(userId)
+			.all<{ review_score: string; c: number }>();
+
+		let successCount = 0;
+		let failCount = 0;
+		let neutralCount = 0;
+		for (const r of agg.results ?? []) {
+			if (r.review_score === "success") successCount = r.c;
+			else if (r.review_score === "fail") failCount = r.c;
+			else if (r.review_score === "neutral") neutralCount = r.c;
+		}
+
+		return `recentReviewCount: ${String(recentReviewCount)}
+successCount: ${String(successCount)}
+failCount: ${String(failCount)}
+neutralCount: ${String(neutralCount)}`;
+	} catch {
+		return MO_STATUS_DEFAULT_BLOCK.review;
+	}
+}
+
 async function executeMoLiveDataCycle(env: Env): Promise<MoLiveCycleResult> {
 	const source = MO_LIVE_SOURCE_TWSE_MI_INDEX;
 	try {
@@ -3600,7 +3935,14 @@ async function executeMoLiveDataCycle(env: Env): Promise<MoLiveCycleResult> {
 	}
 
 	if (fetched && parsed !== null) {
-		const legacySummary = summarizeTwseMiIndexPayload(parsed);
+		let legacySummary = summarizeTwseMiIndexPayload(parsed);
+		const needsFinClose = !/close=[\d.]+/u.test(legacySummary);
+		if (needsFinClose) {
+			const finClose = await tryFinMindTaiexCloseForTradeDate(env, tradeDate);
+			if (finClose !== null) {
+				legacySummary = `${legacySummary};close=${finClose}`;
+			}
+		}
 		const payloadSummaryObj: MoLiveSummaryV2 = {
 			v: 2,
 			source,
@@ -3845,6 +4187,9 @@ async function computeMoPushEvaluationForUser(
 	liveDataGovernance: MoLiveDataGovernance;
 	liveMarketIntelligenceV1: MoLiveMarketIntelligenceV1;
 	liveMarketPushEligible: boolean;
+	liveSnapshotId: number | null;
+	decisionTradeDateYyyymmdd: string;
+	decisionClose: number | null;
 }> {
 	const s = await getSystemStatus(env, userId);
 	const hasUserId = userId.trim() !== "";
@@ -4115,6 +4460,17 @@ async function computeMoPushEvaluationForUser(
 		reportChanged = changed === "yes";
 	}
 
+	const decisionTradeDateYyyymmdd =
+		liveRead.kind === "ok" && liveRead.row !== null ? liveRead.row.trade_date : todayYyyymmddLive;
+	const liveSnapshotId =
+		liveRead.kind === "ok" && liveRead.row !== null && typeof liveRead.row.id === "number" ?
+			liveRead.row.id
+		:	null;
+	const decisionClose =
+		liveRead.kind === "ok" && liveRead.row !== null ?
+			parseNumericCloseFromMoLivePayloadSummary(liveRead.row.payload_summary)
+		:	null;
+
 	return {
 		s,
 		hasUserId,
@@ -4152,6 +4508,9 @@ async function computeMoPushEvaluationForUser(
 		liveDataGovernance,
 		liveMarketIntelligenceV1,
 		liveMarketPushEligible,
+		liveSnapshotId,
+		decisionTradeDateYyyymmdd,
+		decisionClose,
 	};
 }
 async function handleCommand(
@@ -5974,6 +6333,23 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 				simulationGateReason: ctx.liveMarketIntelligenceV1.simulationGateReason,
 			};
 			await recordLastReportSummary(env, userId, summary);
+			console.log("[review] before insert", {
+				userId,
+				hasUserId,
+				isUnknownUser: userId === "unknown-user",
+			});
+			await insertMoDecisionReviewForReport(env, userId, {
+				decisionAt: ctx.snapshotTimeIso,
+				tradeDate: ctx.decisionTradeDateYyyymmdd,
+				marketDataQuality: ctx.liveMarketIntelligenceV1.marketDataQuality,
+				recommendationReadiness: ctx.liveMarketIntelligenceV1.recommendationReadiness,
+				simulationReadiness: ctx.liveMarketIntelligenceV1.simulationReadiness,
+				strategy: strategyFinal,
+				recSummary: ctx.actionLine,
+				noteCount: noteCountForRec,
+				snapshotId: ctx.liveSnapshotId,
+				decisionClose: ctx.decisionClose,
+			});
 		}
 
 		let dataQualityLine = buildMoReportDataQualityNote(ctx.liveDataGovernance);
@@ -6369,14 +6745,16 @@ async function getReplyText(
 		ctx: ExecutionContext
 	): Promise<void> {
 		ctx.waitUntil(
-			executeMoLiveDataCycle(env).then((r) => {
+			(async () => {
+				const r = await executeMoLiveDataCycle(env);
 				console.log("[cron] mo_live", {
 					ok: r.ok,
 					cycleStatus: r.cycleStatus,
 					dbWrite: r.dbWrite,
 					note: r.note,
 				});
-			})
+				await processPendingMoDecisionReviews(env);
+			})()
 		);
 	},
   };

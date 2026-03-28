@@ -366,6 +366,67 @@ function isTwseMiIndexPayloadOk(parsed) {
 }
 
 /**
+ * TWSE rwd MI_INDEX JSON：自 tables[].data 列找「發行量加權股價指數」收盤（可含千分位逗號）
+ * @param {unknown} cell
+ * @returns {string | null}
+ */
+function parseTwseRwdTableNumericClose(cell) {
+	if (typeof cell === "number" && Number.isFinite(cell)) {
+		return String(cell);
+	}
+	if (typeof cell !== "string") {
+		return null;
+	}
+	const t = cell.replace(/,/gu, "").trim();
+	if (!/^-?\d+(\.\d+)?$/u.test(t)) {
+		return null;
+	}
+	return t;
+}
+
+/**
+ * @param {unknown} parsed
+ * @returns {string | null}
+ */
+function extractTwseRwdMiIndexWeightedClose(parsed) {
+	if (typeof parsed !== "object" || parsed === null) {
+		return null;
+	}
+	const obj = /** @type {Record<string, unknown>} */ (parsed);
+	const tables = obj.tables;
+	if (!Array.isArray(tables)) {
+		return null;
+	}
+	const nameRe = /發行量加權股價指數/u;
+	for (const t of tables) {
+		if (typeof t !== "object" || t === null) {
+			continue;
+		}
+		const tb = /** @type {Record<string, unknown>} */ (t);
+		const data = tb.data;
+		if (!Array.isArray(data)) {
+			continue;
+		}
+		for (const row of data) {
+			if (!Array.isArray(row) || row.length < 2) {
+				continue;
+			}
+			const nameCell = row[0];
+			if (typeof nameCell !== "string" || !nameRe.test(nameCell.trim())) {
+				continue;
+			}
+			for (let c = 1; c < row.length; c++) {
+				const closeStr = parseTwseRwdTableNumericClose(row[c]);
+				if (closeStr !== null) {
+					return closeStr;
+				}
+			}
+		}
+	}
+	return null;
+}
+
+/**
  * @param {unknown} parsed
  * @returns {string}
  */
@@ -387,7 +448,12 @@ function summarizeTwseMiIndexPayload(parsed) {
 			}
 		}
 	}
-	return `stat=${stat};date=${date};tableDataRows=${tableRows}`;
+	const closeStr = extractTwseRwdMiIndexWeightedClose(parsed);
+	let base = `stat=${stat};date=${date};tableDataRows=${tableRows}`;
+	if (closeStr !== null) {
+		base += `;close=${closeStr}`;
+	}
+	return base;
 }
 
 /**
@@ -792,6 +858,102 @@ function moLiveExtractMarketValue(legacySummary) {
 	const m2 = /date=\d{8};close=([\d.]+)/u.exec(legacySummary);
 	if (m2 !== null) return m2[1];
 	return null;
+}
+
+/**
+ * 自 mo_live payload_summary（v2 JSON）解析收盤價數值
+ * @param {string} payloadSummary
+ * @returns {number | null}
+ */
+function parseNumericCloseFromMoLivePayloadSummary(payloadSummary) {
+	try {
+		const j = JSON.parse(payloadSummary);
+		if (j && typeof j.legacySummary === "string") {
+			const s = moLiveExtractMarketValue(j.legacySummary);
+			if (s === null) return null;
+			const n = Number(s);
+			return Number.isFinite(n) ? n : null;
+		}
+	} catch {
+		/* ignore */
+	}
+	return null;
+}
+
+/**
+ * @param {{
+ *   return_1d: number | null;
+ *   return_3d: number | null;
+ *   return_5d: number | null;
+ *   return_10d: number | null;
+ * }} r
+ * @returns {number | null}
+ */
+function pickMoReviewReturnForScoring(r) {
+	if (r.return_10d !== null && r.return_10d !== undefined && Number.isFinite(r.return_10d)) {
+		return r.return_10d;
+	}
+	if (r.return_5d !== null && r.return_5d !== undefined && Number.isFinite(r.return_5d)) {
+		return r.return_5d;
+	}
+	if (r.return_3d !== null && r.return_3d !== undefined && Number.isFinite(r.return_3d)) {
+		return r.return_3d;
+	}
+	if (r.return_1d !== null && r.return_1d !== undefined && Number.isFinite(r.return_1d)) {
+		return r.return_1d;
+	}
+	return null;
+}
+
+/**
+ * @param {"ready" | "limited" | "blocked"} recommendationReadiness
+ * @param {number} returnPct 累積報酬率（百分比，例如 1.5 代表 +1.5%）
+ * @returns {"success" | "neutral" | "fail"}
+ */
+function computeMoReviewV1Score(recommendationReadiness, returnPct) {
+	const BIG = 2.0;
+	if (recommendationReadiness === "ready") {
+		if (returnPct > 0) return "success";
+		if (returnPct < 0) return "fail";
+		return "neutral";
+	}
+	if (recommendationReadiness === "limited") {
+		if (returnPct <= -BIG) return "fail";
+		return "neutral";
+	}
+	if (recommendationReadiness === "blocked") {
+		if (returnPct <= -BIG) return "success";
+		if (returnPct >= BIG) return "fail";
+		return "neutral";
+	}
+	return "neutral";
+}
+
+/**
+ * @param {{
+ *   recommendation_readiness: string;
+ *   return_1d: number | null;
+ *   return_3d: number | null;
+ *   return_5d: number | null;
+ *   return_10d: number | null;
+ * }} row
+ * @returns {{ review_status: "pending" | "done"; review_score: "success" | "neutral" | "fail" | null }}
+ */
+function finalizeMoReviewFromReturns(row) {
+	const pct = pickMoReviewReturnForScoring({
+		return_1d: row.return_1d,
+		return_3d: row.return_3d,
+		return_5d: row.return_5d,
+		return_10d: row.return_10d,
+	});
+	if (pct === null) {
+		return { review_status: "pending", review_score: null };
+	}
+	const rr = row.recommendation_readiness;
+	const readiness =
+		rr === "ready" || rr === "limited" || rr === "blocked" ? rr : "limited";
+	const score = computeMoReviewV1Score(readiness, pct);
+	return { review_status: "done", review_score: score };
 }
 
 /**
@@ -1773,6 +1935,15 @@ function runDevCheckMain() {
 		if (!sum.includes("stat=OK")) {
 			throw new Error(`[mo-live] summarize: ${sum}`);
 		}
+		const twseWeighted = {
+			stat: "OK",
+			date: "20260115",
+			tables: [{ title: "價指數", data: [["發行量加權股價指數", "17,858.00"]] }],
+		};
+		const sumW = summarizeTwseMiIndexPayload(twseWeighted);
+		if (!sumW.includes("close=17858.00")) {
+			throw new Error(`[mo-live] summarize weighted close: ${sumW}`);
+		}
 		console.log("[mo-live] dev-check ok", { tradeDate: td0, cycleStatus: "success" });
 	}
 
@@ -2202,6 +2373,73 @@ function runDevCheckMain() {
 	}
 
 	runMoLiveIntelligenceV1DevChecks();
+	passCount += 1;
+
+	function runMoReviewV1DevChecks() {
+		console.log("[mo-review] v1");
+		if (computeMoReviewV1Score("ready", 1.2) !== "success") {
+			throw new Error("[mo-review] ready up");
+		}
+		if (computeMoReviewV1Score("ready", -0.5) !== "fail") {
+			throw new Error("[mo-review] ready down");
+		}
+		if (computeMoReviewV1Score("blocked", -3) !== "success") {
+			throw new Error("[mo-review] blocked down");
+		}
+		if (computeMoReviewV1Score("blocked", 3) !== "fail") {
+			throw new Error("[mo-review] blocked up");
+		}
+		const fin = finalizeMoReviewFromReturns({
+			recommendation_readiness: "ready",
+			return_1d: 1.0,
+			return_3d: null,
+			return_5d: null,
+			return_10d: null,
+		});
+		if (fin.review_status !== "done" || fin.review_score !== "success") {
+			throw new Error("[mo-review] finalize done");
+		}
+		const pend = finalizeMoReviewFromReturns({
+			recommendation_readiness: "ready",
+			return_1d: null,
+			return_3d: null,
+			return_5d: null,
+			return_10d: null,
+		});
+		if (pend.review_status !== "pending" || pend.review_score !== null) {
+			throw new Error("[mo-review] pending");
+		}
+		const closeFromPs = parseNumericCloseFromMoLivePayloadSummary(
+			JSON.stringify({
+				v: 2,
+				source: MO_LIVE_SOURCE_TWSE_MI_INDEX,
+				sourceLevel: "primary",
+				fetchStatus: "success",
+				confidence: "high",
+				rawAvailabilityNote: "",
+				legacySummary: "stat=OK;date=20260101;close=12345.67",
+			})
+		);
+		if (closeFromPs !== 12345.67) {
+			throw new Error("[mo-review] decision_close parse from payload_summary");
+		}
+		if (moLiveExtractMarketValue("stat=OK;close=12345.67") !== "12345.67") {
+			throw new Error("[mo-review] marketValue legacySummary");
+		}
+		const fin10 = finalizeMoReviewFromReturns({
+			recommendation_readiness: "ready",
+			return_1d: null,
+			return_3d: null,
+			return_5d: null,
+			return_10d: 2.0,
+		});
+		if (fin10.review_status !== "done" || fin10.review_score !== "success") {
+			throw new Error("[mo-review] finalize prefers return_10d");
+		}
+		console.log("[mo-review] v1 ok");
+	}
+
+	runMoReviewV1DevChecks();
 	passCount += 1;
 
 	function runMoLiveStatusSummaryDevChecks() {
@@ -2700,6 +2938,11 @@ module.exports = {
 	buildMoReportSummaryStatusBlockLines,
 	applyLiveIntelligenceToRecommendationFields,
 	applyLiveIntelligenceToSimulationFields,
+	moLiveExtractMarketValue,
+	parseNumericCloseFromMoLivePayloadSummary,
+	pickMoReviewReturnForScoring,
+	computeMoReviewV1Score,
+	finalizeMoReviewFromReturns,
 };
 
 if (
