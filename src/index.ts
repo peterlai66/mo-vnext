@@ -7065,6 +7065,7 @@ async function getReplyText(
 
 						let replyText: string;
 						if (moInput.intent === "recommendation") {
+							console.log("[mo] reply branch recommendation");
 							const precheckResult = buildRecommendationPrecheckResult(govForLog);
 							console.log("[mo] recommendation precheck", precheckResult);
 							const recommendationOutput = buildRecommendationOutput(
@@ -7082,6 +7083,12 @@ async function getReplyText(
 									recommendationOutput.explainableSummary.renderedText.length > 0,
 							});
 							replyText = recommendationOutput.explainableSummary.renderedText;
+						} else if (moInput.intent === "report") {
+							console.log("[mo] reply branch report");
+							replyText = await handleCommand("/report", text, env, userId);
+						} else if (moInput.intent === "status") {
+							console.log("[mo] reply branch status");
+							replyText = await handleCommand("/status", text, env, userId);
 						} else {
 							replyText = await getReplyText(event.message?.text, env, userId);
 						}
