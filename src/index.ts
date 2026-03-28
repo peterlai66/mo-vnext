@@ -7193,6 +7193,21 @@ async function getReplyText(
 						const moInput = buildMoInputFromIntent(intent);
 						console.log("[mo] input", moInput);
 
+						const snapshot = await readLatestMoLiveMarketSnapshot(env);
+						const nowMsGov = Date.now();
+						const todayYyyymmddGov = getTaipeiYYYYMMDDMinusDaysFromToday(0);
+						const rowForGov: MoLiveSnapshotRow | null =
+							snapshot.kind === "ok" ? snapshot.row : null;
+						const govForLog = deriveMoLiveDataGovernanceTyped(
+							rowForGov,
+							nowMsGov,
+							todayYyyymmddGov
+						);
+						console.log("[mo] governance", {
+							decisionEligible: govForLog.decisionEligible,
+							dataUsability: govForLog.dataUsability,
+						});
+
 						const pushTestCmd = extractCommand(event.message?.text ?? "");
 						if (
 							pushTestCmd === "/push-test" &&
