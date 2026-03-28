@@ -3634,21 +3634,9 @@ async function ensureMoDecisionReviewsTable(env: Env): Promise<void> {
 			return_3d REAL,
 			return_5d REAL,
 			return_10d REAL,
-			review_score TEXT,
-			review_return REAL,
-			reviewed_at TEXT
+			review_score TEXT
 		)`
 	).run();
-	for (const sql of [
-		`ALTER TABLE mo_decision_reviews ADD COLUMN review_return REAL`,
-		`ALTER TABLE mo_decision_reviews ADD COLUMN reviewed_at TEXT`,
-	] as const) {
-		try {
-			await env.MO_DB.prepare(sql).run();
-		} catch {
-			/* duplicate column on upgraded DB */
-		}
-	}
 }
 
 type MoTradeCloseRow = {
@@ -3799,6 +3787,31 @@ type MoDecisionReviewPendingFinalizeRow = {
 	decision_close: number | null;
 };
 
+/** 與 /report 相同：自 snapshot 的 v2 payload_summary（必要時 raw_payload）解析收盤價 */
+function parseCloseFromMoLiveSnapshotRow(row: {
+	payload_summary: string;
+	raw_payload: string;
+}): number | null {
+	const fromSummary = parseNumericCloseFromMoLivePayloadSummary(row.payload_summary);
+	if (fromSummary !== null && fromSummary > 0) {
+		return fromSummary;
+	}
+	const fromRaw = parseNumericCloseFromMoLivePayloadSummary(row.raw_payload);
+	if (fromRaw !== null && fromRaw > 0) {
+		return fromRaw;
+	}
+	return null;
+}
+
+type MoLiveSnapshotRowForReviewFinalize = {
+	id: number;
+	trade_date: string;
+	source: string;
+	payload_summary: string;
+	raw_payload: string;
+	created_at: string;
+};
+
 async function finalizePendingDecisionReviews(env: Env): Promise<void> {
 	console.log("[review] start");
 	try {
@@ -3828,13 +3841,6 @@ async function finalizePendingDecisionReviews(env: Env): Promise<void> {
 	}
 
 	const todayYyyymmdd = getTaipeiYYYYMMDDMinusDaysFromToday(0);
-	let series: MoTradeCloseRow[];
-	try {
-		series = await fetchMoLiveTradeDateCloseSeries(env);
-	} catch {
-		console.log("[review] done");
-		return;
-	}
 
 	for (const row of pending) {
 		const idNum = typeof row.id === "bigint" ? Number(row.id) : row.id;
@@ -3845,6 +3851,11 @@ async function finalizePendingDecisionReviews(env: Env): Promise<void> {
 
 		const dc = row.decision_close;
 		if (dc === null || dc <= 0) {
+			console.log("[review] skip invalid decision close", {
+				id: idNum,
+				tradeDate: row.trade_date,
+				decisionClose: dc,
+			});
 			continue;
 		}
 
@@ -3852,32 +3863,49 @@ async function finalizePendingDecisionReviews(env: Env): Promise<void> {
 			continue;
 		}
 
-		let futureRow: MoTradeCloseRow | null = null;
-		for (let i = series.length - 1; i >= 0; i--) {
-			if (series[i].trade_date > row.trade_date) {
-				futureRow = series[i];
-				break;
-			}
+		let snap: MoLiveSnapshotRowForReviewFinalize | null = null;
+		try {
+			const sq = await env.MO_DB.prepare(
+				`SELECT id, trade_date, source, payload_summary, raw_payload, created_at
+				 FROM mo_live_market_snapshots
+				 WHERE trade_date > ?
+				 ORDER BY trade_date DESC, id DESC
+				 LIMIT 1`
+			)
+				.bind(row.trade_date)
+				.first<MoLiveSnapshotRowForReviewFinalize>();
+			snap = sq ?? null;
+		} catch {
+			snap = null;
 		}
-		if (futureRow === null || futureRow.close <= 0) {
+
+		if (snap === null) {
+			console.log("[review] skip no future snapshot", { id: idNum, tradeDate: row.trade_date });
 			continue;
 		}
 
-		const reviewReturn = (futureRow.close - dc) / dc;
+		const futureClose = parseCloseFromMoLiveSnapshotRow(snap);
+		if (futureClose === null || futureClose <= 0) {
+			console.log("[review] skip no future close", {
+				id: idNum,
+				tradeDate: row.trade_date,
+				snapshotTradeDate: snap.trade_date,
+			});
+			continue;
+		}
+
+		const reviewReturn = (futureClose - dc) / dc;
 		const reviewScore = scoreReviewReturnFromRatio(reviewReturn);
-		const reviewedAt = formatStatusPushAtTaipei(new Date());
 
 		try {
 			await env.MO_DB
 				.prepare(
 					`UPDATE mo_decision_reviews
 					 SET review_status = 'done',
-					     review_score = ?,
-					     review_return = ?,
-					     reviewed_at = ?
+					     review_score = ?
 					 WHERE id = ?`
 				)
-				.bind(reviewScore, reviewReturn, reviewedAt, idNum)
+				.bind(reviewScore, idNum)
 				.run();
 			console.log("[review] result", { id: idNum, return: reviewReturn, score: reviewScore });
 		} catch {
