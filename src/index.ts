@@ -162,10 +162,19 @@ function stripAssistantJsonForParse(content: string): string {
 	return t;
 }
 
+/** LINE webhook：上一則助理回覆類型（KV；供 GPT 判斷是否延續該話題） */
+type LineAssistantReplyKind = "recommendation" | "report" | "status" | "none";
+
 /**
  * AI intent 解析（僅 log，不接下游）；失敗時回傳 fallback，不 throw。
+ * @param lastAssistantReplyKind 由 KV 讀取之上一則 LINE 助理回覆分支，供短句追問脈絡判斷。
  */
-async function parseIntentWithAI(text: string, userId: string, env: Env): Promise<IntentParseResult> {
+async function parseIntentWithAI(
+	text: string,
+	userId: string,
+	env: Env,
+	lastAssistantReplyKind: LineAssistantReplyKind = "none"
+): Promise<IntentParseResult> {
 	const fallback = intentFallbackResult(userId);
 	const key = env.OPENAI_API_KEY?.trim();
 	if (key === undefined || key === "") {
@@ -173,14 +182,24 @@ async function parseIntentWithAI(text: string, userId: string, env: Env): Promis
 		return fallback;
 	}
 	const model = (env.OPENAI_MODEL ?? "").trim() || "gpt-4o-mini";
+	console.log("[intent] line context", { lastAssistantReplyKind });
 	const systemPrompt = `你是 intent 分類器，只負責依使用者語意輸出**一個** JSON 物件（不要 markdown、不要說明文字）。
 
 intent 只能是：report、recommendation、status。
 
+【判斷優先順序（必讀；「對話脈絡」僅輔助，不得硬覆蓋下列第 1 點）】
+1. **最高優先**：若使用者**明確**在問**整體**市場、大盤、盤勢、行情，或**市場／系統／目前**的宏觀狀態（例如「現在狀態如何」「市場狀態」「目前狀況」「系統狀態」「現在盤勢怎樣」），則 intent **必須**為 status，followUpIntent **必須**為 none——**即使**對話脈絡顯示上一則助理為 recommendation。這是獨立的 status 查詢，不是延續推薦細節。
+2. 若**未**觸發第 1 點，且對話脈絡為 recommendation，且本輪為針對**先前那則推薦／候選**的**短句追問**（未改問整體市場），則 intent 為 recommendation，並依語意設定 followUpIntent（例如風險、理由、下一步、還有沒有其他標的）。
+3. 出現「狀態」一詞時：若語意是**大盤／市場／系統／目前整體**→ status；若語意是**這則建議或標的本身的風險／細節**且為短句延續推薦→ recommendation + 對應 followUpIntent。
+4. recommendation 的 follow-up **不得**壓過第 1 點的明確整體狀態查詢。
+5. 若無 recommendation 脈絡且無法判斷，intent 預設為 status。
+
 【status】適用於：
-- 詢問目前市場狀態、現在如何、盤勢、行情、風險狀態
+- 詢問**整體**市場、大盤、現在盤勢、行情、**宏觀**氛圍，或**市場／系統／目前**狀態
 - 不要求完整分析報告
-例：現在市場如何、今天盤勢怎麼樣、目前適合進場嗎、現在風險高嗎
+例：現在市場如何、今天盤勢怎麼樣、目前適合進場嗎、現在風險高嗎、**現在狀態如何**、市場狀態、目前狀況、系統狀態
+
+【改判 recommendation + followUpIntent 的條件】僅當**未**觸發上述「明確整體狀態查詢」，且使用者是在追問**先前那則建議／候選**的細節（例如風險、理由、下一步、還有沒有其他標的）— 與「問整體市場現在怎樣」不同。
 
 【report】適用於：
 - 明確要求報告、完整整理、摘要、分析報告、總結
@@ -188,6 +207,7 @@ intent 只能是：report、recommendation、status。
 
 【recommendation】適用於：
 - 明確詢問建議、配置、方向、標的、該關注什麼
+- **延續上一則推薦話題的追問**（見 followUpIntent）
 例：給我建議、現在該怎麼配置、推薦我關注什麼、有什麼標的可以觀察
 
 【單字】若使用者輸入**僅**為單一英文單字（不分大小寫）：
@@ -195,15 +215,26 @@ intent 只能是：report、recommendation、status。
 - recommendation → intent 必為 recommendation
 - status → intent 必為 status
 
-若無法判斷，intent 預設為 status。
-
 【followUpIntent】僅在 intent 為 recommendation 時有意義；report / status 時必為 "none"。
 當 intent 為 recommendation 時，依語意選一個字串（不可發明事實，只分類追問類型）：
 - "none"：首次要建議／配置／標的，或無法判斷是否為針對上一則推薦的追問。
 - "ask_more_candidates"：是否還有其他推薦、更多標的、換一個、還有嗎、除了這個還有嗎。
 - "ask_why"：為什麼、理由、依據、為何是這個／這些。
-- "ask_risk"：風險、有什麼風險、注意什麼、會不會有問題。
+- "ask_risk"：風險、有什麼風險、注意什麼、會不會有問題；**包含「風險是什麼」這類短問**（在 recommendation 脈絡下）。
 - "ask_action"：下一步、該怎麼做、現在要做什麼、怎麼執行（在仍屬推薦語境時）。
+
+【範例：對話脈絡上一則為 recommendation】
+- 使用者：風險是什麼 → intent: recommendation, followUpIntent: ask_risk
+- 使用者：為什麼推薦這個 → intent: recommendation, followUpIntent: ask_why
+- 使用者：為什麼 → intent: recommendation, followUpIntent: ask_why
+- 使用者：還有嗎 → intent: recommendation, followUpIntent: ask_more_candidates
+- 使用者：那我該怎麼做 → intent: recommendation, followUpIntent: ask_action
+- 使用者：現在狀態如何 → intent: status, followUpIntent: none（明確整體狀態查詢，優先於脈絡）
+- 使用者：市場狀態 → intent: status, followUpIntent: none
+
+【範例：對話脈絡為 none 或一般】
+- 使用者：現在狀態如何 → intent: status, followUpIntent: none
+- 使用者：給我完整報告 → intent: report, followUpIntent: none
 
 輸出格式（必須遵守）：
 {
@@ -213,8 +244,14 @@ intent 只能是：report、recommendation、status。
   "options": { "mode": "latest" }
 }`;
 
-	const userPrompt = `請根據以下使用者輸入，只回傳一個 JSON 物件，不要加 markdown，不要加解釋。
+	const contextExplain =
+		lastAssistantReplyKind === "none"
+			? "【對話脈絡】上一則助理回覆類型：none（無紀錄或首次）。此欄僅輔助判斷是否延續話題，不是最高優先規則。\n"
+			: `【對話脈絡】上一則助理回覆類型：${lastAssistantReplyKind}（recommendation=投資建議／推薦；report=報告；status=市場狀態摘要）。此欄**僅供輔助**：若使用者明確查詢整體市場／系統／目前狀態，仍應判 status；若為延續推薦的短句追問，再依規則判 recommendation 與 followUpIntent。\n`;
 
+	const userPrompt = `請根據以下「對話脈絡」與使用者輸入，只回傳一個 JSON 物件，不要加 markdown，不要加解釋。
+
+${contextExplain}
 使用者輸入：
 ${text}`;
 
@@ -291,7 +328,10 @@ ${text}`;
 		}
 		console.log("[intent] raw content", contentRaw);
 		console.log("[intent] ai result", normalized);
-		console.log("[intent] followUpIntent result", { followUpIntent: normalized.followUpIntent });
+		console.log("[intent] followUpIntent result", {
+			followUpIntent: normalized.followUpIntent,
+			lastAssistantReplyKind,
+		});
 		return normalized;
 	} catch (error: unknown) {
 		console.log("[intent] ai fail", error instanceof Error ? error : new Error(String(error)));
@@ -660,7 +700,61 @@ const MO_USER_KV_PREFIX = {
 	lastStrategyNotifyGate: "last_strategy_notify_gate",
 	strategyNotifyLock: "strategy_notify_lock",
 	moPushAudit: "mo_push_audit",
+	/** LINE 上一則 reply 分支，供 intent 追問脈絡（短 TTL） */
+	lastLineReplyBranch: "last_line_reply_branch",
 } as const;
+
+function isLineAssistantReplyKind(s: string): s is LineAssistantReplyKind {
+	return (
+		s === "recommendation" ||
+		s === "report" ||
+		s === "status" ||
+		s === "none"
+	);
+}
+
+function getLastLineReplyBranchKey(userId: string): string {
+	return buildMoUserKvKey(MO_USER_KV_PREFIX.lastLineReplyBranch, userId);
+}
+
+async function readLastLineAssistantReplyKind(
+	env: Env,
+	userId: string
+): Promise<LineAssistantReplyKind> {
+	if (userId === "unknown-user" || userId.trim() === "") {
+		return "none";
+	}
+	try {
+		const raw = await env.MO_NOTES.get(getLastLineReplyBranchKey(userId), "text");
+		if (raw === null || raw.trim() === "") {
+			return "none";
+		}
+		const t = raw.trim();
+		if (isLineAssistantReplyKind(t)) {
+			return t;
+		}
+		return "none";
+	} catch {
+		return "none";
+	}
+}
+
+async function writeLastLineAssistantReplyKind(
+	env: Env,
+	userId: string,
+	kind: LineAssistantReplyKind
+): Promise<void> {
+	if (userId === "unknown-user" || userId.trim() === "") {
+		return;
+	}
+	try {
+		await env.MO_NOTES.put(getLastLineReplyBranchKey(userId), kind, {
+			expirationTtl: 7 * 24 * 60 * 60,
+		});
+	} catch {
+		// non-fatal
+	}
+}
 
 /** 正式 strategy notify：兩次推播嘗試最短間隔（毫秒）；與 dev-check MO_PUSH_COOLDOWN_MS_DEFAULT 一致 */
 const STRATEGY_NOTIFY_COOLDOWN_MS = MO_PUSH_COOLDOWN_MS_DEFAULT;
@@ -7263,7 +7357,13 @@ async function getReplyText(
 						const userId = event.source?.userId ?? "unknown-user";
 						console.log("[intent] user message", text);
 
-						const intent = await parseIntentWithAI(text, userId, env);
+						const lastAssistantReplyKind = await readLastLineAssistantReplyKind(env, userId);
+						const intent = await parseIntentWithAI(
+							text,
+							userId,
+							env,
+							lastAssistantReplyKind
+						);
 						const moInput = buildMoInputFromIntent(intent);
 						console.log("[mo] input", moInput);
 
@@ -7336,6 +7436,13 @@ async function getReplyText(
 							replyText = await getReplyText(event.message?.text, env, userId);
 						}
 
+						const lineReplyBranchForKv: LineAssistantReplyKind =
+							moInput.intent === "recommendation"
+								? "recommendation"
+								: moInput.intent === "report"
+									? "report"
+									: "status";
+
 						const response = await fetch("https://api.line.me/v2/bot/message/reply", {
 							method: "POST",
 							headers: {
@@ -7355,6 +7462,9 @@ async function getReplyText(
 						debugLog(env, "[line reply] status", response.status);
 						debugLog(env, "[line reply] ok", response.ok);
 						debugLog(env, "[line reply] body", await response.text());
+						if (response.ok) {
+							await writeLastLineAssistantReplyKind(env, userId, lineReplyBranchForKv);
+						}
 
 						const pushTestCmd = extractCommand(event.message?.text ?? "");
 						if (
