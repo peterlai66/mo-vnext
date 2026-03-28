@@ -132,6 +132,33 @@ type IntentParseResult = {
 	};
 };
 
+/** MO Input Schema（與 IntentParseResult 對齊；僅由 buildMoInputFromIntent 產出） */
+type MoInput = {
+	intent: IntentKind;
+	userId: string;
+	context: {
+		hasPortfolio: boolean;
+		riskPreference: "normal";
+	};
+	options: {
+		mode: "latest";
+	};
+};
+
+function buildMoInputFromIntent(intentResult: IntentParseResult): MoInput {
+	return {
+		intent: intentResult.intent,
+		userId: intentResult.userId,
+		context: {
+			hasPortfolio: intentResult.context.hasPortfolio,
+			riskPreference: intentResult.context.riskPreference,
+		},
+		options: {
+			mode: intentResult.options.mode,
+		},
+	};
+}
+
 function intentFallbackResult(userId: string): IntentParseResult {
 	return {
 		intent: "status",
@@ -7114,7 +7141,8 @@ async function getReplyText(
 						debugLog(env, "[line reply] body", await response.text());
 
 						const intent = await parseIntentWithAI(text, userId, env);
-						void intent;
+						const moInput = buildMoInputFromIntent(intent);
+						console.log("[mo] input", moInput);
 
 						const pushTestCmd = extractCommand(event.message?.text ?? "");
 						if (
