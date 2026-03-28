@@ -6670,6 +6670,14 @@ async function getReplyText(
 		if (url.pathname === "/admin/run" && request.method === "GET") {
 			try {
 				const result = await executeMoLiveDataCycle(env);
+				console.log("[admin/run] start review finalize");
+				try {
+					await processPendingMoDecisionReviews(env);
+					await finalizePendingDecisionReviews(env);
+				} catch (reviewErr: unknown) {
+					console.error("[admin/run] review finalize error", reviewErr);
+				}
+				console.log("[admin/run] review finalize done");
 				return new Response(JSON.stringify(result), {
 					headers: { "Content-Type": "application/json" },
 				});
