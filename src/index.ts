@@ -3634,9 +3634,21 @@ async function ensureMoDecisionReviewsTable(env: Env): Promise<void> {
 			return_3d REAL,
 			return_5d REAL,
 			return_10d REAL,
-			review_score TEXT
+			review_score TEXT,
+			review_return REAL,
+			reviewed_at TEXT
 		)`
 	).run();
+	for (const sql of [
+		`ALTER TABLE mo_decision_reviews ADD COLUMN review_return REAL`,
+		`ALTER TABLE mo_decision_reviews ADD COLUMN reviewed_at TEXT`,
+	] as const) {
+		try {
+			await env.MO_DB.prepare(sql).run();
+		} catch {
+			/* duplicate column on upgraded DB */
+		}
+	}
 }
 
 type MoTradeCloseRow = {
@@ -3768,6 +3780,112 @@ async function processPendingMoDecisionReviews(env: Env): Promise<void> {
 			/* skip */
 		}
 	}
+}
+
+/** Review v1：以「決策日之後最新 snapshot 收盤」對 decision_close 報酬結案（±1% 門檻） */
+function scoreReviewReturnFromRatio(r: number): "success" | "neutral" | "fail" {
+	if (r > 0.01) {
+		return "success";
+	}
+	if (r < -0.01) {
+		return "fail";
+	}
+	return "neutral";
+}
+
+type MoDecisionReviewPendingFinalizeRow = {
+	id: number;
+	trade_date: string;
+	decision_close: number | null;
+};
+
+async function finalizePendingDecisionReviews(env: Env): Promise<void> {
+	console.log("[review] start");
+	try {
+		await ensureMoDecisionReviewsTable(env);
+	} catch {
+		console.log("[review] done");
+		return;
+	}
+
+	let pending: MoDecisionReviewPendingFinalizeRow[];
+	try {
+		const q = await env.MO_DB.prepare(
+			`SELECT id, trade_date, decision_close
+			 FROM mo_decision_reviews
+			 WHERE review_status = 'pending'
+			 ORDER BY id ASC`
+		).all<MoDecisionReviewPendingFinalizeRow>();
+		pending = q.results ?? [];
+	} catch {
+		console.log("[review] done");
+		return;
+	}
+
+	if (pending.length === 0) {
+		console.log("[review] done");
+		return;
+	}
+
+	const todayYyyymmdd = getTaipeiYYYYMMDDMinusDaysFromToday(0);
+	let series: MoTradeCloseRow[];
+	try {
+		series = await fetchMoLiveTradeDateCloseSeries(env);
+	} catch {
+		console.log("[review] done");
+		return;
+	}
+
+	for (const row of pending) {
+		const idNum = typeof row.id === "bigint" ? Number(row.id) : row.id;
+		if (!Number.isFinite(idNum)) {
+			continue;
+		}
+		console.log("[review] evaluating", { id: idNum, tradeDate: row.trade_date });
+
+		const dc = row.decision_close;
+		if (dc === null || dc <= 0) {
+			continue;
+		}
+
+		if (todayYyyymmdd <= row.trade_date) {
+			continue;
+		}
+
+		let futureRow: MoTradeCloseRow | null = null;
+		for (let i = series.length - 1; i >= 0; i--) {
+			if (series[i].trade_date > row.trade_date) {
+				futureRow = series[i];
+				break;
+			}
+		}
+		if (futureRow === null || futureRow.close <= 0) {
+			continue;
+		}
+
+		const reviewReturn = (futureRow.close - dc) / dc;
+		const reviewScore = scoreReviewReturnFromRatio(reviewReturn);
+		const reviewedAt = formatStatusPushAtTaipei(new Date());
+
+		try {
+			await env.MO_DB
+				.prepare(
+					`UPDATE mo_decision_reviews
+					 SET review_status = 'done',
+					     review_score = ?,
+					     review_return = ?,
+					     reviewed_at = ?
+					 WHERE id = ?`
+				)
+				.bind(reviewScore, reviewReturn, reviewedAt, idNum)
+				.run();
+			console.log("[review] result", { id: idNum, return: reviewReturn, score: reviewScore });
+		} catch {
+			/* skip row */
+		}
+	}
+
+	console.log("[review] done");
 }
 
 async function insertMoDecisionReviewForReport(
@@ -6754,6 +6872,7 @@ async function getReplyText(
 					note: r.note,
 				});
 				await processPendingMoDecisionReviews(env);
+				await finalizePendingDecisionReviews(env);
 			})()
 		);
 	},
