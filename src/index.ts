@@ -177,11 +177,27 @@ function isIntentKind(s: string): s is IntentKind {
 	return s === "report" || s === "recommendation" || s === "status";
 }
 
-function extractAssistantJsonContent(content: string): string {
+/**
+ * trim 後去除 ```json / ``` 包圍，取得可 JSON.parse 的片段。
+ */
+function stripAssistantJsonForParse(content: string): string {
 	const t = content.trim();
-	const fence = /^```(?:json)?\s*([\s\S]*?)```$/u.exec(t);
-	if (fence !== null) {
-		return fence[1].trim();
+	if (t === "") {
+		return "";
+	}
+	const fullFence = /^```(?:json)?\s*([\s\S]*?)```$/u.exec(t);
+	if (fullFence !== null) {
+		return fullFence[1].trim();
+	}
+	if (t.startsWith("```")) {
+		const firstLineEnd = t.indexOf("\n");
+		if (firstLineEnd !== -1) {
+			const afterOpen = t.slice(firstLineEnd + 1);
+			const closePos = afterOpen.lastIndexOf("```");
+			if (closePos !== -1) {
+				return afterOpen.slice(0, closePos).trim();
+			}
+		}
 	}
 	return t;
 }
@@ -194,8 +210,12 @@ function normalizeIntentPayload(
 		return null;
 	}
 	const o = raw as Record<string, unknown>;
-	const ir = o.intent;
-	if (typeof ir !== "string" || !isIntentKind(ir)) {
+	const irRaw = o.intent;
+	if (typeof irRaw !== "string") {
+		return null;
+	}
+	const ir = irRaw.trim().toLowerCase();
+	if (!isIntentKind(ir)) {
 		return null;
 	}
 	let hasPortfolio = true;
@@ -230,25 +250,41 @@ async function parseIntentWithAI(text: string, userId: string, env: Env): Promis
 		return fallback;
 	}
 	const model = (env.OPENAI_MODEL ?? "").trim() || "gpt-4o-mini";
-	const systemPrompt = `你是一個系統，只負責將使用者輸入轉為 JSON。
+	const systemPrompt = `你是 intent 分類器，只負責依使用者語意輸出**一個** JSON 物件（不要 markdown、不要說明文字）。
 
-規則：
-1. 只能輸出 JSON
-2. 不要任何解釋
-3. intent 只能是：report / recommendation / status
-4. 如果無法判斷，預設為 status
+intent 只能是：report、recommendation、status。
 
-輸出格式：
+【status】適用於：
+- 詢問目前市場狀態、現在如何、盤勢、行情、風險狀態
+- 不要求完整分析報告
+例：現在市場如何、今天盤勢怎麼樣、目前適合進場嗎、現在風險高嗎
+
+【report】適用於：
+- 明確要求報告、完整整理、摘要、分析報告、總結
+例：report、給我報告、產生市場報告、今天的投資報告、幫我整理完整分析
+
+【recommendation】適用於：
+- 明確詢問建議、配置、方向、標的、該關注什麼
+例：給我建議、現在該怎麼配置、推薦我關注什麼、有什麼標的可以觀察
+
+【單字】若使用者輸入**僅**為單一英文單字（不分大小寫）：
+- report → intent 必為 report
+- recommendation → intent 必為 recommendation
+- status → intent 必為 status
+
+若無法判斷，intent 預設為 status。
+
+輸出格式（必須遵守）：
 {
-  "intent": "...",
-  "context": {
-    "hasPortfolio": true,
-    "riskPreference": "normal"
-  },
-  "options": {
-    "mode": "latest"
-  }
+  "intent": "report | recommendation | status",
+  "context": { "hasPortfolio": true, "riskPreference": "normal" },
+  "options": { "mode": "latest" }
 }`;
+
+	const userPrompt = `請根據以下使用者輸入，只回傳一個 JSON 物件，不要加 markdown，不要加解釋。
+
+使用者輸入：
+${text}`;
 
 	try {
 		const res = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -261,7 +297,7 @@ async function parseIntentWithAI(text: string, userId: string, env: Env): Promis
 				model,
 				messages: [
 					{ role: "system", content: systemPrompt },
-					{ role: "user", content: text },
+					{ role: "user", content: userPrompt },
 				],
 			}),
 		});
@@ -296,7 +332,16 @@ async function parseIntentWithAI(text: string, userId: string, env: Env): Promis
 			console.log("[intent] ai fail", new Error("OpenAI content not string"));
 			return fallback;
 		}
-		const jsonStr = extractAssistantJsonContent(contentRaw);
+		const trimmedContent = contentRaw.trim();
+		if (trimmedContent === "") {
+			console.log("[intent] ai fail", new Error("OpenAI assistant content empty after trim"));
+			return fallback;
+		}
+		const jsonStr = stripAssistantJsonForParse(trimmedContent);
+		if (jsonStr === "") {
+			console.log("[intent] ai fail", new Error("OpenAI content empty after code fence strip"));
+			return fallback;
+		}
 		let parsed: unknown;
 		try {
 			parsed = JSON.parse(jsonStr) as unknown;
@@ -306,9 +351,13 @@ async function parseIntentWithAI(text: string, userId: string, env: Env): Promis
 		}
 		const normalized = normalizeIntentPayload(parsed, userId);
 		if (normalized === null) {
-			console.log("[intent] ai fail", new Error("intent JSON shape invalid"));
+			console.log(
+				"[intent] ai fail",
+				new Error("intent not in {report,recommendation,status} or JSON shape invalid")
+			);
 			return fallback;
 		}
+		console.log("[intent] raw content", contentRaw);
 		console.log("[intent] ai result", normalized);
 		return normalized;
 	} catch (error: unknown) {
