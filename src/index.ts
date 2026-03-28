@@ -42,6 +42,7 @@ import {
 	normalizeIntentPayload,
 	type IntentParseResult,
 	type MoInput,
+	type RecommendationFollowUpIntent,
 } from "./mo/input.js";
 import {
 	deriveMoLiveDataGovernanceTyped,
@@ -52,6 +53,7 @@ import { buildRecommendationPrecheckResult } from "./mo/recommendation-precheck.
 import {
 	buildRecommendationOutput,
 	type RecommendationExplainableSummary,
+	type RecommendationOutput,
 } from "./mo/recommendation-output.js";
 
 interface KVListKey {
@@ -195,9 +197,18 @@ intent 只能是：report、recommendation、status。
 
 若無法判斷，intent 預設為 status。
 
+【followUpIntent】僅在 intent 為 recommendation 時有意義；report / status 時必為 "none"。
+當 intent 為 recommendation 時，依語意選一個字串（不可發明事實，只分類追問類型）：
+- "none"：首次要建議／配置／標的，或無法判斷是否為針對上一則推薦的追問。
+- "ask_more_candidates"：是否還有其他推薦、更多標的、換一個、還有嗎、除了這個還有嗎。
+- "ask_why"：為什麼、理由、依據、為何是這個／這些。
+- "ask_risk"：風險、有什麼風險、注意什麼、會不會有問題。
+- "ask_action"：下一步、該怎麼做、現在要做什麼、怎麼執行（在仍屬推薦語境時）。
+
 輸出格式（必須遵守）：
 {
   "intent": "report | recommendation | status",
+  "followUpIntent": "none | ask_more_candidates | ask_why | ask_risk | ask_action",
   "context": { "hasPortfolio": true, "riskPreference": "normal" },
   "options": { "mode": "latest" }
 }`;
@@ -280,6 +291,7 @@ ${text}`;
 		}
 		console.log("[intent] raw content", contentRaw);
 		console.log("[intent] ai result", normalized);
+		console.log("[intent] followUpIntent result", { followUpIntent: normalized.followUpIntent });
 		return normalized;
 	} catch (error: unknown) {
 		console.log("[intent] ai fail", error instanceof Error ? error : new Error(String(error)));
@@ -289,13 +301,100 @@ ${text}`;
 
 type AiRecommendationRenderResult = { ok: true; text: string } | { ok: false };
 
+type RecommendationFollowUpRenderContext = {
+	followUpIntent: RecommendationFollowUpIntent;
+	moFactsEnglish: string;
+};
+
+function followUpIntentToneHintZh(fu: RecommendationFollowUpIntent): string {
+	switch (fu) {
+		case "none":
+			return "";
+		case "ask_more_candidates":
+			return "使用者想確認是否還有其他候選或更多選項。";
+		case "ask_why":
+			return "使用者想了解推薦理由或依據。";
+		case "ask_risk":
+			return "使用者想了解風險與限制。";
+		case "ask_action":
+			return "使用者想知道下一步可行做法。";
+		default: {
+			const _e: never = fu;
+			return _e;
+		}
+	}
+}
+
+/**
+ * MO 依 RecommendationOutput 真實欄位組裝英文事實（供渲染層轉繁中，不得由模型發明）。
+ */
+function buildRecommendationFollowUpMoFactsEnglish(
+	out: RecommendationOutput,
+	fu: RecommendationFollowUpIntent
+): string {
+	if (fu === "none") {
+		return "";
+	}
+	const rec = out.recommendation;
+	const alloc = out.allocation;
+	const sim = out.simulation;
+	const dec = out.decision;
+
+	switch (fu) {
+		case "ask_more_candidates": {
+			if (out.blocked) {
+				return `Recommendation path is blocked (reason: ${out.blockReason ?? "unknown"}). No additional ranked candidates are produced beyond governance.`;
+			}
+			const n = rec.candidateCount;
+			if (n === 0) {
+				return "Ranked candidate count is zero; there are no further candidates in this run.";
+			}
+			const listed = rec.candidates.length;
+			return `This run has ${String(n)} ranked candidate(s); ${String(listed)} row(s) are attached to the payload for allocation planning. There is no separate hidden list beyond these ranked rows.`;
+		}
+		case "ask_why": {
+			const parts: string[] = [];
+			parts.push(`Recommendation source: ${rec.source}.`);
+			parts.push(`Ranked candidate count: ${String(rec.candidateCount)}.`);
+			if (rec.candidateCount > 0 && rec.candidates[0] !== undefined) {
+				const c0 = rec.candidates[0];
+				parts.push(
+					`Top-ranked row: symbol ${c0.symbol}, name ${c0.name}, score ${String(c0.score)}, rank ${String(c0.rank)}.`
+				);
+			}
+			parts.push(
+				`Allocation: ready=${String(alloc.ready)}, method=${alloc.method}, profile=${alloc.profile}, itemCount=${String(alloc.itemCount)}.`
+			);
+			parts.push(
+				`Simulation: readiness=${sim.readiness}, executable=${String(sim.executable)}, source=${sim.source}.`
+			);
+			return parts.join(" ");
+		}
+		case "ask_risk": {
+			if (out.blocked) {
+				return `Blocked: ${out.blockReason ?? "unknown"}. Decision stage=${dec.stage}, readiness=${dec.readiness}.`;
+			}
+			return `Blocked=${String(out.blocked)}. Data usability=${out.dataUsability}. Decision stage=${dec.stage}, readiness=${dec.readiness}. Simulation readiness=${sim.readiness}, executable=${String(sim.executable)}. Allocation ready=${String(alloc.ready)}, method=${alloc.method}.`;
+		}
+		case "ask_action": {
+			const notes = dec.notes.length > 0 ? dec.notes.join(" | ") : "(no notes)";
+			return `Decision notes: ${notes}. Allocation ready=${String(alloc.ready)}. Simulation executable=${String(sim.executable)}. Explainable action line: ${out.explainableSummary.action}`;
+		}
+		default: {
+			const _e: never = fu;
+			return _e;
+		}
+	}
+}
+
 /**
  * AI Rendering Pack v1: localize explainable summary to zh-TW for LINE; does not mutate input.
  * On failure, caller uses English renderedText.
  */
 async function renderRecommendationExplainableSummaryZh(
 	env: Env,
-	summary: RecommendationExplainableSummary
+	summary: RecommendationExplainableSummary,
+	followUp: RecommendationFollowUpRenderContext | null
 ): Promise<AiRecommendationRenderResult> {
 	const key = env.OPENAI_API_KEY?.trim();
 	if (key === undefined || key === "") {
@@ -309,7 +408,7 @@ async function renderRecommendationExplainableSummaryZh(
 		risk: summary.risk,
 		renderedText: summary.renderedText,
 	});
-	const systemPrompt = `你是 MO 的投資助理，要把「內部摘要資料」改寫成使用者一眼能懂的繁體中文訊息。語氣要像在 LINE 上跟使用者說話，不要像 checklist。
+	const baseSystem = `你是 MO 的投資助理，要把「內部摘要資料」改寫成使用者一眼能懂的繁體中文訊息。語氣要像在 LINE 上跟使用者說話，不要像 checklist。
 
 【語氣範例（風格務必接近；可依實際內容換句，不要照抄）】
 範例1：
@@ -332,9 +431,27 @@ async function renderRecommendationExplainableSummaryZh(
 - 風險：濃縮成一句話即可（例如語意上表達「目前建議先觀察」）。
 - 格式：最多 4 行（可用換行分段）；禁止使用條列符號、編號、markdown；不要加「助理：」等前綴。`;
 
-	const userPrompt = `以下為內部結構化資料（JSON，可能含英文）。請依系統規則改寫為給使用者的繁中訊息；輸出中不得保留任何英文或內部欄位名稱。
+	const followUpSystemExtra =
+		followUp === null
+			? ""
+			: `
 
-${payload}`;
+【追問補充】另有「MO 事實補充」英文段落為權威事實來源：你必須在繁中輸出中如實反映其語意，不得與其矛盾，不得新增其中沒有的事實。可與上方 JSON 摘要自然合併為一段對話。語意提示（僅供語氣）：${followUpIntentToneHintZh(followUp.followUpIntent)}
+- 含追問補充時：全文最多 6 行（可用換行分段）；仍禁止條列符號、編號、markdown。`;
+
+	const systemPrompt = baseSystem + followUpSystemExtra;
+
+	const userPrompt =
+		followUp === null
+			? `以下為內部結構化資料（JSON，可能含英文）。請依系統規則改寫為給使用者的繁中訊息；輸出中不得保留任何英文或內部欄位名稱。
+
+${payload}`
+			: `以下為內部結構化資料（JSON，可能含英文），以及 MO 依真實資料產生的英文事實補充（權威）。請合併改寫為給使用者的繁中訊息；輸出中不得保留任何英文或內部欄位名稱；MO 事實補充的語意必須保留。
+
+${payload}
+
+【MO 事實補充（英文，權威）】
+${followUp.moFactsEnglish}`;
 
 	try {
 		const res = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -7184,10 +7301,22 @@ async function getReplyText(
 								renderedTextPresent:
 									recommendationOutput.explainableSummary.renderedText.length > 0,
 							});
+							console.log("[mo] recommendation follow-up branch", moInput.followUpIntent);
+							const followUpRenderCtx: RecommendationFollowUpRenderContext | null =
+								moInput.followUpIntent === "none"
+									? null
+									: {
+											followUpIntent: moInput.followUpIntent,
+											moFactsEnglish: buildRecommendationFollowUpMoFactsEnglish(
+												recommendationOutput,
+												moInput.followUpIntent
+											),
+										};
 							console.log("[ai] rendering start");
 							const zhRender = await renderRecommendationExplainableSummaryZh(
 								env,
-								recommendationOutput.explainableSummary
+								recommendationOutput.explainableSummary,
+								followUpRenderCtx
 							);
 							if (zhRender.ok) {
 								console.log("[ai] rendering success");
