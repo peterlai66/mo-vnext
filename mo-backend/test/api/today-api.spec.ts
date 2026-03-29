@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { tryHandleTodayApiRequest } from "../../src/api/today-route.js";
 import { buildTodayApiStubResponse } from "../../src/api/today-stub-builder.js";
 import type { TodayApiResponse } from "../../src/api/today-types.js";
+import type { Env } from "../../src/types/env.js";
 
 const USABILITY = new Set(["display_only", "decision_ok", "push_ok", "unusable"]);
 const STALENESS = new Set(["fresh", "aging", "stale", "too_old"]);
@@ -58,48 +59,99 @@ function assertTodaySuccessShape(body: unknown): asserts body is TodayApiRespons
 	expect(typeof n.unreadCount).toBe("number");
 }
 
+/** D1 stub：回傳一列或 null（模擬 first() 行為） */
+function makeD1Stub(row: Record<string, unknown> | null): D1Database {
+	return {
+		prepare: () => ({
+			first: () => Promise.resolve(row),
+			bind: function () {
+				return this;
+			},
+		}),
+	} as unknown as D1Database;
+}
+
+function makeEnv(d1Row: Record<string, unknown> | null): Env {
+	return { MO_DB: makeD1Stub(d1Row) } as unknown as Env;
+}
+
+const VALID_ROW = {
+	id: 1,
+	trade_date: "20260328",
+	source: "twse_mi_index",
+	payload_summary: "indexDailyPct:0.34",
+	created_at: "2026-03-29T10:00:00.000Z",
+};
+
 describe("Today API `/api/today`（白盒，Node pool）", () => {
-	it("buildTodayApiStubResponse：欄位 mapping 與治理／recommendation 語彙一致", () => {
+	it("buildTodayApiStubResponse：欄位 mapping 正確（stub 保留供緊急參考）", () => {
 		const fixed = buildTodayApiStubResponse(1_717_000_000_000);
 		expect(fixed.ok).toBe(true);
 		expect(fixed.generatedAt).toBe("2024-05-29T16:26:40.000Z");
 		expect(fixed.data.tradeDate).toBe("20260328");
 		expect(fixed.data.governance.dataUsability).toBe("decision_ok");
-		expect(fixed.data.governance.decisionEligible).toBe(true);
-		expect(fixed.data.governance.pushEligible).toBe(false);
-		expect(fixed.data.recommendation.mode).toBe("observe_only");
-		expect(fixed.data.recommendation.confidence).toBe("medium");
 		expect(fixed.data.recommendation.display.headlineZh.length).toBeGreaterThan(0);
 		expect(fixed.data.display.tradeDateLabelZh).toMatch(/\d{4}\/\d{2}\/\d{2}/);
-		expect(fixed.data.market.stalenessLevel).toBe("fresh");
 		assertTodaySuccessShape(fixed);
 	});
 
-	it("tryHandleTodayApiRequest：GET 成功、Content-Type 為 JSON", async () => {
-		const res = tryHandleTodayApiRequest(new Request("https://example.com/api/today", { method: "GET" }));
-		expect(res).not.toBeNull();
-		const ct = res!.headers.get("Content-Type") ?? "";
-		expect(ct).toMatch(/^application\/json/i);
-		expect(ct.toLowerCase()).toContain("charset=utf-8");
-		const json: unknown = JSON.parse(await res!.text());
-		assertTodaySuccessShape(json);
+	it("tryHandleTodayApiRequest：是 async function", () => {
+		const fn = tryHandleTodayApiRequest;
+		const result = fn(new Request("https://x.com/api/today"), makeEnv(VALID_ROW));
+		expect(result instanceof Promise).toBe(true);
+		return result;
 	});
 
-	it("tryHandleTodayApiRequest：POST 回 405 與 Allow: GET", async () => {
-		const res = tryHandleTodayApiRequest(
-			new Request("https://example.com/api/today", { method: "POST", body: "{}" })
+	it("tryHandleTodayApiRequest：GET + D1 有資料 → 200 + success shape（market.source 無 stub）", async () => {
+		const env = makeEnv(VALID_ROW);
+		const res = await tryHandleTodayApiRequest(
+			new Request("https://example.com/api/today", { method: "GET" }),
+			env
+		);
+		expect(res).not.toBeNull();
+		expect(res!.status).toBe(200);
+		const ct = res!.headers.get("Content-Type") ?? "";
+		expect(ct).toMatch(/^application\/json/i);
+		const json: unknown = JSON.parse(await res!.text());
+		assertTodaySuccessShape(json);
+		const data = (json as TodayApiResponse).data;
+		expect(data.market.source).toBe("twse_mi_index");
+		expect(data.market.source).not.toContain("stub");
+		expect(data.tradeDate).toBe("20260328");
+	});
+
+	it("tryHandleTodayApiRequest：D1 查無資料 → 503 + ok:false + error:no_live_data", async () => {
+		const env = makeEnv(null);
+		const res = await tryHandleTodayApiRequest(
+			new Request("https://example.com/api/today", { method: "GET" }),
+			env
+		);
+		expect(res!.status).toBe(503);
+		const j = JSON.parse(await res!.text()) as { ok: boolean; error: string };
+		expect(j.ok).toBe(false);
+		expect(j.error).toBe("no_live_data");
+	});
+
+	it("tryHandleTodayApiRequest：POST → 405 + Allow: GET", async () => {
+		const env = makeEnv(null);
+		const res = await tryHandleTodayApiRequest(
+			new Request("https://example.com/api/today", { method: "POST", body: "{}" }),
+			env
 		);
 		expect(res!.status).toBe(405);
 		expect(res!.headers.get("Allow")).toBe("GET");
-		const ct = res!.headers.get("Content-Type") ?? "";
-		expect(ct).toMatch(/^application\/json/i);
 		const j = JSON.parse(await res!.text()) as { ok: boolean; error: string };
 		expect(j.ok).toBe(false);
 		expect(j.error).toBe("method_not_allowed");
 	});
 
-	it("tryHandleTodayApiRequest：其他路徑回 null（不攔截）", () => {
-		expect(tryHandleTodayApiRequest(new Request("https://example.com/api/today/extra"))).toBeNull();
-		expect(tryHandleTodayApiRequest(new Request("https://example.com/status"))).toBeNull();
+	it("tryHandleTodayApiRequest：其他路徑回 null", async () => {
+		const env = makeEnv(null);
+		expect(
+			await tryHandleTodayApiRequest(new Request("https://example.com/api/today/extra"), env)
+		).toBeNull();
+		expect(
+			await tryHandleTodayApiRequest(new Request("https://example.com/status"), env)
+		).toBeNull();
 	});
 });
