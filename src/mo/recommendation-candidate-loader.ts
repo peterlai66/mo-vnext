@@ -7,7 +7,7 @@ import {
 /** Unified row shape for recommendation pipeline (stub + loader). */
 export type RecommendationCandidate = RecommendationStubCandidate;
 
-export type RecommendationCandidateLoadSource = "real_loader" | "stub_engine";
+export type RecommendationCandidateLoadSource = "real_loader" | "stub_engine" | "etf_universe";
 
 export type RecommendationCandidateLoadResult = {
 	source: RecommendationCandidateLoadSource;
@@ -112,6 +112,10 @@ function withStubFallbackNotes(stub: ReturnType<typeof buildRecommendationStubRe
 export type RecommendationLoaderContext = {
 	snapshotRow: MoLiveSnapshotRow | null;
 	snapshotReadOk: boolean;
+	/** ETF v1：交易日（YYYYMMDD），通常等於快照 trade_date；由 Worker 填入 */
+	etfTradeDateYyyymmdd: string;
+	/** 大盤同日報酬（小數）；無則 null */
+	indexDailyPct: number | null;
 };
 
 export function loadRecommendationCandidates(ctx: RecommendationLoaderContext): RecommendationCandidateLoadResult {

@@ -1,6 +1,7 @@
 import type {
 	RecommendationCandidate,
 	RecommendationCandidateLoadResult,
+	RecommendationCandidateLoadSource,
 } from "./recommendation-candidate-loader.js";
 
 export type RecommendationRankedCandidate = {
@@ -10,12 +11,12 @@ export type RecommendationRankedCandidate = {
 	rationale: string;
 	score: number;
 	rank: number;
-	scoringSource: "real_loader" | "stub_engine";
+	scoringSource: RecommendationCandidateLoadSource;
 	scoringNotes: string[];
 };
 
 export type RecommendationRankingResult = {
-	source: "real_loader" | "stub_engine";
+	source: RecommendationCandidateLoadSource;
 	ready: boolean;
 	candidateCount: number;
 	rankedCandidates: readonly RecommendationRankedCandidate[];
@@ -35,12 +36,18 @@ export function rankRecommendationCandidates(
 	const sorted = [...load.candidates].sort(compareStableDescendingScore);
 	const scoringSource = load.source;
 	const perCandidateScoringNotes: readonly string[] =
-		scoringSource === "real_loader"
-			? ["ranked from real candidate loader"]
-			: ["ranked from stub engine"];
+		scoringSource === "etf_universe"
+			? ["ranked from ETF universe v1"]
+			: scoringSource === "real_loader"
+				? ["ranked from real candidate loader"]
+				: ["ranked from stub engine"];
 
 	const rankingTailNote =
-		scoringSource === "real_loader" ? "real candidate ranking ready" : "stub candidate ranking ready";
+		scoringSource === "etf_universe"
+			? "etf universe v1 ranking ready"
+			: scoringSource === "real_loader"
+				? "real candidate ranking ready"
+				: "stub candidate ranking ready";
 
 	const rankedCandidates: RecommendationRankedCandidate[] = sorted.map((c, idx) => ({
 		symbol: c.symbol,

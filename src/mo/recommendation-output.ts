@@ -5,17 +5,18 @@ import {
 	type RecommendationAllocationPlanItem,
 	type RecommendationAllocationPlanResult,
 } from "./recommendation-allocation.js";
-import {
-	loadRecommendationCandidates,
-	type RecommendationCandidate,
-	type RecommendationCandidateLoadResult,
-	type RecommendationLoaderContext,
+import type {
+	RecommendationCandidate,
+	RecommendationCandidateLoadResult,
+	RecommendationLoaderContext,
 } from "./recommendation-candidate-loader.js";
 import {
 	rankRecommendationCandidates,
 	type RecommendationRankedCandidate,
 	type RecommendationRankingResult,
 } from "./recommendation-ranking.js";
+import { runMoEtfCandidatePipelineV1 } from "./recommendation/etf-pipeline.js";
+import type { EtfCandidateGateState, MoEtfFetchEnv } from "./recommendation/etf-types.js";
 
 /** Narrow usability aligned with precheck output (engine may extend later). */
 export type RecommendationOutputDataUsability = "decision_ok" | "display_only" | "unusable";
@@ -87,7 +88,7 @@ export type RecommendationSimulationPlaceholder = {
 	notes: string[];
 };
 
-export type RecommendationPayloadSource = "none" | "stub_engine" | "real_loader";
+export type RecommendationPayloadSource = "none" | "stub_engine" | "real_loader" | "etf_universe";
 
 /** Engine-facing slice; ranked candidates for downstream allocation / simulation. */
 export type RecommendationPayload = {
@@ -128,6 +129,11 @@ export type RecommendationOutput = {
 	recommendation: RecommendationPayload;
 	explainableSummary: RecommendationExplainableSummary;
 	generatedAt: string;
+	/** ETF Candidate Universe v1（與 FinMind 載入／gate 對齊；供 report／follow-up 引用） */
+	etfCandidateContext?: {
+		gate: EtfCandidateGateState;
+		humanSummaryZh: string;
+	};
 };
 
 export type { RecommendationCandidate, RecommendationRankedCandidate };
@@ -226,7 +232,9 @@ function buildExplainableSummary(
 }
 
 function attachExplainable(
-	base: Omit<RecommendationOutput, "explainableSummary">
+	base: Omit<RecommendationOutput, "explainableSummary" | "etfCandidateContext"> & {
+		etfCandidateContext?: RecommendationOutput["etfCandidateContext"];
+	}
 ): RecommendationOutput {
 	return {
 		...base,
@@ -272,9 +280,11 @@ function decisionFromRankingAndAllocation(
 	rank: RecommendationRankingResult
 ): RecommendationDecisionEnvelope {
 	const base =
-		rank.source === "real_loader"
-			? ["real candidate ranking ready"]
-			: ["stub candidate ranking ready"];
+		rank.source === "etf_universe"
+			? ["etf universe v1 candidate ranking ready"]
+			: rank.source === "real_loader"
+				? ["real candidate ranking ready"]
+				: ["stub candidate ranking ready"];
 	return {
 		stage: "skeleton_ready",
 		readiness: "ready_for_engine",
@@ -299,7 +309,9 @@ function candidateFromRankingResult(
 	load: RecommendationCandidateLoadResult
 ): RecommendationCandidatePlaceholder {
 	const source: RecommendationCandidateSource =
-		load.source === "real_loader" ? "recommendation_loader" : "recommendation_stub";
+		load.source === "real_loader" || load.source === "etf_universe"
+			? "recommendation_loader"
+			: "recommendation_stub";
 	return {
 		stage: "placeholder_ready",
 		source,
@@ -367,7 +379,11 @@ function recommendationWhenBlocked(): RecommendationPayload {
 
 function recommendationFromRankingResult(rank: RecommendationRankingResult): RecommendationPayload {
 	const source: RecommendationPayloadSource =
-		rank.source === "real_loader" ? "real_loader" : "stub_engine";
+		rank.source === "etf_universe"
+			? "etf_universe"
+			: rank.source === "real_loader"
+				? "real_loader"
+				: "stub_engine";
 	return {
 		source,
 		ready: rank.ready,
@@ -386,16 +402,19 @@ function summaryFromRankAndPlan(
 			? "real recommendation ranking ready"
 			: "stub recommendation ranking ready";
 	}
-	return rank.source === "real_loader"
-		? "real recommendation allocation ready"
-		: "stub recommendation allocation ready";
+	return rank.source === "etf_universe"
+		? "etf universe v1 recommendation allocation pipeline"
+		: rank.source === "real_loader"
+			? "real recommendation allocation ready"
+			: "stub recommendation allocation ready";
 }
 
-export function buildRecommendationOutput(
+export async function buildRecommendationOutput(
 	moInput: MoInput,
 	precheck: RecommendationPrecheckResult,
-	loaderCtx: RecommendationLoaderContext
-): RecommendationOutput {
+	loaderCtx: RecommendationLoaderContext,
+	fetchEnv: MoEtfFetchEnv
+): Promise<RecommendationOutput> {
 	const generatedAt = new Date().toISOString();
 	const mode = moInput.options.mode;
 	const profile = allocationProfile(moInput);
@@ -419,7 +438,12 @@ export function buildRecommendationOutput(
 		});
 	}
 
-	const load = loadRecommendationCandidates(loaderCtx);
+	const etf = await runMoEtfCandidatePipelineV1(
+		fetchEnv,
+		loaderCtx.etfTradeDateYyyymmdd,
+		loaderCtx.indexDailyPct
+	);
+	const load = etf.loadResult;
 	const rank = rankRecommendationCandidates(load);
 	const plan = buildRecommendationAllocationPlan({ blocked: false, rank, profile });
 
@@ -437,5 +461,9 @@ export function buildRecommendationOutput(
 		simulation: simulationFromPlan(plan),
 		recommendation: recommendationFromRankingResult(rank),
 		generatedAt,
+		etfCandidateContext: {
+			gate: etf.gate,
+			humanSummaryZh: etf.humanSummaryZh,
+		},
 	});
 }

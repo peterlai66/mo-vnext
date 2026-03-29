@@ -45,6 +45,10 @@ import {
 	type RecommendationFollowUpIntent,
 } from "./mo/input.js";
 import {
+	applyRecommendationAskTimingIntentOverride,
+	composeAskTimingFollowUpReplyZh,
+} from "./mo/recommendation-follow-up-timing.js";
+import {
 	deriveMoLiveDataGovernanceTyped,
 	type MoLiveDataGovernance,
 	type MoLiveDataUsability,
@@ -56,6 +60,14 @@ import {
 	type RecommendationExplainableSummary,
 	type RecommendationOutput,
 } from "./mo/recommendation-output.js";
+import { runMoEtfCandidatePipelineV1 } from "./mo/recommendation/etf-pipeline.js";
+import { etfCandidateGateLabelZh } from "./mo/recommendation/etf-gate.js";
+import { parseIndexDailyPctFromMoLivePayloadSummary } from "./mo/live-index-daily-pct.js";
+import {
+	tryFinMindTaiexDailyWithIndexPct,
+	supplementLegacySummaryWithFinMindIndexDailyPct,
+} from "./mo/finmind-taiex-index-pct.js";
+import { buildMoStatusEtfIntegrationBlockZh } from "./mo/status-etf-integration.js";
 
 interface KVListKey {
 	name: string;
@@ -189,16 +201,17 @@ async function parseIntentWithAI(
 intent 只能是：report、recommendation、status。
 
 【判斷優先順序（必讀；「對話脈絡」僅輔助，不得硬覆蓋下列第 1 點）】
-1. **最高優先**：若使用者**明確**在問**整體**市場、大盤、盤勢、行情，或**市場／系統／目前**的宏觀狀態（例如「現在狀態如何」「市場狀態」「目前狀況」「系統狀態」「現在盤勢怎樣」），則 intent **必須**為 status，followUpIntent **必須**為 none——**即使**對話脈絡顯示上一則助理為 recommendation。這是獨立的 status 查詢，不是延續推薦細節。
+1. **最高優先**：若使用者**明確**在問**整體**市場、大盤、盤勢、行情，或**市場／系統／目前**的宏觀狀態（例如「現在狀態如何」「市場狀態」「目前狀況」「系統狀態」「現在盤勢怎樣」），則 intent **必須**為 status，followUpIntent **必須**為 none——**即使**對話脈絡顯示上一則助理為 recommendation。這是獨立的 status 查詢，不是延續推薦細節。**例外（必守）**：若上一則助理為 recommendation，且使用者短句在問「現在／目前適合進場嗎、適合買嗎、可以進場嗎、適合佈局嗎」等**進場／買入／佈局時機**，則**不屬於**本條整體狀態查詢；intent **必須**為 recommendation，followUpIntent **必須**為 ask_timing（不得判成 status）。
 2. 若**未**觸發第 1 點，且對話脈絡為 recommendation，且本輪為針對**先前那則推薦／候選**的**短句追問**（未改問整體市場），則 intent 為 recommendation，並依語意設定 followUpIntent（例如風險、理由、下一步、還有沒有其他標的）。
 3. 出現「狀態」一詞時：若語意是**大盤／市場／系統／目前整體**→ status；若語意是**這則建議或標的本身的風險／細節**且為短句延續推薦→ recommendation + 對應 followUpIntent。
 4. recommendation 的 follow-up **不得**壓過第 1 點的明確整體狀態查詢。
 5. 若無 recommendation 脈絡且無法判斷，intent 預設為 status。
 
 【status】適用於：
-- 詢問**整體**市場、大盤、現在盤勢、行情、**宏觀**氛圍，或**市場／系統／目前**狀態
+- 詢問**整體**市場、大盤、現在盤勢、行情、**宏觀**氛圍，或**市場／系統／目前**狀態（指整體環境／氣氛／指數概況，而非「針對上一則推薦的進場時機」）
 - 不要求完整分析報告
-例：現在市場如何、今天盤勢怎麼樣、目前適合進場嗎、現在風險高嗎、**現在狀態如何**、市場狀態、目前狀況、系統狀態
+- **禁止**把「現在／目前適合進場嗎、適合買嗎、可以進場嗎、這時候適合佈局嗎」在 recommendation 脈絡下判成 status；該類為 recommendation + ask_timing。
+例：現在市場如何、今天盤勢怎麼樣、現在風險高嗎、**現在狀態如何**、市場狀態、目前狀況、系統狀態
 
 【改判 recommendation + followUpIntent 的條件】僅當**未**觸發上述「明確整體狀態查詢」，且使用者是在追問**先前那則建議／候選**的細節（例如風險、理由、下一步、還有沒有其他標的）— 與「問整體市場現在怎樣」不同。
 
@@ -231,6 +244,9 @@ intent 只能是：report、recommendation、status。
 - 使用者：為什麼 → intent: recommendation, followUpIntent: ask_why
 - 使用者：還有嗎 → intent: recommendation, followUpIntent: ask_more_candidates
 - 使用者：那我該怎麼做 → intent: recommendation, followUpIntent: ask_action
+- 使用者：現在適合進場嗎 → intent: recommendation, followUpIntent: ask_timing
+- 使用者：現在適合買嗎 → intent: recommendation, followUpIntent: ask_timing
+- 使用者：這時候適合佈局嗎 → intent: recommendation, followUpIntent: ask_timing
 - 使用者：現在狀態如何 → intent: status, followUpIntent: none（明確整體狀態查詢，優先於脈絡）
 - 使用者：市場狀態 → intent: status, followUpIntent: none
 
@@ -415,10 +431,17 @@ function buildRecommendationFollowUpMoFactsEnglish(
 	}
 	if (pack !== null) {
 		const guard = buildFollowUpGuardFactsEnglish(pack);
+		const etfFacts =
+			out.etfCandidateContext !== undefined ?
+				`台股 ETF 候選：狀態=${etfCandidateGateLabelZh(out.etfCandidateContext.gate)}。${out.etfCandidateContext.humanSummaryZh}`
+			:	"台股 ETF 候選：此輪未附加摘要。";
 		if (fu === "ask_why") {
 			return [
 				guard,
 				"ask_why facts:",
+				"etf_ranking_vs_gate: Candidate ETF row scores are for sorting only; overall recommendation gate uses the composite system score (separate layer).",
+				etfFacts,
+				`recommendation_payload_source: ${out.recommendation.source}`,
 				`primaryReason (main story): ${pack.primaryReason}`,
 				`blockedBy: ${pack.blockedBy}`,
 				`semanticCandidateOnly: ${pack.semanticCandidateOnly ? "yes" : "no"} (if yes, do not imply a named actionable pick)`,
@@ -431,6 +454,8 @@ function buildRecommendationFollowUpMoFactsEnglish(
 			return [
 				guard,
 				"ask_risk facts:",
+				"etf_ranking_vs_gate: Candidate ETF row scores are for sorting only; overall gate uses composite system score (separate layer).",
+				etfFacts,
 				`blockedBy: ${pack.blockedBy}`,
 				`riskNote: ${pack.riskNote}`,
 				`simulationCaution: ${pack.simulationCautionLine}`,
@@ -446,6 +471,8 @@ function buildRecommendationFollowUpMoFactsEnglish(
 			return [
 				guard,
 				"ask_timing facts:",
+				"etf_ranking_vs_gate: ETF candidate scores sort only; entry timing follows overall recommendationMode and composite gate, not a single ETF row score.",
+				etfFacts,
 				`recommendationMode: ${pack.recommendationMode}`,
 				`blockedBy: ${pack.blockedBy}`,
 				`actionHint: ${pack.actionHint}`,
@@ -473,6 +500,11 @@ function buildRecommendationFollowUpMoFactsEnglish(
 		}
 		case "ask_why": {
 			const parts: string[] = [];
+			if (out.etfCandidateContext !== undefined) {
+				parts.push(
+					`台股 ETF 候選：狀態=${etfCandidateGateLabelZh(out.etfCandidateContext.gate)}。${out.etfCandidateContext.humanSummaryZh}`
+				);
+			}
 			parts.push(`Recommendation source: ${rec.source}.`);
 			parts.push(`Ranked candidate count: ${String(rec.candidateCount)}.`);
 			if (rec.candidateCount > 0 && rec.candidates[0] !== undefined) {
@@ -490,17 +522,25 @@ function buildRecommendationFollowUpMoFactsEnglish(
 			return parts.join(" ");
 		}
 		case "ask_risk": {
+			const etfPrefix =
+				out.etfCandidateContext !== undefined ?
+					`台股 ETF 候選：狀態=${etfCandidateGateLabelZh(out.etfCandidateContext.gate)}。${out.etfCandidateContext.humanSummaryZh} `
+				:	"";
 			if (out.blocked) {
-				return `Blocked: ${out.blockReason ?? "unknown"}. Decision stage=${dec.stage}, readiness=${dec.readiness}.`;
+				return `${etfPrefix}Blocked: ${out.blockReason ?? "unknown"}. Decision stage=${dec.stage}, readiness=${dec.readiness}.`;
 			}
-			return `Blocked=${String(out.blocked)}. Data usability=${out.dataUsability}. Decision stage=${dec.stage}, readiness=${dec.readiness}. Simulation readiness=${sim.readiness}, executable=${String(sim.executable)}. Allocation ready=${String(alloc.ready)}, method=${alloc.method}.`;
+			return `${etfPrefix}Blocked=${String(out.blocked)}. Data usability=${out.dataUsability}. Decision stage=${dec.stage}, readiness=${dec.readiness}. Simulation readiness=${sim.readiness}, executable=${String(sim.executable)}. Allocation ready=${String(alloc.ready)}, method=${alloc.method}.`;
 		}
 		case "ask_action": {
 			const notes = dec.notes.length > 0 ? dec.notes.join(" | ") : "(no notes)";
 			return `Decision notes: ${notes}. Allocation ready=${String(alloc.ready)}. Simulation executable=${String(sim.executable)}. Explainable action line: ${out.explainableSummary.action}`;
 		}
 		case "ask_timing": {
-			return `Decision readiness: ${dec.readiness}. Stage: ${dec.stage}. Action from summary: ${out.explainableSummary.action}`;
+			const etfPrefix =
+				out.etfCandidateContext !== undefined ?
+					`台股 ETF 候選：狀態=${etfCandidateGateLabelZh(out.etfCandidateContext.gate)}。${out.etfCandidateContext.humanSummaryZh} `
+				:	"";
+			return `${etfPrefix}Decision readiness: ${dec.readiness}. Stage: ${dec.stage}. Action from summary: ${out.explainableSummary.action}`;
 		}
 		default: {
 			const _e: never = fu;
@@ -553,13 +593,20 @@ async function renderRecommendationExplainableSummaryZh(
 - 風險：濃縮成一句話即可（例如語意上表達「目前建議先觀察」）。
 - 格式：最多 4 行（可用換行分段）；禁止使用條列符號、編號、markdown；不要加「助理：」等前綴。`;
 
+	const timingIntentExtra =
+		followUp !== null && followUp.followUpIntent === "ask_timing"
+			? `
+
+【ask_timing 專用】使用者問的是「現在是否適合進場、買入或佈局」。請用繁中直接回答：① 目前建議模式（先觀察／可留意等，須與事實補充一致）；② 是否適合積極進場的結論；③ 主因須對齊分數與門檻或 gate，勿將模擬未完成敘述成唯一或主要理由；④ 若事實補充含台股 ETF 候選，須交代「有候選可觀察但未達放行條件」之語意（若屬實）。嚴禁改寫成整段市場狀態報告或與進場時機無關的長文。`
+			: "";
+
 	const followUpSystemExtra =
 		followUp === null
 			? ""
 			: `
 
 【追問補充】另有「MO 事實補充」英文段落為權威事實來源：你必須在繁中輸出中如實反映其語意，不得與其矛盾，不得新增其中沒有的事實。可與上方 JSON 摘要自然合併為一段對話。語意提示（僅供語氣）：${followUpIntentToneHintZh(followUp.followUpIntent)}
-- 含追問補充時：全文最多 6 行（可用換行分段）；仍禁止條列符號、編號、markdown。`;
+- 含追問補充時：全文最多 6 行（可用換行分段）；仍禁止條列符號、編號、markdown。${timingIntentExtra}`;
 
 	const systemPrompt = baseSystem + followUpSystemExtra;
 
@@ -1880,6 +1927,7 @@ type MoStatusState = {
 	reportBlock: string;
 	reviewBlock: string;
 	liveMarketBlock: string;
+	etfIntegrationBlock: string;
 };
 
 /** 與 D1 payload_summary JSON 對齊（v2 正規化） */
@@ -2122,6 +2170,12 @@ function buildCandidateSummaryForPack(recOut: RecommendationOutput | null): {
 	}
 	const n = recOut.recommendation.candidateCount;
 	if (n === 0) {
+		if (recOut.etfCandidateContext !== undefined) {
+			return {
+				candidateSummary: recOut.etfCandidateContext.humanSummaryZh,
+				semanticCandidateOnly: true,
+			};
+		}
 		return {
 			candidateSummary: "目前無足夠入列候選，或候選分數不足以支撐積極建議。",
 			semanticCandidateOnly: true,
@@ -2162,7 +2216,9 @@ function buildCandidateSummaryForPack(recOut: RecommendationOutput | null): {
 		};
 	}
 	// 可辨識之上市／上櫃代號型態（來源無關，不依賴資料商名稱）
-	const symOk = /^\d{4}\.TW$/u.test(top.symbol.trim()) || /^[A-Z]{1,5}\d{0,2}\.TW$/u.test(top.symbol.trim());
+	const symOk =
+		/^(\d{4}|\d{5}|\d{6})\.TW$/u.test(top.symbol.trim()) ||
+		/^[A-Z]{1,5}\d{0,2}\.TW$/u.test(top.symbol.trim());
 	if (symOk) {
 		return {
 			candidateSummary: `可辨識候選：${top.name}（${top.symbol}）；共 ${String(n)} 檔列入排序。`,
@@ -2352,6 +2408,7 @@ function buildRecommendationGateReportAppendix(
 	pack: RecommendationExplainableSummaryPack | null
 ): string {
 	const base = [
+		"【層級說明】此處「綜合分／門檻」為整體建議 gate 用；台股 ETF 候選列上的排序分屬另一層級，僅供排序與觀察。",
 		`候選／綜合分數：${String(d.candidateScore)}（balanced 門檻 ${String(d.balancedMinScore)}，scoreEligible=${d.scoreEligible ? "yes" : "no"}）`,
 		`decisionEligible=${d.decisionEligible ? "true" : "false"} dataUsability=${d.dataUsability} recommendationReadiness=${d.recommendationReadiness}`,
 		`actionableAllowed=${d.actionableAllowed ? "true" : "false"} blockedBy=${d.blockedBy}`,
@@ -2531,74 +2588,6 @@ function maskFinMindTokenInRequestUrl(fullUrl: string): string {
 	} catch {
 		return "<invalid url>";
 	}
-}
-
-/**
- * FinMind fallback：GET /api/v4/data dataset=TaiwanStockPrice data_id=TAIEX
- * （與 TWSE MI_INDEX 欄位不同，僅最小日線；v4 已無 TaiwanStockDaily 資料集名稱）
- */
-async function tryFinMindTaiexDaily(env: Env): Promise<
-	| { ok: true; tradeDateYyyymmdd: string; rawText: string; legacySummary: string }
-	| { ok: false; note: string }
-> {
-	const token = env.FINMIND_TOKEN?.trim();
-	if (token === undefined || token === "") {
-		return { ok: false, note: "FINMIND_TOKEN unset" };
-	}
-	let lastNote = "";
-	for (let i = 0; i < 7; i++) {
-		const td = getTaipeiYYYYMMDDMinusDaysFromToday(i);
-		const finDate = yyyymmddToFinMindDate(td);
-		if (finDate === null) {
-			lastNote = `bad td ${td}`;
-			continue;
-		}
-		const params = new URLSearchParams({
-			dataset: "TaiwanStockPrice",
-			data_id: "TAIEX",
-			start_date: finDate,
-			end_date: finDate,
-			token,
-		});
-		const url = `https://api.finmindtrade.com/api/v4/data?${params.toString()}`;
-		try {
-			const res = await fetch(url, {
-				headers: {
-					"User-Agent": "Mozilla/5.0 (compatible; MO-vNext/1.0; FinMind-fallback)",
-				},
-			});
-			const text = await res.text();
-			if (!res.ok) {
-				console.log("[mo-live] finmind http error", {
-					requestUrl: maskFinMindTokenInRequestUrl(url),
-					status: res.status,
-					bodyPreview: text.slice(0, 200),
-				});
-				lastNote = `http ${String(res.status)} for ${td}`;
-				continue;
-			}
-			let j: unknown;
-			try {
-				j = JSON.parse(text) as unknown;
-			} catch {
-				lastNote = `json parse failed for ${td}`;
-				continue;
-			}
-			const parsed = parseFinMindTaiwanStockPriceTaiexResponse(j);
-			if (parsed !== null) {
-				return {
-					ok: true,
-					tradeDateYyyymmdd: parsed.tradeDateYyyymmdd,
-					rawText: text,
-					legacySummary: parsed.legacySummary,
-				};
-			}
-			lastNote = `no TAIEX row for ${td}`;
-		} catch (err: unknown) {
-			lastNote = err instanceof Error ? err.message : String(err);
-		}
-	}
-	return { ok: false, note: lastNote || "FinMind TAIEX daily empty" };
 }
 
 /**
@@ -2998,14 +2987,35 @@ async function buildMoLiveMarketStatusBlock(env: Env): Promise<string> {
 }
 
 async function buildMoStatusState(env: Env, userId: string): Promise<MoStatusState> {
-	const [lastPushBlock, decisionBlock, reportBlock, reviewBlock, liveMarketBlock] = await Promise.all([
-		formatLastPushStatusBlock(env, userId),
-		formatLastStrategyDecisionStatusBlock(env, userId),
-		formatLastReportSummaryStatusBlock(env, userId),
-		formatMoReviewStatusBlock(env, userId),
-		buildMoLiveMarketStatusBlock(env),
-	]);
-	return { lastPushBlock, decisionBlock, reportBlock, reviewBlock, liveMarketBlock };
+	const [pushCtx, lastPushBlock, decisionBlock, reportBlock, reviewBlock, liveMarketBlock] =
+		await Promise.all([
+			computeMoPushEvaluationForUser(env, userId, false),
+			formatLastPushStatusBlock(env, userId),
+			formatLastStrategyDecisionStatusBlock(env, userId),
+			formatLastReportSummaryStatusBlock(env, userId),
+			formatMoReviewStatusBlock(env, userId),
+			buildMoLiveMarketStatusBlock(env),
+		]);
+	const etfIntegrationBlock = await buildMoStatusEtfIntegrationBlockZh(
+		{ FINMIND_TOKEN: env.FINMIND_TOKEN },
+		{
+			liveDataGovernance: pushCtx.liveDataGovernance,
+			livePayloadSummary: pushCtx.livePayloadSummary,
+			decisionTradeDateYyyymmdd: pushCtx.decisionTradeDateYyyymmdd,
+			recommendationExplainablePack: {
+				recommendationMode: pushCtx.recommendationExplainablePack.recommendationMode,
+				semanticCandidateOnly: pushCtx.recommendationExplainablePack.semanticCandidateOnly,
+			},
+		}
+	);
+	return {
+		lastPushBlock,
+		decisionBlock,
+		reportBlock,
+		reviewBlock,
+		liveMarketBlock,
+		etfIntegrationBlock,
+	};
 }
 
 function renderMoStatusText(params: {
@@ -3043,7 +3053,9 @@ ${formatSection("Report", params.state.reportBlock)}
 
 ${formatSection("Review", params.state.reviewBlock)}
 
-${formatSection("Live market", params.state.liveMarketBlock)}`;
+${formatSection("Live market", params.state.liveMarketBlock)}
+
+${formatSection("ETF / 建議對齊", params.state.etfIntegrationBlock)}`;
 	// safeguard: 避免標題被意外多出字元（例如 eMO Status）
 	return statusText.replace(/^eMO Status/u, "MO Status");
 }
@@ -5363,6 +5375,11 @@ async function executeMoLiveDataCycle(env: Env): Promise<MoLiveCycleResult> {
 				legacySummary = `${legacySummary};close=${finClose}`;
 			}
 		}
+		legacySummary = await supplementLegacySummaryWithFinMindIndexDailyPct(
+			{ FINMIND_TOKEN: env.FINMIND_TOKEN },
+			tradeDate,
+			legacySummary
+		);
 		const payloadSummaryObj: MoLiveSummaryV2 = {
 			v: 2,
 			source,
@@ -5409,7 +5426,11 @@ async function executeMoLiveDataCycle(env: Env): Promise<MoLiveCycleResult> {
 	if (!forceTwseFailForTest) {
 		console.log("[mo-live] twse fail", { lastNote: lastNote || "no MI_INDEX in lookback" });
 	}
-	const fin = await tryFinMindTaiexDaily(env);
+	const fin = await tryFinMindTaiexDailyWithIndexPct(
+		{ FINMIND_TOKEN: env.FINMIND_TOKEN },
+		7,
+		getTaipeiYYYYMMDDMinusDaysFromToday
+	);
 	if (fin.ok) {
 		const finSource = MO_LIVE_SOURCE_FINMIND_TAIEX;
 		const payloadSummaryObj: MoLiveSummaryV2 = {
@@ -5459,6 +5480,11 @@ async function executeMoLiveDataCycle(env: Env): Promise<MoLiveCycleResult> {
 	const off = await tryTwseOpenApiMiIndexWeighted(env);
 	if (off.ok) {
 		const offSource = MO_LIVE_SOURCE_TWSE_OPENAPI_MI_INDEX;
+		const offLegacy = await supplementLegacySummaryWithFinMindIndexDailyPct(
+			{ FINMIND_TOKEN: env.FINMIND_TOKEN },
+			off.tradeDateYyyymmdd,
+			off.legacySummary
+		);
 		const payloadSummaryObj: MoLiveSummaryV2 = {
 			v: 2,
 			source: offSource,
@@ -5467,7 +5493,7 @@ async function executeMoLiveDataCycle(env: Env): Promise<MoLiveCycleResult> {
 			confidence: "low",
 			rawAvailabilityNote:
 				"TWSE 官方 Open API（openapi.twse.com.tw）v1 exchangeReport/MI_INDEX；UTF-8 JSON 陣列；僅取「發行量加權股價指數」收盤指數；與 rwd MI_INDEX 主路徑表格式不同。",
-			legacySummary: off.legacySummary,
+			legacySummary: offLegacy,
 		};
 		const payloadSummary = JSON.stringify(payloadSummaryObj);
 		const createdAt = new Date().toISOString();
@@ -5610,6 +5636,8 @@ async function computeMoPushEvaluationForUser(
 	liveSnapshotId: number | null;
 	decisionTradeDateYyyymmdd: string;
 	decisionClose: number | null;
+	/** 最新快照 payload_summary（供 indexDailyPct 與 ETF 對齊解析；無快照則 null） */
+	livePayloadSummary: string | null;
 	recommendationGateDiagnostics: RecommendationGateDiagnostics;
 	recommendationExplainablePack: RecommendationExplainableSummaryPack;
 	liveDataArbitration: ReturnType<typeof resolveLiveDataArbitration>;
@@ -5932,6 +5960,8 @@ async function computeMoPushEvaluationForUser(
 		liveRead.kind === "ok" && liveRead.row !== null ?
 			parseNumericCloseFromMoLivePayloadSummary(liveRead.row.payload_summary)
 		:	null;
+	const livePayloadSummary =
+		liveRead.kind === "ok" && liveRead.row !== null ? liveRead.row.payload_summary : null;
 
 	return {
 		s,
@@ -5973,6 +6003,7 @@ async function computeMoPushEvaluationForUser(
 		liveSnapshotId,
 		decisionTradeDateYyyymmdd,
 		decisionClose,
+		livePayloadSummary,
 		recommendationGateDiagnostics,
 		recommendationExplainablePack,
 		liveDataArbitration,
@@ -7853,11 +7884,23 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 			actionLine: ctx.actionLine,
 			simulationLine,
 		});
+		const reportIndexPct =
+			ctx.livePayloadSummary !== null ?
+				parseIndexDailyPctFromMoLivePayloadSummary(ctx.livePayloadSummary).value
+			:	null;
+		const etfReport = await runMoEtfCandidatePipelineV1(
+			{ FINMIND_TOKEN: env.FINMIND_TOKEN },
+			ctx.decisionTradeDateYyyymmdd,
+			reportIndexPct
+		);
+		console.log("[mo] report etf v1", { gate: etfReport.gate });
 		const gateAppendix = buildRecommendationGateReportAppendix(
 			ctx.recommendationGateDiagnostics,
 			ctx.recommendationExplainablePack
 		);
 		return `${reportBody}
+
+${etfReport.humanSummaryZh}
 
 【建議放行摘要】
 ${gateAppendix}`;
@@ -8161,12 +8204,29 @@ async function getReplyText(
 						console.log("[intent] user message", text);
 
 						const lastAssistantReplyKind = await readLastLineAssistantReplyKind(env, userId);
-						const intent = await parseIntentWithAI(
+						const intentParsed = await parseIntentWithAI(
 							text,
 							userId,
 							env,
 							lastAssistantReplyKind
 						);
+						const intent = applyRecommendationAskTimingIntentOverride(
+							lastAssistantReplyKind,
+							text,
+							intentParsed
+						);
+						if (
+							intentParsed.intent !== intent.intent ||
+							intentParsed.followUpIntent !== intent.followUpIntent
+						) {
+							console.log("[intent] ask_timing_zh_override", {
+								from: {
+									intent: intentParsed.intent,
+									followUpIntent: intentParsed.followUpIntent,
+								},
+								to: { intent: intent.intent, followUpIntent: intent.followUpIntent },
+							});
+						}
 						const moInput = buildMoInputFromIntent(intent);
 						console.log("[mo] input", moInput);
 
@@ -8191,14 +8251,28 @@ async function getReplyText(
 							const pushCtx = await computeMoPushEvaluationForUser(env, userId, false);
 							const precheckResult = buildRecommendationPrecheckResult(govForLog);
 							console.log("[mo] recommendation precheck", precheckResult);
-							const recommendationOutput = buildRecommendationOutput(
+							const etfTd =
+								rowForGov !== null && /^\d{8}$/u.test(rowForGov.trade_date) ?
+									rowForGov.trade_date
+								:	getTaipeiYYYYMMDDMinusDaysFromToday(0);
+							const lineIndexDailyPct =
+								snapshot.kind === "ok" && rowForGov !== null ?
+									parseIndexDailyPctFromMoLivePayloadSummary(
+										rowForGov.payload_summary
+									).value
+								:	null;
+							const recommendationOutput = await buildRecommendationOutput(
 								moInput,
 								precheckResult,
 								{
 									snapshotRow: rowForGov,
 									snapshotReadOk: snapshot.kind === "ok",
-								}
+									etfTradeDateYyyymmdd: etfTd,
+									indexDailyPct: lineIndexDailyPct,
+								},
+								{ FINMIND_TOKEN: env.FINMIND_TOKEN }
 							);
+							console.log("[mo] etf candidate v1", recommendationOutput.etfCandidateContext);
 							const linePack = buildRecommendationExplainableSummaryPack(
 								pushCtx.liveDataGovernance,
 								pushCtx.liveMarketIntelligenceV1,
@@ -8248,7 +8322,13 @@ async function getReplyText(
 								} else {
 									console.log("[ai] rendering fallback");
 									console.warn("openai_fail_timeout_or_empty");
-									replyText = composeRecommendationLineReplyFromPack(linePack);
+									replyText =
+										moInput.followUpIntent === "ask_timing"
+											? composeAskTimingFollowUpReplyZh(
+													linePack,
+													recommendationOutput.etfCandidateContext
+												)
+											: composeRecommendationLineReplyFromPack(linePack);
 								}
 							}
 						} else if (moInput.intent === "report") {
