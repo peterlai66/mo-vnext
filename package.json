@@ -1,0 +1,17 @@
+{
+	"name": "mo-project",
+	"private": true,
+	"description": "MO monorepo：mo-backend + mo-web（請在 root 使用 npm run status / ship:* 等指令）",
+	"scripts": {
+		"doctor": "bash scripts/doctor.sh",
+		"status": "bash scripts/status.sh",
+		"commit": "bash scripts/commit.sh",
+		"push": "bash scripts/push.sh",
+		"deploy:backend": "bash scripts/deploy-backend.sh",
+		"deploy:web": "bash scripts/deploy-web.sh",
+		"deploy:all": "bash scripts/deploy-all.sh",
+		"ship:backend": "bash scripts/ship-backend.sh",
+		"ship:web": "bash scripts/ship-web.sh",
+		"ship:all": "bash scripts/ship-all.sh"
+	}
+}
