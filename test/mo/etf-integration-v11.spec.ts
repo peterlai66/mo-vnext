@@ -113,6 +113,7 @@ describe("ETF Integration v1.1 — status ETF 摘要 mapping（白盒）", () =>
 		expect(text).toContain("已產出可排名");
 		expect(text).toContain("先觀察");
 		expect(text).toContain("大盤當日報酬已納入");
+		expect(text).toContain("雖已有可排名候選，但整體策略分數仍未達進場門檻");
 	});
 
 	it("insufficient_data：語意正確", () => {

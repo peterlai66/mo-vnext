@@ -35,6 +35,7 @@ const mockEtfResult: etfPipeline.MoEtfPipelineResult = {
 	},
 	ranked: [],
 	humanSummaryZh: "【層級】\n【idx】\n【ETF 候選 v1】測試重用摘要",
+	deltaExplain: null,
 	listsNamedEtfCandidates: false,
 };
 

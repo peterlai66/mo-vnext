@@ -62,6 +62,7 @@ import {
 } from "./mo/recommendation-output.js";
 import { runMoEtfCandidatePipelineV1 } from "./mo/recommendation/etf-pipeline.js";
 import { etfCandidateGateLabelZh } from "./mo/recommendation/etf-gate.js";
+import { etfObserveOnlyRankedCandidatesFootnoteZh } from "./mo/recommendation/etf-public-facts.js";
 import {
 	parseIndexDailyPctFromMoLivePayloadSummary,
 	type IndexDailyPctParseResult,
@@ -444,11 +445,18 @@ function buildRecommendationFollowUpMoFactsEnglish(
 				`台股 ETF 候選：狀態=${etfCandidateGateLabelZh(out.etfCandidateContext.gate)}。${out.etfCandidateContext.humanSummaryZh}`
 			:	"台股 ETF 候選：此輪未附加摘要。";
 		if (fu === "ask_why") {
+			const etfWhy =
+				out.etfCandidateContext !== undefined &&
+				out.etfCandidateContext.gate === "ranked_candidate_ready" &&
+				pack.recommendationMode === "observe_only"
+					? `${etfFacts}\n${etfObserveOnlyRankedCandidatesFootnoteZh()}`
+					: etfFacts;
 			return [
 				guard,
 				"ask_why facts:",
 				"etf_ranking_vs_gate: Candidate ETF row scores are for sorting only; overall recommendation gate uses the composite system score (separate layer).",
-				etfFacts,
+				"etf_delta_explain: The Chinese ETF block includes why the first-ranked ticker leads vs other named candidates (not only a single-symbol rationale); you must reference that pairwise comparison when explaining sort order.",
+				etfWhy,
 				`recommendation_payload_source: ${out.recommendation.source}`,
 				`primaryReason (main story): ${pack.primaryReason}`,
 				`blockedBy: ${pack.blockedBy}`,
@@ -512,6 +520,11 @@ function buildRecommendationFollowUpMoFactsEnglish(
 				parts.push(
 					`台股 ETF 候選：狀態=${etfCandidateGateLabelZh(out.etfCandidateContext.gate)}。${out.etfCandidateContext.humanSummaryZh}`
 				);
+				if (out.etfCandidateContext.gate === "ranked_candidate_ready") {
+					parts.push(
+						"ETF delta explain: summarize why the first-ranked ticker leads relative to other named candidates in the Chinese summary above (pairwise advantages/disadvantages), not only one symbol in isolation."
+					);
+				}
 			}
 			parts.push(`Recommendation source: ${rec.source}.`);
 			parts.push(`Ranked candidate count: ${String(rec.candidateCount)}.`);
@@ -2176,6 +2189,25 @@ function buildCandidateSummaryForPack(recOut: RecommendationOutput | null): {
 			semanticCandidateOnly: true,
 		};
 	}
+	if (
+		recOut.etfCandidateContext !== undefined &&
+		recOut.etfCandidateContext.gate === "ranked_candidate_ready"
+	) {
+		const rows = recOut.recommendation.candidates;
+		const semanticCandidateOnly =
+			rows.length > 0 &&
+			rows.every((c) =>
+				candidateLooksLikeSemanticOnlyReference({
+					symbol: c.symbol,
+					name: c.name,
+					rationale: c.rationale,
+				})
+			);
+		return {
+			candidateSummary: recOut.etfCandidateContext.humanSummaryZh,
+			semanticCandidateOnly,
+		};
+	}
 	const n = recOut.recommendation.candidateCount;
 	if (n === 0) {
 		if (recOut.etfCandidateContext !== undefined) {
@@ -2269,6 +2301,15 @@ function buildRecommendationExplainableSummaryPack(
 ): RecommendationExplainableSummaryPack {
 	const mode = deriveRecommendationMode(gov, li, diag);
 	const { candidateSummary, semanticCandidateOnly } = buildCandidateSummaryForPack(recOut);
+	let candidateSummaryForPack = candidateSummary;
+	if (
+		mode === "observe_only" &&
+		recOut !== null &&
+		!recOut.blocked &&
+		recOut.etfCandidateContext?.gate === "ranked_candidate_ready"
+	) {
+		candidateSummaryForPack = `${candidateSummary.trim()}\n\n${etfObserveOnlyRankedCandidatesFootnoteZh()}`;
+	}
 	const simulationCautionLine = diag.simulationRoleInSummary;
 
 	let primaryReason = diag.gateReasonDetail;
@@ -2322,7 +2363,7 @@ function buildRecommendationExplainableSummaryPack(
 		primaryReason,
 		riskNote,
 		actionHint,
-		candidateSummary,
+		candidateSummary: candidateSummaryForPack,
 		gateSummary,
 		simulationCautionLine,
 		explainTags: ["ask_why", "ask_risk", "ask_timing"],
@@ -7945,9 +7986,14 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 			ctx.recommendationGateDiagnostics,
 			ctx.recommendationExplainablePack
 		);
+		const etfReportBody =
+			ctx.recommendationExplainablePack.recommendationMode === "observe_only" &&
+			etfReport.gate === "ranked_candidate_ready"
+				? `${etfReport.humanSummaryZh}\n${etfObserveOnlyRankedCandidatesFootnoteZh()}`
+				: etfReport.humanSummaryZh;
 		return `${reportBody}
 
-${etfReport.humanSummaryZh}
+${etfReportBody}
 
 【建議放行摘要】
 ${gateAppendix}`;

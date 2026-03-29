@@ -6,8 +6,11 @@ import { rankEtfCandidates } from "./etf-rank.js";
 import type { EtfCandidateGateState, EtfRankedRow, MoEtfFetchEnv } from "./etf-types.js";
 import {
 	etfScoreLayerDisclaimerZh,
+	formatEtfDeltaExplainBodyZh,
 	indexDailyPctObservabilityZh,
+	type EtfDeltaExplainBlockZh,
 } from "./etf-public-facts.js";
+import { compareTopCandidates } from "./etf-delta-explain.js";
 import type { IndexDailyPctParseResult } from "../live-index-daily-pct.js";
 import { logMoEtfIndexDailyPctBeforeRanking } from "../etf-index-daily-pct-log.js";
 
@@ -33,15 +36,20 @@ function indexMetaFromNullablePct(indexDailyPct: number | null): IndexDailyPctPa
 function buildHumanSummaryZh(
 	gate: EtfCandidateGateState,
 	ranked: readonly EtfRankedRow[],
-	indexDailyPct: number | null
+	indexDailyPct: number | null,
+	deltaExplain: EtfDeltaExplainBlockZh | null
 ): string {
 	const layer = etfScoreLayerDisclaimerZh();
 	const idxLine = indexDailyPctObservabilityZh(indexMetaFromNullablePct(indexDailyPct));
 	if (gate === "ranked_candidate_ready") {
+		const deltaBody =
+			deltaExplain !== null ?
+				formatEtfDeltaExplainBodyZh(deltaExplain)
+			:	"（差異說明暫不可用）";
 		const lines = ranked.slice(0, TOP_N).map(
 			(r) => `${r.name}（${r.symbol}）排序分${String(r.score)}：${r.scoreBreakdownZh}`
 		);
-		return `${layer}\n${idxLine}\n【ETF 候選 v1】已產出可排名標的（最多${String(TOP_N)}檔）：\n${lines.join("\n")}`;
+		return `${layer}\n${idxLine}\n【ETF 候選 v1】已產出可排名標的（最多${String(TOP_N)}檔）：\n${deltaBody}\n\n【各檔分項】\n${lines.join("\n")}`;
 	}
 	if (gate === "insufficient_data") {
 		return `${layer}\n${idxLine}\n【ETF 候選 v1】已取得候選池資料，但缺少收盤價／交易日等關鍵欄位，尚無法形成可排名 ETF。`;
@@ -54,6 +62,8 @@ export type MoEtfPipelineResult = {
 	loadResult: RecommendationCandidateLoadResult;
 	ranked: readonly EtfRankedRow[];
 	humanSummaryZh: string;
+	/** 第一名與其他前段名次之差異說明（不改排序分） */
+	deltaExplain: EtfDeltaExplainBlockZh | null;
 	/** 已產出具名 ETF 候選列（與「僅指數參考」語意區隔） */
 	listsNamedEtfCandidates: boolean;
 };
@@ -91,6 +101,7 @@ export async function runMoEtfCandidatePipelineV1(
 
 	if (gate === "ranked_candidate_ready") {
 		const cands = toRecommendationCandidates(ranked);
+		const deltaExplain = compareTopCandidates(ranked, TOP_N, indexDailyPct);
 		return {
 			gate,
 			loadResult: {
@@ -101,7 +112,8 @@ export async function runMoEtfCandidatePipelineV1(
 				notes,
 			},
 			ranked,
-			humanSummaryZh: buildHumanSummaryZh(gate, ranked, indexDailyPct),
+			humanSummaryZh: buildHumanSummaryZh(gate, ranked, indexDailyPct, deltaExplain),
+			deltaExplain,
 			listsNamedEtfCandidates: cands.length > 0,
 		};
 	}
@@ -116,7 +128,8 @@ export async function runMoEtfCandidatePipelineV1(
 			notes: [...notes, "no ranked ETF candidates for recommendation payload"],
 		},
 		ranked,
-		humanSummaryZh: buildHumanSummaryZh(gate, ranked, indexDailyPct),
+		humanSummaryZh: buildHumanSummaryZh(gate, ranked, indexDailyPct, null),
+		deltaExplain: null,
 		listsNamedEtfCandidates: false,
 	};
 }

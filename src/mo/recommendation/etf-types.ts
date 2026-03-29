@@ -31,11 +31,20 @@ export type EtfNormalizedCandidate = {
 	normalizationNote: string;
 };
 
+/** 與 scoreEtfCandidate 公式一致之分項（供 delta explain，不改變分數計算） */
+export type EtfScoreParts = {
+	completeness: number;
+	trend: number;
+	volPts: number;
+	align: number;
+};
+
 /** 單檔排名結果（可解釋） */
 export type EtfRankedRow = EtfNormalizedCandidate & {
 	score: number;
 	rank: number;
 	scoreBreakdownZh: string;
+	scoreParts: EtfScoreParts;
 };
 
 export type MoEtfFetchEnv = {

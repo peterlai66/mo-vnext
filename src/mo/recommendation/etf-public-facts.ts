@@ -68,6 +68,96 @@ export function etfScoreLayerDisclaimerZh(): string {
 	return "【層級說明】候選 ETF 分數僅供排序；整體是否放行依系統綜合分與建議 gate，兩者不同層級。";
 }
 
+/** observe_only 且已有可排名 ETF 時，與候選摘要並列之進場語意（與 gate 對齊） */
+export function etfObserveOnlyRankedCandidatesFootnoteZh(): string {
+	return "雖已有可排名候選，但整體策略分數仍未達進場門檻。";
+}
+
+// --- Delta explain（與 etf-rank 分項語意對齊，集中於此檔供 pipeline／status／follow-up 共用） ---
+
+export function etfDeltaCompletenessAdvantageZh(): string {
+	return "資料完整度較高";
+}
+
+export function etfDeltaCompletenessDisadvantageZh(): string {
+	return "資料完整度相對較低";
+}
+
+export function etfDeltaTrendAdvantageZh(): string {
+	return "當日報酬動能較強";
+}
+
+export function etfDeltaTrendDisadvantageZh(): string {
+	return "當日報酬動能相對較弱";
+}
+
+export function etfDeltaVolumeAdvantageZh(): string {
+	return "成交活絡度較高";
+}
+
+export function etfDeltaVolumeDisadvantageZh(): string {
+	return "成交活絡度相對較低";
+}
+
+export function etfDeltaAlignAdvantageZh(): string {
+	return "與大盤同日走向較一致（大盤相容分較佳）";
+}
+
+export function etfDeltaAlignDisadvantageZh(): string {
+	return "與大盤同日走向較分歧（大盤相容分較低）";
+}
+
+/** 總分相同、依代號決定第一名時 */
+export function etfDeltaTieScoreSortZh(): string {
+	return "總分相同，依代號排序居前";
+}
+
+/** 各維度差距在門檻內、但排序總分仍略高時（強調「整體差距不大」） */
+export function etfDeltaOverallNarrowMarginZh(): string {
+	return "整體差距不大，但排序總分略高";
+}
+
+/** pairwise 劣勢列為空時之固定補句（不含矛盾語意） */
+export function etfDeltaNoClearWeaknessZh(): string {
+	return "相較之下無明顯弱項";
+}
+
+export type EtfDeltaComparisonZh = {
+	against: string;
+	advantages: string[];
+	disadvantages: string[];
+};
+
+export type EtfDeltaExplainBlockZh = {
+	leader: string;
+	comparisons: EtfDeltaComparisonZh[];
+};
+
+/**
+ * 將 compareTopCandidates 結果排版為 humanSummaryZh 內文（不含層級／大盤列）。
+ * 僅以 pairwise 區塊呈現，避免「全局優勢」與「相較某檔」語意打架。
+ */
+export function formatEtfDeltaExplainBodyZh(block: EtfDeltaExplainBlockZh): string {
+	const { leader, comparisons } = block;
+	if (comparisons.length === 0) {
+		return `目前候選中，${leader} 排名第一；僅一檔可比，尚無其他候選可供差異對照。`;
+	}
+
+	const compareBlocks = comparisons.map((c) => {
+		const adv =
+			c.advantages.length > 0 ?
+				`優勢：${c.advantages.join("；")}`
+			:	`優勢：${etfDeltaOverallNarrowMarginZh()}`;
+		const dis =
+			c.disadvantages.length > 0 ?
+				`劣勢：${c.disadvantages.join("；")}`
+			:	`劣勢：${etfDeltaNoClearWeaknessZh()}`;
+		return `相較 ${c.against}：\n- ${adv}\n- ${dis}`;
+	});
+
+	return [`目前候選中，${leader} 排名第一。`, "", ...compareBlocks].join("\n");
+}
+
 export function formatMoStatusEtfIntegrationBlockZh(args: {
 	govDataUnusable: boolean;
 	precheckBlocked: boolean;
@@ -98,7 +188,15 @@ export function formatMoStatusEtfIntegrationBlockZh(args: {
 		return lines.join("\n");
 	}
 	lines.push(etfGateStatusLineZh(args.etfGate));
-	lines.push(truncateEtfHumanSummaryForStatus(args.etfHumanSummaryZh, 420));
+	let etfBody = truncateEtfHumanSummaryForStatus(args.etfHumanSummaryZh, 420);
+	if (
+		args.packMode === "observe_only" &&
+		args.etfGate === "ranked_candidate_ready" &&
+		args.etfHumanSummaryZh.trim() !== ""
+	) {
+		etfBody = `${etfBody}\n${etfObserveOnlyRankedCandidatesFootnoteZh()}`;
+	}
+	lines.push(etfBody);
 	lines.push(indexDailyPctObservabilityZh(args.indexMeta));
 	lines.push(packOverallAlignmentLineZh(args.packMode, args.semanticCandidateOnly));
 	return lines.join("\n");
