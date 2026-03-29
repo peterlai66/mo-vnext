@@ -80,6 +80,7 @@ import {
 	supplementLegacySummaryWithFinMindIndexDailyPct,
 } from "./mo/finmind-taiex-index-pct.js";
 import { buildMoStatusEtfIntegrationBlockZh } from "./mo/status-etf-integration.js";
+import { tryHandleTodayApiRequest } from "./api/today-route.js";
 
 /** computeMoPush 內 ETF pipeline 觸發條件（與 /status、/report 對齊） */
 type MoPushEtfIntegrationMode = "none" | "status_aligned" | "report";
@@ -8146,6 +8147,11 @@ async function getReplyText(
 		debugLog(env, "[fetch] hit");
 		debugLog(env, "[fetch] path", new URL(request.url).pathname);
 		const url = new URL(request.url);
+
+		const todayResponse = tryHandleTodayApiRequest(request);
+		if (todayResponse !== null) {
+			return todayResponse;
+		}
 
 		if (url.pathname === "/admin/status-preview" && request.method === "GET") {
 			const uid = url.searchParams.get("userId") ?? "preview-user";

@@ -10,6 +10,7 @@
 		"check:strategy": "npm run dev:check",
 		"ship:strategy": "sh -c 'npm run dev:check && if [ -n \"$1\" ]; then npm run ship -- \"$1\"; else npm run ship; fi' --",
     "test": "vitest",
+    "test:today-api": "vitest run -c vitest.unit.config.mts",
     "test:etf": "vitest run test/mo/etf-candidate.spec.ts test/mo/etf-delta-explain.spec.ts test/mo/etf-confidence.spec.ts test/mo/recommendation-answer-layer-v1.spec.ts test/mo/etf-integration-v11.spec.ts test/mo/status-etf-reuse.spec.ts --pool=threads",
 		"cf-typegen": "wrangler types",
 		"ac": "git add . && sh -c 'git commit -m \"${1:-chore: 提交變更}\"' --",
