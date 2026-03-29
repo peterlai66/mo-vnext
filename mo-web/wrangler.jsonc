@@ -10,14 +10,18 @@
 	"assets": {
 		"binding": "ASSETS",
 		"not_found_handling": "single-page-application",
-		"run_worker_first": true
+		// SPA + Workers：相容日曆 ≥2025-04-01 時，導覽請求可能略過 Worker。
+		// 明確列出 /api/* 可確保 production 上 API 先進 User Worker，再 proxy，不會被 ASSETS／SPA fallback 吃掉。
+		"run_worker_first": ["/api/*"]
 	},
 	"observability": {
 		"enabled": true
 	},
 	"upload_source_maps": true,
 	"compatibility_flags": [
-		"nodejs_compat"
+		"nodejs_compat",
+		// Worker 內 fetch 另一個 `*.workers.dev` Worker 時，須讓 subrequest 走「公網」路由，否則會拿到錯誤的 404 HTML（見 compatibility flag 說明）。
+		"global_fetch_strictly_public"
 	]
 	/**
 	 * Smart Placement
