@@ -62,7 +62,12 @@ import {
 } from "./mo/recommendation-output.js";
 import { runMoEtfCandidatePipelineV1 } from "./mo/recommendation/etf-pipeline.js";
 import { etfCandidateGateLabelZh } from "./mo/recommendation/etf-gate.js";
-import { etfObserveOnlyRankedCandidatesFootnoteZh } from "./mo/recommendation/etf-public-facts.js";
+import {
+	etfConfidenceAppendZh,
+	etfConfidenceDerivationFromRecommendationCandidates,
+	etfConfidenceDerivationFromStatusEtf,
+	etfObserveOnlyRankedCandidatesFootnoteZh,
+} from "./mo/recommendation/etf-public-facts.js";
 import {
 	parseIndexDailyPctFromMoLivePayloadSummary,
 	type IndexDailyPctParseResult,
@@ -2309,6 +2314,16 @@ function buildRecommendationExplainableSummaryPack(
 		recOut.etfCandidateContext?.gate === "ranked_candidate_ready"
 	) {
 		candidateSummaryForPack = `${candidateSummary.trim()}\n\n${etfObserveOnlyRankedCandidatesFootnoteZh()}`;
+	}
+	if (recOut !== null && recOut.etfCandidateContext !== undefined) {
+		candidateSummaryForPack = `${candidateSummaryForPack.trim()}\n\n${etfConfidenceAppendZh(
+			etfConfidenceDerivationFromRecommendationCandidates({
+				recommendationMode: mode,
+				blocked: recOut.blocked,
+				etfGate: recOut.etfCandidateContext.gate,
+				candidates: recOut.recommendation.candidates,
+			})
+		)}`;
 	}
 	const simulationCautionLine = diag.simulationRoleInSummary;
 
@@ -7986,11 +8001,19 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 			ctx.recommendationGateDiagnostics,
 			ctx.recommendationExplainablePack
 		);
-		const etfReportBody =
+		const etfReportBase =
 			ctx.recommendationExplainablePack.recommendationMode === "observe_only" &&
 			etfReport.gate === "ranked_candidate_ready"
 				? `${etfReport.humanSummaryZh}\n${etfObserveOnlyRankedCandidatesFootnoteZh()}`
 				: etfReport.humanSummaryZh;
+		const etfReportBody = `${etfReportBase}\n${etfConfidenceAppendZh(
+			etfConfidenceDerivationFromStatusEtf({
+				recommendationMode: ctx.recommendationExplainablePack.recommendationMode,
+				etfGate: etfReport.gate,
+				etfListsNamedCandidates: etfReport.listsNamedEtfCandidates,
+				ranked: etfReport.ranked,
+			})
+		)}`;
 		return `${reportBody}
 
 ${etfReportBody}

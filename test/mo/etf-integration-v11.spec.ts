@@ -109,11 +109,16 @@ describe("ETF Integration v1.1 — status ETF 摘要 mapping（白盒）", () =>
 			packMode: "observe_only",
 			semanticCandidateOnly: true,
 			indexMeta: { value: 0.01, kind: "parsed" },
+			etfListsNamedCandidates: true,
+			etfRankedScores: [{ score: 80 }, { score: 70 }],
 		});
 		expect(text).toContain("已產出可排名");
 		expect(text).toContain("先觀察");
 		expect(text).toContain("大盤當日報酬已納入");
 		expect(text).toContain("雖已有可排名候選，但整體策略分數仍未達進場門檻");
+		expect(text).toContain("已有相對較佳標的，但整體仍建議觀察為主。");
+		const lines = text.trim().split("\n");
+		expect(lines[lines.length - 1]).toBe("已有相對較佳標的，但整體仍建議觀察為主。");
 	});
 
 	it("insufficient_data：語意正確", () => {
@@ -128,6 +133,8 @@ describe("ETF Integration v1.1 — status ETF 摘要 mapping（白盒）", () =>
 			indexMeta: { value: null, kind: "absent" },
 		});
 		expect(text).toContain("資料不足");
+		const lines = text.trim().split("\n");
+		expect(lines[lines.length - 1]).toBe("目前市場條件仍偏不明朗，建議持續觀察。");
 	});
 });
 

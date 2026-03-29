@@ -108,5 +108,7 @@ export async function buildMoStatusEtfIntegrationBlockZh(
 		packMode: view.recommendationExplainablePack.recommendationMode,
 		semanticCandidateOnly: semanticForLine,
 		indexMeta,
+		etfListsNamedCandidates: etf.listsNamedEtfCandidates,
+		etfRankedScores: etf.ranked,
 	});
 }
