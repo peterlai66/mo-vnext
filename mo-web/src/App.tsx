@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import CandidatesSection from "./CandidatesSection.tsx";
+import NotificationsSection from "./NotificationsSection.tsx";
 import ReportSection from "./ReportSection.tsx";
 
 /** 與 mo-backend `TodayApiResponse` 對齊；Web 僅顯示，不重算。 */
@@ -192,6 +193,8 @@ export default function App() {
       <ReportSection />
 
       <CandidatesSection />
+
+      <NotificationsSection />
     </div>
   );
 }

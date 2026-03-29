@@ -61,13 +61,31 @@ function jsonResponse(obj: unknown, status = 200): Response {
 
 const defaultReportText = "MO Report\nstub";
 
+const notificationsOkForApp = {
+  ok: true,
+  generatedAt: "2026-03-29T00:00:00.000Z",
+  data: {
+    items: [
+      {
+        id: "n1",
+        timestamp: "2026-03-29T00:00:00.000Z",
+        type: "system" as const,
+        title: "系統",
+        summary: "stub",
+        severity: "info" as const,
+      },
+    ],
+  },
+};
+
 function mockFetchForApp(
   todayResponse: Response,
   candidatesResponse: Response = jsonResponse(candidatesOkForApp),
   reportResponse: Response = new Response(defaultReportText, {
     status: 200,
     headers: { "Content-Type": "text/plain; charset=utf-8" },
-  })
+  }),
+  notificationsResponse: Response = jsonResponse(notificationsOkForApp)
 ) {
   vi.mocked(fetch).mockImplementation((input: RequestInfo | URL) => {
     const url = typeof input === "string" ? input : (input as Request).url;
@@ -76,6 +94,9 @@ function mockFetchForApp(
     }
     if (url.includes("/api/report-preview")) {
       return Promise.resolve(reportResponse);
+    }
+    if (url.includes("/api/notifications")) {
+      return Promise.resolve(notificationsResponse);
     }
     return Promise.resolve(todayResponse);
   });
@@ -114,6 +135,11 @@ describe("Today 頁 /api/today", () => {
     expect(screen.getByTestId("rec-summary")).toHaveTextContent("SUMMARY_FROM_API");
     expect(screen.getByTestId("rec-mode")).toHaveTextContent("observe_only");
     expect(screen.getByTestId("rec-confidence")).toHaveTextContent("medium");
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "通知" })).toBeInTheDocument();
+    });
+    expect(screen.getByTestId("notifications-list")).toBeInTheDocument();
   });
 
   it("ok===false 時轉 error", async () => {

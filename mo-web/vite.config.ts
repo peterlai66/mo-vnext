@@ -19,6 +19,10 @@ export default defineConfig({
         target: moBackendTarget,
         changeOrigin: true,
       },
+      "/api/notifications": {
+        target: moBackendTarget,
+        changeOrigin: true,
+      },
       "/api/report-preview": {
         target: moBackendTarget,
         changeOrigin: true,

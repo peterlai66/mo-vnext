@@ -11,9 +11,10 @@ describe("mo-backend API route map（與 Worker / Vite proxy 一致）", () => {
 		expect(MO_BACKEND_API_PATH_BY_INCOMING["/api/report-preview"]).toBe("/admin/report-preview");
 	});
 
-	it("/api/today、/api/candidates 不 rewrite", () => {
+	it("/api/today、/api/candidates、/api/notifications 不 rewrite", () => {
 		expect(resolveMoBackendPathname("/api/today")).toBe("/api/today");
 		expect(resolveMoBackendPathname("/api/candidates")).toBe("/api/candidates");
+		expect(resolveMoBackendPathname("/api/notifications")).toBe("/api/notifications");
 	});
 
 	it("未列管 path 回 null", () => {

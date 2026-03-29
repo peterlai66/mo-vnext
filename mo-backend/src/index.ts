@@ -82,6 +82,7 @@ import {
 import { buildMoStatusEtfIntegrationBlockZh } from "./mo/status-etf-integration.js";
 import { tryHandleTodayApiRequest } from "./api/today-route.js";
 import { tryHandleCandidatesApiRequest } from "./api/candidates-route.js";
+import { tryHandleNotificationsApiRequest } from "./api/notifications-route.js";
 
 /** computeMoPush 內 ETF pipeline 觸發條件（與 /status、/report 對齊） */
 type MoPushEtfIntegrationMode = "none" | "status_aligned" | "report";
@@ -8165,6 +8166,11 @@ async function getReplyText(
 		});
 		if (candidatesResponse !== null) {
 			return candidatesResponse;
+		}
+
+		const notificationsResponse = tryHandleNotificationsApiRequest(request);
+		if (notificationsResponse !== null) {
+			return notificationsResponse;
 		}
 
 		if (url.pathname === "/admin/status-preview" && request.method === "GET") {

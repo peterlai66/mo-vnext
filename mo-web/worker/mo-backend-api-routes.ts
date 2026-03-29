@@ -5,6 +5,7 @@
 export const MO_BACKEND_API_PATH_BY_INCOMING: Readonly<Record<string, string>> = {
 	"/api/today": "/api/today",
 	"/api/candidates": "/api/candidates",
+	"/api/notifications": "/api/notifications",
 	"/api/report-preview": "/admin/report-preview",
 } as const;
 
