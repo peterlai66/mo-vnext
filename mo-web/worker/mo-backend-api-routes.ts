@@ -12,3 +12,13 @@ export function resolveMoBackendPathname(incomingPathname: string): string | nul
 	const mapped = MO_BACKEND_API_PATH_BY_INCOMING[incomingPathname];
 	return mapped !== undefined ? mapped : null;
 }
+
+/**
+ * 所有 `/api/*` 轉發至 mo-backend 時使用的 pathname：
+ * - 有對照表則 rewrite（如 report-preview）
+ * - 否則與請求路徑相同
+ */
+export function resolveBackendPathForMoProxy(incomingPathname: string): string {
+	const mapped = MO_BACKEND_API_PATH_BY_INCOMING[incomingPathname];
+	return mapped !== undefined ? mapped : incomingPathname;
+}

@@ -1,6 +1,11 @@
-import { resolveMoBackendPathname } from "./mo-backend-api-routes.js";
+import {
+	resolveBackendPathForMoProxy,
+} from "./mo-backend-api-routes.js";
 
-type EnvWithBackend = Env & { MO_BACKEND_ORIGIN?: string };
+type EnvWithProxy = Env & {
+	MO_BACKEND_ORIGIN?: string;
+	ASSETS?: { fetch: typeof fetch };
+};
 
 const JSON_UTF8 = "application/json; charset=utf-8";
 
@@ -16,28 +21,35 @@ function backendNotConfiguredResponse(): Response {
 }
 
 /**
- * 統一 API proxy：僅處理 `MO_BACKEND_API_PATH_BY_INCOMING` 內路徑，其餘 /api/* 維持舊行為。
+ * 1) 所有 `/api/*` 優先 proxy（在 ASSETS 之前），避免被 static / SPA 吃掉。
+ * 2) 其餘請求交給 `env.ASSETS.fetch`（需 wrangler `run_worker_first` + `binding`）。
  */
 export default {
 	async fetch(request, env) {
 		const url = new URL(request.url);
-		const backendOrigin = (env as EnvWithBackend).MO_BACKEND_ORIGIN?.trim();
-		const base =
-			backendOrigin && backendOrigin.length > 0 ?
-				backendOrigin.endsWith("/") ?
-					backendOrigin.slice(0, -1)
-				:	backendOrigin
-			:	undefined;
+		const pathname = url.pathname;
 
-		const mappedPath = resolveMoBackendPathname(url.pathname);
+		if (pathname.startsWith("/api/")) {
+			const backendOrigin = (env as EnvWithProxy).MO_BACKEND_ORIGIN?.trim();
+			const base =
+				backendOrigin && backendOrigin.length > 0 ?
+					backendOrigin.endsWith("/") ?
+						backendOrigin.slice(0, -1)
+					:	backendOrigin
+				:	undefined;
 
-		if (mappedPath !== null) {
 			if (!base) {
 				return backendNotConfiguredResponse();
 			}
+
+			const backendPath = resolveBackendPathForMoProxy(pathname);
 			const originBase = base.replace(/\/+$/u, "");
-			const target = new URL(`${mappedPath}${url.search}`, `${originBase}/`);
-			const upstream = await fetch(target.href, {
+			const targetUrl = new URL(`${backendPath}${url.search}`, `${originBase}/`);
+
+			console.log("[proxy] hit", pathname);
+			console.log("[proxy] target", targetUrl.href);
+
+			const upstream = await fetch(targetUrl.href, {
 				method: request.method,
 				headers: request.headers,
 			});
@@ -48,8 +60,9 @@ export default {
 			});
 		}
 
-		if (url.pathname.startsWith("/api/")) {
-			return Response.json({ name: "Cloudflare" });
+		const assets = (env as EnvWithProxy).ASSETS;
+		if (assets) {
+			return assets.fetch(request);
 		}
 		return new Response(null, { status: 404 });
 	},

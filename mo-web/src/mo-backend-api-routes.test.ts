@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
 	MO_BACKEND_API_PATH_BY_INCOMING,
+	resolveBackendPathForMoProxy,
 	resolveMoBackendPathname,
 } from "../worker/mo-backend-api-routes.ts";
 
@@ -22,5 +23,9 @@ describe("mo-backend API route map（與 Worker / Vite proxy 一致）", () => {
 
 	it("search 由呼叫端拼接 URL（此函式僅 pathname）", () => {
 		expect(resolveMoBackendPathname("/api/report-preview")).toBe("/admin/report-preview");
+	});
+
+	it("resolveBackendPathForMoProxy：未列管 /api/* 維持原 path", () => {
+		expect(resolveBackendPathForMoProxy("/api/future-endpoint")).toBe("/api/future-endpoint");
 	});
 });
