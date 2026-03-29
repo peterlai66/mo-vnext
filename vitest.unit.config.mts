@@ -4,6 +4,6 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
 	test: {
 		pool: "forks",
-		include: ["test/api/today-api.spec.ts"],
+		include: ["test/api/**/*.spec.ts"],
 	},
 });

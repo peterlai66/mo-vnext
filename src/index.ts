@@ -81,6 +81,7 @@ import {
 } from "./mo/finmind-taiex-index-pct.js";
 import { buildMoStatusEtfIntegrationBlockZh } from "./mo/status-etf-integration.js";
 import { tryHandleTodayApiRequest } from "./api/today-route.js";
+import { tryHandleCandidatesApiRequest } from "./api/candidates-route.js";
 
 /** computeMoPush 內 ETF pipeline 觸發條件（與 /status、/report 對齊） */
 type MoPushEtfIntegrationMode = "none" | "status_aligned" | "report";
@@ -8151,6 +8152,19 @@ async function getReplyText(
 		const todayResponse = tryHandleTodayApiRequest(request);
 		if (todayResponse !== null) {
 			return todayResponse;
+		}
+
+		const candidatesResponse = await tryHandleCandidatesApiRequest(request, env, {
+			loadPushContext: async (e) => {
+				const ctx = await computeMoPushEvaluationForUser(e, "api-candidates", false, "status_aligned");
+				return {
+					etfPipelineResult: ctx.etfPipelineResult,
+					recommendationExplainablePack: ctx.recommendationExplainablePack,
+				};
+			},
+		});
+		if (candidatesResponse !== null) {
+			return candidatesResponse;
 		}
 
 		if (url.pathname === "/admin/status-preview" && request.method === "GET") {
