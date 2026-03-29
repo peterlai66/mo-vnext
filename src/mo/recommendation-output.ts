@@ -441,7 +441,10 @@ export async function buildRecommendationOutput(
 	const etf = await runMoEtfCandidatePipelineV1(
 		fetchEnv,
 		loaderCtx.etfTradeDateYyyymmdd,
-		loaderCtx.indexDailyPct
+		loaderCtx.indexDailyPct,
+		loaderCtx.indexDailyPctParse !== undefined ?
+			{ indexDailyPctParse: loaderCtx.indexDailyPctParse }
+		:	undefined
 	);
 	const load = etf.loadResult;
 	const rank = rankRecommendationCandidates(load);

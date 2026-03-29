@@ -1,4 +1,5 @@
 import type { MoLiveSnapshotRow } from "./governance.js";
+import type { IndexDailyPctParseResult } from "./live-index-daily-pct.js";
 import {
 	buildRecommendationStubResult,
 	type RecommendationStubCandidate,
@@ -116,6 +117,8 @@ export type RecommendationLoaderContext = {
 	etfTradeDateYyyymmdd: string;
 	/** 大盤同日報酬（小數）；無則 null */
 	indexDailyPct: number | null;
+	/** 可選：與 indexDailyPct 同源之解析結果（供 log／pipeline 可觀測） */
+	indexDailyPctParse?: IndexDailyPctParseResult;
 };
 
 export function loadRecommendationCandidates(ctx: RecommendationLoaderContext): RecommendationCandidateLoadResult {

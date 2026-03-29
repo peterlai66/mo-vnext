@@ -11,6 +11,15 @@ import {
 	formatMoStatusEtfIntegrationBlockZh,
 	type MoRecommendationModePublic,
 } from "./recommendation/etf-public-facts.js";
+import type { MoEtfPipelineResult } from "./recommendation/etf-pipeline.js";
+import type { IndexDailyPctParseResult } from "./live-index-daily-pct.js";
+
+/** computeMoPush 已跑過之 ETF 結果，供 /status 重用（避免重複 FinMind pipeline） */
+export type MoStatusEtfReusePayload = {
+	indexMeta: IndexDailyPctParseResult;
+	/** null：與 v1.1 相同條件下未執行 pipeline（治理／precheck 略過） */
+	etfPipelineResult: MoEtfPipelineResult | null;
+};
 
 export type MoStatusEtfIntegrationPushView = {
 	liveDataGovernance: MoLiveDataGovernance;
@@ -37,11 +46,14 @@ function precheckBlockNoteZh(blockReason: string | null): string {
 
 export async function buildMoStatusEtfIntegrationBlockZh(
 	env: MoEtfFetchEnv,
-	view: MoStatusEtfIntegrationPushView
+	view: MoStatusEtfIntegrationPushView,
+	reuse?: MoStatusEtfReusePayload
 ): Promise<string> {
 	const gov = view.liveDataGovernance;
 	const indexMeta =
-		view.livePayloadSummary !== null ?
+		reuse !== undefined ?
+			reuse.indexMeta
+		: view.livePayloadSummary !== null ?
 			parseIndexDailyPctFromMoLivePayloadSummary(view.livePayloadSummary)
 		:	{ value: null, kind: "absent" as const };
 
@@ -73,11 +85,17 @@ export async function buildMoStatusEtfIntegrationBlockZh(
 		});
 	}
 
-	const etf = await runMoEtfCandidatePipelineV1(
-		env,
-		view.decisionTradeDateYyyymmdd,
-		indexMeta.value
-	);
+	let etf: MoEtfPipelineResult;
+	if (reuse !== undefined && reuse.etfPipelineResult !== null) {
+		etf = reuse.etfPipelineResult;
+	} else {
+		etf = await runMoEtfCandidatePipelineV1(
+			env,
+			view.decisionTradeDateYyyymmdd,
+			indexMeta.value,
+			{ indexDailyPctParse: indexMeta }
+		);
+	}
 	const semanticForLine = etf.listsNamedEtfCandidates
 		? false
 		: view.recommendationExplainablePack.semanticCandidateOnly;

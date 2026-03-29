@@ -9,6 +9,7 @@ import {
 	indexDailyPctObservabilityZh,
 } from "./etf-public-facts.js";
 import type { IndexDailyPctParseResult } from "../live-index-daily-pct.js";
+import { logMoEtfIndexDailyPctBeforeRanking } from "../etf-index-daily-pct-log.js";
 
 const TOP_N = 3;
 
@@ -57,6 +58,11 @@ export type MoEtfPipelineResult = {
 	listsNamedEtfCandidates: boolean;
 };
 
+export type MoEtfPipelineRunOptions = {
+	/** 供可觀測 log；未傳則由 indexDailyPct 推斷 parsed／absent（無 invalid 語意） */
+	indexDailyPctParse?: IndexDailyPctParseResult;
+};
+
 /**
  * ETF Candidate Universe v1：FinMind 載入 → 正規化 → gate → 排名 → 轉成 recommendation 候選列。
  * indexDailyPct：大盤同日報酬率（小數）；無則傳 null，相容項為 0。
@@ -64,8 +70,13 @@ export type MoEtfPipelineResult = {
 export async function runMoEtfCandidatePipelineV1(
 	env: MoEtfFetchEnv,
 	tradeDateYyyymmdd: string,
-	indexDailyPct: number | null
+	indexDailyPct: number | null,
+	options?: MoEtfPipelineRunOptions
 ): Promise<MoEtfPipelineResult> {
+	const parseForLog: IndexDailyPctParseResult =
+		options?.indexDailyPctParse ?? indexMetaFromNullablePct(indexDailyPct);
+	logMoEtfIndexDailyPctBeforeRanking(parseForLog);
+
 	const raw = await loadTwEtfUniverseFromFinMind(env, tradeDateYyyymmdd);
 	const normalized = normalizeEtfRawRows(raw);
 	const gate = resolveEtfCandidateGate(raw, normalized);

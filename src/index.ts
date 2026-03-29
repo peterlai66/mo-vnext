@@ -62,12 +62,20 @@ import {
 } from "./mo/recommendation-output.js";
 import { runMoEtfCandidatePipelineV1 } from "./mo/recommendation/etf-pipeline.js";
 import { etfCandidateGateLabelZh } from "./mo/recommendation/etf-gate.js";
-import { parseIndexDailyPctFromMoLivePayloadSummary } from "./mo/live-index-daily-pct.js";
+import {
+	parseIndexDailyPctFromMoLivePayloadSummary,
+	type IndexDailyPctParseResult,
+} from "./mo/live-index-daily-pct.js";
+import { logMoEtfIndexDailyPctFromSnapshot } from "./mo/etf-index-daily-pct-log.js";
+import type { MoEtfPipelineResult } from "./mo/recommendation/etf-pipeline.js";
 import {
 	tryFinMindTaiexDailyWithIndexPct,
 	supplementLegacySummaryWithFinMindIndexDailyPct,
 } from "./mo/finmind-taiex-index-pct.js";
 import { buildMoStatusEtfIntegrationBlockZh } from "./mo/status-etf-integration.js";
+
+/** computeMoPush 內 ETF pipeline 觸發條件（與 /status、/report 對齊） */
+type MoPushEtfIntegrationMode = "none" | "status_aligned" | "report";
 
 interface KVListKey {
 	name: string;
@@ -2987,9 +2995,9 @@ async function buildMoLiveMarketStatusBlock(env: Env): Promise<string> {
 }
 
 async function buildMoStatusState(env: Env, userId: string): Promise<MoStatusState> {
-	const [pushCtx, lastPushBlock, decisionBlock, reportBlock, reviewBlock, liveMarketBlock] =
+		const [pushCtx, lastPushBlock, decisionBlock, reportBlock, reviewBlock, liveMarketBlock] =
 		await Promise.all([
-			computeMoPushEvaluationForUser(env, userId, false),
+			computeMoPushEvaluationForUser(env, userId, false, "status_aligned"),
 			formatLastPushStatusBlock(env, userId),
 			formatLastStrategyDecisionStatusBlock(env, userId),
 			formatLastReportSummaryStatusBlock(env, userId),
@@ -3006,6 +3014,10 @@ async function buildMoStatusState(env: Env, userId: string): Promise<MoStatusSta
 				recommendationMode: pushCtx.recommendationExplainablePack.recommendationMode,
 				semanticCandidateOnly: pushCtx.recommendationExplainablePack.semanticCandidateOnly,
 			},
+		},
+		{
+			indexMeta: pushCtx.etfIndexDailyPctParse,
+			etfPipelineResult: pushCtx.etfPipelineResult,
 		}
 	);
 	return {
@@ -5595,7 +5607,8 @@ async function executeMoLiveDataCycle(env: Env): Promise<MoLiveCycleResult> {
 async function computeMoPushEvaluationForUser(
 	env: Env,
 	userId: string,
-	isReportTestChange: boolean
+	isReportTestChange: boolean,
+	etfIntegrationMode: MoPushEtfIntegrationMode = "none"
 ): Promise<{
 	s: SystemStatus;
 	hasUserId: boolean;
@@ -5638,6 +5651,10 @@ async function computeMoPushEvaluationForUser(
 	decisionClose: number | null;
 	/** 最新快照 payload_summary（供 indexDailyPct 與 ETF 對齊解析；無快照則 null） */
 	livePayloadSummary: string | null;
+	/** 與 livePayloadSummary 同源之 indexDailyPct 解析（供 status／report 重用） */
+	etfIndexDailyPctParse: IndexDailyPctParseResult;
+	/** status_aligned／report 模式已跑 pipeline 時非 null；none 或略過條件時為 null */
+	etfPipelineResult: MoEtfPipelineResult | null;
 	recommendationGateDiagnostics: RecommendationGateDiagnostics;
 	recommendationExplainablePack: RecommendationExplainableSummaryPack;
 	liveDataArbitration: ReturnType<typeof resolveLiveDataArbitration>;
@@ -5963,6 +5980,34 @@ async function computeMoPushEvaluationForUser(
 	const livePayloadSummary =
 		liveRead.kind === "ok" && liveRead.row !== null ? liveRead.row.payload_summary : null;
 
+	const etfIndexDailyPctParse: IndexDailyPctParseResult =
+		livePayloadSummary !== null ?
+			parseIndexDailyPctFromMoLivePayloadSummary(livePayloadSummary)
+		:	{ value: null, kind: "absent" };
+
+	let etfPipelineResult: MoEtfPipelineResult | null = null;
+	if (etfIntegrationMode !== "none") {
+		logMoEtfIndexDailyPctFromSnapshot(etfIndexDailyPctParse);
+	}
+	if (etfIntegrationMode === "report") {
+		etfPipelineResult = await runMoEtfCandidatePipelineV1(
+			{ FINMIND_TOKEN: env.FINMIND_TOKEN },
+			decisionTradeDateYyyymmdd,
+			etfIndexDailyPctParse.value,
+			{ indexDailyPctParse: etfIndexDailyPctParse }
+		);
+	} else if (etfIntegrationMode === "status_aligned") {
+		const etfPrecheck = buildRecommendationPrecheckResult(liveDataGovernance);
+		if (liveDataGovernance.dataUsability !== "unusable" && !etfPrecheck.shouldBlock) {
+			etfPipelineResult = await runMoEtfCandidatePipelineV1(
+				{ FINMIND_TOKEN: env.FINMIND_TOKEN },
+				decisionTradeDateYyyymmdd,
+				etfIndexDailyPctParse.value,
+				{ indexDailyPctParse: etfIndexDailyPctParse }
+			);
+		}
+	}
+
 	return {
 		s,
 		hasUserId,
@@ -6004,6 +6049,8 @@ async function computeMoPushEvaluationForUser(
 		decisionTradeDateYyyymmdd,
 		decisionClose,
 		livePayloadSummary,
+		etfIndexDailyPctParse,
+		etfPipelineResult,
 		recommendationGateDiagnostics,
 		recommendationExplainablePack,
 		liveDataArbitration,
@@ -7548,7 +7595,7 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 	  case "/report-test-change":
 	  case "/report": {
 		const isReportTestChange = command === "/report-test-change";
-		const ctx = await computeMoPushEvaluationForUser(env, userId, isReportTestChange);
+		const ctx = await computeMoPushEvaluationForUser(env, userId, isReportTestChange, "report");
 		console.log("[mo] recommendation summary", {
 			recommendationMode: ctx.recommendationExplainablePack.recommendationMode,
 			primaryReason: ctx.recommendationExplainablePack.primaryReason,
@@ -7884,15 +7931,15 @@ ${lines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
 			actionLine: ctx.actionLine,
 			simulationLine,
 		});
-		const reportIndexPct =
-			ctx.livePayloadSummary !== null ?
-				parseIndexDailyPctFromMoLivePayloadSummary(ctx.livePayloadSummary).value
-			:	null;
-		const etfReport = await runMoEtfCandidatePipelineV1(
-			{ FINMIND_TOKEN: env.FINMIND_TOKEN },
-			ctx.decisionTradeDateYyyymmdd,
-			reportIndexPct
-		);
+		const etfReport =
+			ctx.etfPipelineResult !== null ?
+				ctx.etfPipelineResult
+			:	await runMoEtfCandidatePipelineV1(
+					{ FINMIND_TOKEN: env.FINMIND_TOKEN },
+					ctx.decisionTradeDateYyyymmdd,
+					ctx.etfIndexDailyPctParse.value,
+					{ indexDailyPctParse: ctx.etfIndexDailyPctParse }
+				);
 		console.log("[mo] report etf v1", { gate: etfReport.gate });
 		const gateAppendix = buildRecommendationGateReportAppendix(
 			ctx.recommendationGateDiagnostics,
@@ -7924,7 +7971,7 @@ async function buildMoPushPreviewJsonResponse(
 	isReportTestChange: boolean
 ): Promise<Response> {
 	try {
-		const ctx = await computeMoPushEvaluationForUser(env, userId, isReportTestChange);
+		const ctx = await computeMoPushEvaluationForUser(env, userId, isReportTestChange, "none");
 		const audit = ctx.auditBeforeEvaluate;
 		const lastFp = audit === null ? null : audit.lastPushedFingerprint;
 		const previewResult =
@@ -8248,19 +8295,25 @@ async function getReplyText(
 						let replyText: string;
 						if (moInput.intent === "recommendation") {
 							console.log("[mo] reply branch recommendation");
-							const pushCtx = await computeMoPushEvaluationForUser(env, userId, false);
+							const pushCtx = await computeMoPushEvaluationForUser(
+								env,
+								userId,
+								false,
+								"none"
+							);
 							const precheckResult = buildRecommendationPrecheckResult(govForLog);
 							console.log("[mo] recommendation precheck", precheckResult);
 							const etfTd =
 								rowForGov !== null && /^\d{8}$/u.test(rowForGov.trade_date) ?
 									rowForGov.trade_date
 								:	getTaipeiYYYYMMDDMinusDaysFromToday(0);
-							const lineIndexDailyPct =
+							const lineIndexDailyPctParse: IndexDailyPctParseResult =
 								snapshot.kind === "ok" && rowForGov !== null ?
 									parseIndexDailyPctFromMoLivePayloadSummary(
 										rowForGov.payload_summary
-									).value
-								:	null;
+									)
+								:	{ value: null, kind: "absent" };
+							logMoEtfIndexDailyPctFromSnapshot(lineIndexDailyPctParse);
 							const recommendationOutput = await buildRecommendationOutput(
 								moInput,
 								precheckResult,
@@ -8268,7 +8321,8 @@ async function getReplyText(
 									snapshotRow: rowForGov,
 									snapshotReadOk: snapshot.kind === "ok",
 									etfTradeDateYyyymmdd: etfTd,
-									indexDailyPct: lineIndexDailyPct,
+									indexDailyPct: lineIndexDailyPctParse.value,
+									indexDailyPctParse: lineIndexDailyPctParse,
 								},
 								{ FINMIND_TOKEN: env.FINMIND_TOKEN }
 							);
