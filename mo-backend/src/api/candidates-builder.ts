@@ -4,6 +4,7 @@ import type { EtfRankedRow } from "../mo/recommendation/etf-types.js";
 import type { EtfDeltaComparisonZh } from "../mo/recommendation/etf-public-facts.js";
 import {
 	deriveEtfConfidenceLevel,
+	etfConfidenceLineZh,
 	etfConfidenceDerivationFromStatusEtf,
 	etfDeltaNoClearWeaknessZh,
 	etfDeltaOverallNarrowMarginZh,
@@ -17,6 +18,8 @@ import type {
 	CandidatesApiRankedEntry,
 	CandidatesApiSuccessBody,
 } from "./candidates-types.js";
+import { deltaPairNarrativeZh, recommendationModeDecisionLabelZh } from "./candidates-display-zh.js";
+import { formatIsoToTaipeiDateTime } from "./taipei-time.js";
 
 const JSON_UTF8 = "application/json; charset=utf-8";
 
@@ -88,10 +91,13 @@ export function mapEtfContextToCandidatesApiSuccess(args: {
 	const pairs = delta.comparisons.slice(0, 2).map((comp, idx) => {
 		const otherRow = top3[idx + 1] as EtfRankedRow;
 		const scoreDiff = top3[0].score - otherRow.score;
+		const summaryZh = pairwiseSummaryZh(comp);
+		const from = stripEtfTickerForDisplay(top3[0].symbol);
 		return {
-			from: stripEtfTickerForDisplay(top3[0].symbol),
+			from,
 			to: comp.against,
-			summaryZh: pairwiseSummaryZh(comp),
+			summaryZh,
+			narrativeZh: deltaPairNarrativeZh(from, comp.against, summaryZh),
 			scoreDiff,
 		};
 	});
@@ -118,6 +124,11 @@ export function mapEtfContextToCandidatesApiSuccess(args: {
 		leader,
 		rankedCandidates,
 		deltaExplain: { pairs },
+		display: {
+			decisionLabelZh: recommendationModeDecisionLabelZh(recommendationMode),
+			confidenceNarrativeZh: etfConfidenceLineZh(confidenceLevel),
+			generatedAtTaipei: formatIsoToTaipeiDateTime(generatedAt),
+		},
 	};
 	return {
 		ok: true,

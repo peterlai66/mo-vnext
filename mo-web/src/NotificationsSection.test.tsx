@@ -6,22 +6,31 @@ const okBody = {
   ok: true,
   generatedAt: "2026-03-29T12:00:00.000Z",
   data: {
+    feedNoteZh: "摘要說明（測試）",
     items: [
       {
         id: "a1",
         timestamp: "2026-03-29T12:00:00.000Z",
+        timestampTaipei: "2026/03/29 20:00",
         type: "recommendation" as const,
         title: "T1",
         summary: "S1",
         severity: "info" as const,
+        changeType: "snapshot" as const,
+        isNew: false,
+        isSummaryDigest: true,
       },
       {
         id: "a2",
         timestamp: "2026-03-29T12:00:00.000Z",
+        timestampTaipei: "2026/03/29 20:00",
         type: "governance" as const,
         title: "T2",
         summary: "S2",
         severity: "warning" as const,
+        changeType: "summary" as const,
+        isNew: false,
+        isSummaryDigest: true,
       },
     ],
   },
@@ -71,7 +80,7 @@ describe("NotificationsSection /api/notifications", () => {
       jsonResponse({
         ok: true,
         generatedAt: "2026-03-29T00:00:00.000Z",
-        data: { items: [] },
+        data: { feedNoteZh: "摘要", items: [] },
       })
     );
 

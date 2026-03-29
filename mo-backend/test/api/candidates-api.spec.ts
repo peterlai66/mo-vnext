@@ -72,6 +72,12 @@ describe("/api/candidates 映射（白盒）", () => {
 		expect(data.leader.rank).toBe(1);
 		expect(data.recommendationMode).toBe("observe_only");
 		expect(typeof data.confidence).toBe("string");
+		expect(typeof data.display.decisionLabelZh).toBe("string");
+		expect(data.display.decisionLabelZh.length).toBeGreaterThan(0);
+		expect(typeof data.display.confidenceNarrativeZh).toBe("string");
+		expect(data.display.confidenceNarrativeZh.length).toBeGreaterThan(0);
+		expect(typeof data.display.generatedAtTaipei).toBe("string");
+		expect(data.display.generatedAtTaipei.length).toBeGreaterThan(5);
 	});
 
 	it("score 由高到低", () => {
@@ -97,6 +103,8 @@ describe("/api/candidates 映射（白盒）", () => {
 		for (const p of pairs) {
 			const lines = p.summaryZh.split("\n");
 			expect(lines.length).toBeGreaterThanOrEqual(2);
+			expect(typeof p.narrativeZh).toBe("string");
+			expect(p.narrativeZh.length).toBeGreaterThan(10);
 		}
 		const comps = etf.deltaExplain!.comparisons.slice(0, 2);
 		for (const c of comps) {

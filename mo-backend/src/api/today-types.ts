@@ -27,11 +27,22 @@ export interface TodayApiGovernanceBlock {
 	pushEligible: boolean;
 }
 
+/** Web 顯示用（人話標籤；內部 mode／confidence 仍保留於同層供除錯） */
+export interface TodayApiRecommendationDisplay {
+	headlineZh: string;
+	summaryZh: string;
+	/** 投資立場／策略語氣（取代直接顯示 mode enum） */
+	stanceLabelZh: string;
+	/** 信心／不確定性說明（取代直接顯示 confidence enum） */
+	confidenceLabelZh: string;
+}
+
 export interface TodayApiRecommendationBlock {
 	mode: TodayApiRecommendationMode;
 	confidence: TodayApiConfidenceLabel;
 	headline: string;
 	summary: string;
+	display: TodayApiRecommendationDisplay;
 }
 
 export interface TodayApiReportBlock {
@@ -43,6 +54,13 @@ export interface TodayApiNotificationsBlock {
 	unreadCount: number;
 }
 
+export interface TodayApiDisplay {
+	/** 資料產出時間（台灣時區可讀字串） */
+	generatedAtTaipei: string;
+	/** 交易日人話標示 */
+	tradeDateLabelZh: string;
+}
+
 export interface TodayApiData {
 	tradeDate: string;
 	market: TodayApiMarketBlock;
@@ -50,6 +68,8 @@ export interface TodayApiData {
 	recommendation: TodayApiRecommendationBlock;
 	report: TodayApiReportBlock;
 	notifications: TodayApiNotificationsBlock;
+	/** Web 專用：時間與日期顯示 */
+	display: TodayApiDisplay;
 }
 
 export interface TodayApiResponse {

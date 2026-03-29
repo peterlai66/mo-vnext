@@ -2,20 +2,25 @@ import { useEffect, useState } from "react";
 
 type NotificationType = "recommendation" | "governance" | "report" | "system";
 type NotificationSeverity = "info" | "warning" | "critical";
+type NotificationChangeType = "snapshot" | "shift" | "alert" | "summary";
 
 type NotificationItem = {
   id: string;
   timestamp: string;
+  timestampTaipei: string;
   type: NotificationType;
   title: string;
   summary: string;
   severity: NotificationSeverity;
+  changeType: NotificationChangeType;
+  isNew: boolean;
+  isSummaryDigest: boolean;
 };
 
 type NotificationsApiSuccessBody = {
   ok: true;
   generatedAt: string;
-  data: { items: NotificationItem[] };
+  data: { feedNoteZh: string; items: NotificationItem[] };
 };
 
 type NotificationsViewState =
@@ -33,10 +38,14 @@ function isNotificationItem(x: unknown): x is NotificationItem {
   return (
     typeof x.id === "string" &&
     typeof x.timestamp === "string" &&
+    typeof x.timestampTaipei === "string" &&
     typeof x.title === "string" &&
     typeof x.summary === "string" &&
     typeof x.type === "string" &&
-    typeof x.severity === "string"
+    typeof x.severity === "string" &&
+    typeof x.changeType === "string" &&
+    typeof x.isNew === "boolean" &&
+    typeof x.isSummaryDigest === "boolean"
   );
 }
 
@@ -45,6 +54,7 @@ function isNotificationsApiSuccessBody(x: unknown): x is NotificationsApiSuccess
   if (typeof x.generatedAt !== "string") return false;
   const data = x.data;
   if (!isRecord(data) || !Array.isArray(data.items)) return false;
+  if (typeof data.feedNoteZh !== "string") return false;
   for (const it of data.items) {
     if (!isNotificationItem(it)) return false;
   }
@@ -78,7 +88,7 @@ export default function NotificationsSection() {
         if (ac.signal.aborted) return;
 
         if (!res.ok) {
-          const msg = isRecord(json) ? errorMessageFromJson(json) : `HTTP ${res.status}`;
+          const msg = isRecord(json) ? errorMessageFromJson(json) : `HTTP ${String(res.status)}`;
           setState({ phase: "error", message: msg });
           return;
         }
@@ -160,40 +170,52 @@ export default function NotificationsSection() {
       )}
 
       {state.phase === "success" && (
-        <ul
-          data-testid="notifications-list"
-          style={{
-            listStyle: "none",
-            margin: 0,
-            padding: 0,
-            display: "flex",
-            flexDirection: "column",
-            gap: "0.75rem",
-          }}
-        >
-          {state.body.data.items.map((it) => (
-            <li
-              key={it.id}
-              data-testid="notifications-item"
-              style={{
-                padding: "0.85rem 1rem",
-                borderRadius: 10,
-                border: "1px solid rgba(0,0,0,0.12)",
-                background: "rgba(255,255,255,0.04)",
-              }}
-            >
-              <div style={{ fontWeight: 600, marginBottom: "0.35rem" }}>{it.title}</div>
-              <div style={{ fontSize: "0.9rem", opacity: 0.9, whiteSpace: "pre-wrap" }}>{it.summary}</div>
-              <div style={{ fontSize: "0.75rem", opacity: 0.65, marginTop: "0.5rem" }}>
-                <span data-testid="notif-time">{it.timestamp}</span>
-                {" · "}
-                <span data-testid="notif-type">{it.type}</span>
-                {" · "}
-                <span data-testid="notif-severity">{it.severity}</span>
-              </div>
-            </li>
-          ))}
-        </ul>
+        <>
+          <p
+            data-testid="notifications-feed-note"
+            style={{ margin: "0 0 0.75rem", fontSize: "0.9rem", opacity: 0.88, lineHeight: 1.45 }}
+          >
+            {state.body.data.feedNoteZh}
+          </p>
+          <ul
+            data-testid="notifications-list"
+            style={{
+              listStyle: "none",
+              margin: 0,
+              padding: 0,
+              display: "flex",
+              flexDirection: "column",
+              gap: "0.75rem",
+            }}
+          >
+            {state.body.data.items.map((it) => (
+              <li
+                key={it.id}
+                data-testid="notifications-item"
+                style={{
+                  padding: "0.85rem 1rem",
+                  borderRadius: 10,
+                  border: "1px solid rgba(0,0,0,0.12)",
+                  background: "rgba(255,255,255,0.04)",
+                }}
+              >
+                <div style={{ fontWeight: 600, marginBottom: "0.35rem" }}>{it.title}</div>
+                <div style={{ fontSize: "0.9rem", opacity: 0.9, whiteSpace: "pre-wrap" }}>{it.summary}</div>
+                <div style={{ fontSize: "0.75rem", opacity: 0.65, marginTop: "0.5rem" }}>
+                  <span data-testid="notif-time">{it.timestampTaipei}</span>
+                  {" · "}
+                  <span data-testid="notif-change">{it.changeType}</span>
+                  {it.isNew ? " · 新" : ""}
+                  {it.isSummaryDigest ? " · 摘要" : ""}
+                  {" · "}
+                  <span data-testid="notif-type">{it.type}</span>
+                  {" · "}
+                  <span data-testid="notif-severity">{it.severity}</span>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </>
       )}
     </section>
   );

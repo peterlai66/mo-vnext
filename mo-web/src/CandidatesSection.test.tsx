@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import CandidatesSection from "./CandidatesSection.tsx";
 
 const candidatesSuccess = {
@@ -8,6 +8,11 @@ const candidatesSuccess = {
   data: {
     recommendationMode: "observe_only",
     confidence: "observe",
+    display: {
+      decisionLabelZh: "目前以觀察為主（測試）",
+      confidenceNarrativeZh: "已有相對較佳標的，但整體仍建議觀察為主。",
+      generatedAtTaipei: "2026/03/29 20:00",
+    },
     leader: {
       symbol: "0056.TW",
       name: "元大高股息",
@@ -25,12 +30,14 @@ const candidatesSuccess = {
           from: "0056",
           to: "00713",
           summaryZh: "優勢：資料完整度較高\n劣勢：成交活絡度相對較低",
+          narrativeZh: "比較「0056」與「00713」：優勢：資料完整度較高 劣勢：成交活絡度相對較低",
           scoreDiff: 11,
         },
         {
           from: "0056",
           to: "00878",
           summaryZh: "優勢：A\n劣勢：B",
+          narrativeZh: "比較「0056」與「00878」：優勢：A 劣勢：B",
           scoreDiff: 0,
         },
       ],
@@ -64,7 +71,7 @@ describe("CandidatesSection /api/candidates", () => {
     expect(screen.getByRole("status", { name: "載入 Candidates 資料中" })).toHaveTextContent("載入中");
   });
 
-  it("success：leader、Top 3、pairs 與 Decision", async () => {
+  it("success：leader、差異敘述、決策人話", async () => {
     vi.mocked(fetch).mockResolvedValue(jsonResponse(candidatesSuccess));
 
     render(<CandidatesSection />);
@@ -73,29 +80,9 @@ describe("CandidatesSection /api/candidates", () => {
       expect(screen.getByTestId("candidates-leader-symbol")).toHaveTextContent("0056.TW");
     });
 
-    expect(screen.getByTestId("candidates-leader-name")).toHaveTextContent("元大高股息");
-    expect(screen.getByTestId("candidates-leader-score")).toHaveTextContent("82");
-    expect(screen.getByTestId("candidates-leader-rank")).toHaveTextContent("1");
-
-    expect(screen.getByTestId("candidates-top3-list").querySelectorAll("li")).toHaveLength(3);
-    expect(screen.getByTestId("candidates-row-1")).toHaveTextContent("0056.TW");
-    expect(screen.getByTestId("candidates-pair-summary-0")).toHaveTextContent("資料完整度較高");
-
-    expect(screen.getByTestId("candidates-decision-mode")).toHaveTextContent("observe_only");
-    expect(screen.getByTestId("candidates-decision-confidence")).toHaveTextContent("observe");
-  });
-
-  it("scoreDiff===0 顯示（差異不顯著）", async () => {
-    vi.mocked(fetch).mockResolvedValue(jsonResponse(candidatesSuccess));
-
-    render(<CandidatesSection />);
-
-    await waitFor(() => {
-      expect(screen.getByTestId("candidates-pair-1")).toBeInTheDocument();
-    });
-
-    const pair1 = screen.getByTestId("candidates-pair-1");
-    expect(within(pair1).getByTestId("candidates-insignificant-1")).toHaveTextContent("差異不顯著");
+    expect(screen.getByTestId("candidates-pair-narrative-0")).toHaveTextContent("比較「0056」與「00713」");
+    expect(screen.getByTestId("candidates-decision-human")).toHaveTextContent("目前以觀察為主（測試）");
+    expect(screen.getByTestId("candidates-confidence-human")).toHaveTextContent("已有相對較佳標的");
   });
 
   it("ok===false → error", async () => {
@@ -109,7 +96,8 @@ describe("CandidatesSection /api/candidates", () => {
       expect(screen.getByRole("alert")).toBeInTheDocument();
     });
 
-    expect(screen.getByText("etf_gate_not_ready")).toBeInTheDocument();
+    expect(screen.getByText(/ETF 候選排名/i)).toBeInTheDocument();
+    expect(screen.getByText(/gate/i)).toBeInTheDocument();
   });
 
   it("HTTP error → error", async () => {

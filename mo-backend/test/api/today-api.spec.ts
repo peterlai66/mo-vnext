@@ -40,6 +40,15 @@ function assertTodaySuccessShape(body: unknown): asserts body is TodayApiRespons
 	expect(CONFIDENCE.has(String(r.confidence))).toBe(true);
 	expect(typeof r.headline).toBe("string");
 	expect(typeof r.summary).toBe("string");
+	const rd = r.display as Record<string, unknown>;
+	expect(typeof rd.headlineZh).toBe("string");
+	expect(typeof rd.summaryZh).toBe("string");
+	expect(typeof rd.stanceLabelZh).toBe("string");
+	expect(typeof rd.confidenceLabelZh).toBe("string");
+
+	const disp = d.display as Record<string, unknown>;
+	expect(typeof disp.generatedAtTaipei).toBe("string");
+	expect(typeof disp.tradeDateLabelZh).toBe("string");
 
 	const rep = d.report as Record<string, unknown>;
 	expect(typeof rep.available).toBe("boolean");
@@ -60,6 +69,8 @@ describe("Today API `/api/today`（白盒，Node pool）", () => {
 		expect(fixed.data.governance.pushEligible).toBe(false);
 		expect(fixed.data.recommendation.mode).toBe("observe_only");
 		expect(fixed.data.recommendation.confidence).toBe("medium");
+		expect(fixed.data.recommendation.display.headlineZh.length).toBeGreaterThan(0);
+		expect(fixed.data.display.tradeDateLabelZh).toMatch(/\d{4}\/\d{2}\/\d{2}/);
 		expect(fixed.data.market.stalenessLevel).toBe("fresh");
 		assertTodaySuccessShape(fixed);
 	});

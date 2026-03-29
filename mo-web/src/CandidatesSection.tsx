@@ -11,6 +11,7 @@ type CandidatesPair = {
   from: string;
   to: string;
   summaryZh: string;
+  narrativeZh: string;
   scoreDiff: number;
 };
 
@@ -23,6 +24,11 @@ type CandidatesApiSuccessBody = {
     leader: CandidatesRanked;
     rankedCandidates: CandidatesRanked[];
     deltaExplain: { pairs: CandidatesPair[] };
+    display: {
+      decisionLabelZh: string;
+      confidenceNarrativeZh: string;
+      generatedAtTaipei: string;
+    };
   };
 };
 
@@ -51,11 +57,11 @@ function isCandidatesPair(x: unknown): x is CandidatesPair {
     typeof x.from === "string" &&
     typeof x.to === "string" &&
     typeof x.summaryZh === "string" &&
+    typeof x.narrativeZh === "string" &&
     typeof x.scoreDiff === "number"
   );
 }
 
-/** 後端 schema 通過才視為 success；不做排序或欄位改寫。 */
 function isCandidatesApiSuccessBody(x: unknown): x is CandidatesApiSuccessBody {
   if (!isRecord(x) || x.ok !== true) return false;
   if (typeof x.generatedAt !== "string") return false;
@@ -63,6 +69,15 @@ function isCandidatesApiSuccessBody(x: unknown): x is CandidatesApiSuccessBody {
   if (!isRecord(data)) return false;
   if (typeof data.recommendationMode !== "string") return false;
   if (typeof data.confidence !== "string") return false;
+  const disp = data.display;
+  if (!isRecord(disp)) return false;
+  if (
+    typeof disp.decisionLabelZh !== "string" ||
+    typeof disp.confidenceNarrativeZh !== "string" ||
+    typeof disp.generatedAtTaipei !== "string"
+  ) {
+    return false;
+  }
   if (!isCandidatesRanked(data.leader)) return false;
   if (!Array.isArray(data.rankedCandidates)) return false;
   if (data.rankedCandidates.length === 0) return false;
@@ -77,13 +92,26 @@ function isCandidatesApiSuccessBody(x: unknown): x is CandidatesApiSuccessBody {
   return true;
 }
 
-function errorMessageFromJson(json: unknown): string {
-  if (!isRecord(json)) return "回應格式異常";
-  const err = json.error;
-  if (typeof err === "string" && err.length > 0) return err;
+/** 後端 error code → 人話；不自行翻譯成功 payload 內 enum，僅處理錯誤情境 */
+function humanCandidatesErrorBody(json: unknown): string {
+  if (!isRecord(json)) return "無法解析伺服器回應，請稍後再試。";
+  const code = typeof json.error === "string" ? json.error : "";
+  const detail = typeof json.message === "string" && json.message.length > 0 ? json.message : "";
+  if (code === "etf_gate_not_ready") {
+    return [
+      "目前無法顯示 ETF 候選排名與標的差異說明：後端判定資料尚未通過內部檢查（gate），可能與行情欄位完整度或候選池狀態有關。",
+      detail ? `（詳情：${detail}）` : "",
+      "請稍後再試；可先參考頁面上方「今日」與「報告」的整體說明。",
+    ]
+      .filter(Boolean)
+      .join(" ");
+  }
+  if (code.length > 0) {
+    return detail ? `${code}（${detail}）` : code;
+  }
   const msg = json.message;
   if (typeof msg === "string" && msg.length > 0) return msg;
-  return "伺服器回傳錯誤";
+  return "伺服器回傳錯誤，請稍後再試。";
 }
 
 export default function CandidatesSection() {
@@ -104,13 +132,15 @@ export default function CandidatesSection() {
         if (ac.signal.aborted) return;
 
         if (!res.ok) {
-          const msg = isRecord(json) ? errorMessageFromJson(json) : `HTTP ${String(res.status)}`;
+          const msg = isRecord(json)
+            ? humanCandidatesErrorBody(json)
+            : `無法連線至 Candidates（HTTP ${String(res.status)}），請稍後再試。`;
           setState({ phase: "error", message: msg });
           return;
         }
 
         if (isRecord(json) && json.ok === false) {
-          setState({ phase: "error", message: errorMessageFromJson(json) });
+          setState({ phase: "error", message: humanCandidatesErrorBody(json) });
           return;
         }
 
@@ -184,6 +214,10 @@ export default function CandidatesSection() {
 
       {state.phase === "success" && (
         <>
+          <p style={{ margin: 0, fontSize: "0.85rem", opacity: 0.75 }} data-testid="candidates-updated">
+            資料時間（台灣）：{state.body.data.display.generatedAtTaipei}
+          </p>
+
           <div>
             <h3 style={{ margin: "0 0 0.5rem", fontSize: "1.05rem" }}>Leader</h3>
             <p style={{ margin: 0 }} data-testid="candidates-leader-line">
@@ -212,7 +246,7 @@ export default function CandidatesSection() {
           </div>
 
           <div>
-            <h3 style={{ margin: "0 0 0.5rem", fontSize: "1.05rem" }}>Delta Explain</h3>
+            <h3 style={{ margin: "0 0 0.5rem", fontSize: "1.05rem" }}>標的差異說明</h3>
             <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
               {state.body.data.deltaExplain.pairs.map((pair, i) => (
                 <div
@@ -220,52 +254,32 @@ export default function CandidatesSection() {
                   data-testid={`candidates-pair-${String(i)}`}
                 >
                   <p style={{ margin: "0 0 0.35rem", fontWeight: 600 }}>
-                    {pair.from} vs {pair.to}
+                    {pair.from} 與 {pair.to}
                   </p>
-                  <pre
+                  <p
                     style={{
                       margin: 0,
-                      fontFamily: "inherit",
+                      lineHeight: 1.5,
                       whiteSpace: "pre-wrap",
                       wordBreak: "break-word",
                     }}
-                    data-testid={`candidates-pair-summary-${String(i)}`}
+                    data-testid={`candidates-pair-narrative-${String(i)}`}
                   >
-                    {pair.summaryZh}
-                  </pre>
-                  {pair.scoreDiff === 0 && (
-                    <p
-                      style={{ margin: "0.35rem 0 0", opacity: 0.85 }}
-                      data-testid={`candidates-insignificant-${String(i)}`}
-                    >
-                      （差異不顯著）
-                    </p>
-                  )}
+                    {pair.narrativeZh}
+                  </p>
                 </div>
               ))}
             </div>
           </div>
 
           <div>
-            <h3 style={{ margin: "0 0 0.5rem", fontSize: "1.05rem" }}>Decision</h3>
-            <dl
-              style={{
-                margin: 0,
-                display: "grid",
-                gridTemplateColumns: "auto 1fr",
-                gap: "0.35rem 1rem",
-                fontSize: "0.95rem",
-              }}
-            >
-              <dt style={{ margin: 0, opacity: 0.8 }}>recommendationMode</dt>
-              <dd style={{ margin: 0 }} data-testid="candidates-decision-mode">
-                {state.body.data.recommendationMode}
-              </dd>
-              <dt style={{ margin: 0, opacity: 0.8 }}>confidence</dt>
-              <dd style={{ margin: 0 }} data-testid="candidates-decision-confidence">
-                {state.body.data.confidence}
-              </dd>
-            </dl>
+            <h3 style={{ margin: "0 0 0.5rem", fontSize: "1.05rem" }}>決策與信心</h3>
+            <p style={{ margin: "0 0 0.5rem" }} data-testid="candidates-decision-human">
+              {state.body.data.display.decisionLabelZh}
+            </p>
+            <p style={{ margin: 0 }} data-testid="candidates-confidence-human">
+              {state.body.data.display.confidenceNarrativeZh}
+            </p>
           </div>
         </>
       )}

@@ -3,15 +3,7 @@ import CandidatesSection from "./CandidatesSection.tsx";
 import NotificationsSection from "./NotificationsSection.tsx";
 import ReportSection from "./ReportSection.tsx";
 
-/** 與 mo-backend `TodayApiResponse` 對齊；Web 僅顯示，不重算。 */
-type TodayApiRecommendationMode =
-  | "actionable"
-  | "actionable_with_caution"
-  | "observe_only"
-  | "blocked";
-
-type TodayApiConfidenceLabel = "high" | "medium" | "low";
-
+/** 與 mo-backend Today API `display` 對齊；Web 只 render，不翻譯 enum */
 type TodayApiSuccessBody = {
   ok: true;
   generatedAt: string;
@@ -19,10 +11,16 @@ type TodayApiSuccessBody = {
     tradeDate: string;
     market: { summaryText: string };
     recommendation: {
-      mode: TodayApiRecommendationMode;
-      confidence: TodayApiConfidenceLabel;
-      headline: string;
-      summary: string;
+      display: {
+        headlineZh: string;
+        summaryZh: string;
+        stanceLabelZh: string;
+        confidenceLabelZh: string;
+      };
+    };
+    display: {
+      generatedAtTaipei: string;
+      tradeDateLabelZh: string;
     };
   };
 };
@@ -46,8 +44,19 @@ function isTodayApiSuccessBody(x: unknown): x is TodayApiSuccessBody {
   if (!isRecord(market) || typeof market.summaryText !== "string") return false;
   const rec = data.recommendation;
   if (!isRecord(rec)) return false;
-  if (typeof rec.headline !== "string" || typeof rec.summary !== "string") return false;
-  if (typeof rec.mode !== "string" || typeof rec.confidence !== "string") return false;
+  const disp = rec.display;
+  if (!isRecord(disp)) return false;
+  if (
+    typeof disp.headlineZh !== "string" ||
+    typeof disp.summaryZh !== "string" ||
+    typeof disp.stanceLabelZh !== "string" ||
+    typeof disp.confidenceLabelZh !== "string"
+  ) {
+    return false;
+  }
+  const top = data.display;
+  if (!isRecord(top)) return false;
+  if (typeof top.generatedAtTaipei !== "string" || typeof top.tradeDateLabelZh !== "string") return false;
   return true;
 }
 
@@ -147,10 +156,12 @@ export default function App() {
       {state.phase === "success" && (
         <div style={{ display: "flex", flexDirection: "column", gap: "1.25rem" }}>
           <p style={{ margin: 0, opacity: 0.75, fontSize: "0.9rem" }}>
-            交易日（tradeDate）：{" "}
-            <span data-testid="tradeDate">{state.body.data.tradeDate}</span>
+            交易日：{" "}
+            <span data-testid="tradeDateLabel">{state.body.data.display.tradeDateLabelZh}</span>
             <br />
-            <span style={{ fontSize: "0.8rem" }}>generatedAt: {state.body.generatedAt}</span>
+            <span style={{ fontSize: "0.85rem" }} data-testid="generated-at-taipei">
+              更新時間（台灣）：{state.body.data.display.generatedAtTaipei}
+            </span>
           </p>
 
           <section>
@@ -161,31 +172,21 @@ export default function App() {
           </section>
 
           <section>
-            <h2 style={{ fontSize: "1.1rem", margin: "0 0 0.5rem" }}>建議（後端原文）</h2>
+            <h2 style={{ fontSize: "1.1rem", margin: "0 0 0.5rem" }}>投資建議</h2>
             <p style={{ margin: "0 0 0.5rem", fontWeight: 600 }} data-testid="rec-headline">
-              {state.body.data.recommendation.headline}
+              {state.body.data.recommendation.display.headlineZh}
             </p>
-            <p style={{ margin: 0, whiteSpace: "pre-wrap" }} data-testid="rec-summary">
-              {state.body.data.recommendation.summary}
+            <p style={{ margin: "0 0 0.75rem", whiteSpace: "pre-wrap" }} data-testid="rec-summary">
+              {state.body.data.recommendation.display.summaryZh}
             </p>
-            <dl
-              style={{
-                margin: "1rem 0 0",
-                display: "grid",
-                gridTemplateColumns: "auto 1fr",
-                gap: "0.35rem 1rem",
-                fontSize: "0.95rem",
-              }}
-            >
-              <dt style={{ margin: 0, opacity: 0.8 }}>recommendation.mode</dt>
-              <dd style={{ margin: 0 }} data-testid="rec-mode">
-                {state.body.data.recommendation.mode}
-              </dd>
-              <dt style={{ margin: 0, opacity: 0.8 }}>recommendation.confidence</dt>
-              <dd style={{ margin: 0 }} data-testid="rec-confidence">
-                {state.body.data.recommendation.confidence}
-              </dd>
-            </dl>
+            <p style={{ margin: 0, fontSize: "0.95rem" }} data-testid="rec-stance">
+              <strong>立場：</strong>
+              {state.body.data.recommendation.display.stanceLabelZh}
+            </p>
+            <p style={{ margin: "0.5rem 0 0", fontSize: "0.95rem" }} data-testid="rec-confidence">
+              <strong>信心與不確定性：</strong>
+              {state.body.data.recommendation.display.confidenceLabelZh}
+            </p>
           </section>
         </div>
       )}

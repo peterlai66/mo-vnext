@@ -1,0 +1,57 @@
+{
+  "ok": true,
+  "generatedAt": "2026-03-29T10:24:46.753Z",
+  "data": {
+    "recommendationMode": "observe_only",
+    "confidence": "observe",
+    "leader": {
+      "symbol": "0056.TW",
+      "name": "0056",
+      "score": 81,
+      "rank": 1
+    },
+    "rankedCandidates": [
+      {
+        "symbol": "0056.TW",
+        "name": "0056",
+        "score": 81,
+        "rank": 1
+      },
+      {
+        "symbol": "00713.TW",
+        "name": "00713",
+        "score": 76,
+        "rank": 2
+      },
+      {
+        "symbol": "00878.TW",
+        "name": "00878",
+        "score": 62,
+        "rank": 3
+      }
+    ],
+    "deltaExplain": {
+      "pairs": [
+        {
+          "from": "0056",
+          "to": "00713",
+          "summaryZh": "優勢：當日報酬動能較強；成交活絡度較高\n劣勢：相較之下無明顯弱項",
+          "narrativeZh": "比較「0056」與「00713」：優勢：當日報酬動能較強；成交活絡度較高 劣勢：相較之下無明顯弱項",
+          "scoreDiff": 5
+        },
+        {
+          "from": "0056",
+          "to": "00878",
+          "summaryZh": "優勢：當日報酬動能較強；成交活絡度較高；與大盤同日走向較一致（大盤相容分較佳）\n劣勢：相較之下無明顯弱項",
+          "narrativeZh": "比較「0056」與「00878」：優勢：當日報酬動能較強；成交活絡度較高；與大盤同日走向較一致（大盤相容分較佳） 劣勢：相較之下無明顯弱項",
+          "scoreDiff": 19
+        }
+      ]
+    },
+    "display": {
+      "decisionLabelZh": "目前以觀察為主：先掌握環境與標的差異，避免過度積極進場。",
+      "confidenceNarrativeZh": "已有相對較佳標的，但整體仍建議觀察為主。",
+      "generatedAtTaipei": "2026/03/29 18:24"
+    }
+  }
+}

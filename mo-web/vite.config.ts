@@ -23,6 +23,10 @@ export default defineConfig({
         target: moBackendTarget,
         changeOrigin: true,
       },
+      "/api/report-view": {
+        target: moBackendTarget,
+        changeOrigin: true,
+      },
       "/api/report-preview": {
         target: moBackendTarget,
         changeOrigin: true,

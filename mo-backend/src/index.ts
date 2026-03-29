@@ -83,6 +83,7 @@ import { buildMoStatusEtfIntegrationBlockZh } from "./mo/status-etf-integration.
 import { tryHandleTodayApiRequest } from "./api/today-route.js";
 import { tryHandleCandidatesApiRequest } from "./api/candidates-route.js";
 import { tryHandleNotificationsApiRequest } from "./api/notifications-route.js";
+import { sanitizeReportPlainForWeb } from "./api/report-view-sanitize.js";
 
 /** computeMoPush 內 ETF pipeline 觸發條件（與 /status、/report 對齊） */
 type MoPushEtfIntegrationMode = "none" | "status_aligned" | "report";
@@ -8171,6 +8172,62 @@ async function getReplyText(
 		const notificationsResponse = tryHandleNotificationsApiRequest(request);
 		if (notificationsResponse !== null) {
 			return notificationsResponse;
+		}
+
+		if (url.pathname === "/api/report-view") {
+			if (request.method !== "GET") {
+				return new Response(
+					JSON.stringify({
+						ok: false,
+						error: "method_not_allowed",
+						allowedMethods: ["GET"],
+						generatedAt: new Date().toISOString(),
+					}),
+					{
+						status: 405,
+						headers: {
+							"Content-Type": "application/json; charset=utf-8",
+							Allow: "GET",
+						},
+					}
+				);
+			}
+			const uid = url.searchParams.get("userId") ?? "preview-user";
+			const testChange = url.searchParams.get("testChange") === "1";
+			try {
+				const cmd = testChange ? "/report-test-change" : "/report";
+				const text = await handleCommand(cmd, cmd, env, uid);
+				const generatedAt = new Date().toISOString();
+				const view = sanitizeReportPlainForWeb(text, generatedAt);
+				return new Response(
+					JSON.stringify({
+						ok: true,
+						generatedAt,
+						data: view,
+					}),
+					{
+						status: 200,
+						headers: {
+							"Content-Type": "application/json; charset=utf-8",
+							"Cache-Control": "no-store",
+						},
+					}
+				);
+			} catch (err: unknown) {
+				const message = err instanceof Error ? err.message : String(err);
+				return new Response(
+					JSON.stringify({
+						ok: false,
+						error: "report_view_error",
+						message,
+						generatedAt: new Date().toISOString(),
+					}),
+					{
+						status: 500,
+						headers: { "Content-Type": "application/json; charset=utf-8" },
+					}
+				);
+			}
 		}
 
 		if (url.pathname === "/admin/status-preview" && request.method === "GET") {
