@@ -16,6 +16,7 @@ import {
 	type RecommendationRankingResult,
 } from "./recommendation-ranking.js";
 import { runMoEtfCandidatePipelineV1 } from "./recommendation/etf-pipeline.js";
+import type { EtfDeltaExplainBlockZh } from "./recommendation/etf-public-facts.js";
 import type { EtfCandidateGateState, MoEtfFetchEnv } from "./recommendation/etf-types.js";
 
 /** Narrow usability aligned with precheck output (engine may extend later). */
@@ -133,6 +134,8 @@ export type RecommendationOutput = {
 	etfCandidateContext?: {
 		gate: EtfCandidateGateState;
 		humanSummaryZh: string;
+		/** 與 pipeline 同源；供回答層組裝，不影響排序 */
+		deltaExplain: EtfDeltaExplainBlockZh | null;
 	};
 };
 
@@ -467,6 +470,7 @@ export async function buildRecommendationOutput(
 		etfCandidateContext: {
 			gate: etf.gate,
 			humanSummaryZh: etf.humanSummaryZh,
+			deltaExplain: etf.deltaExplain,
 		},
 	});
 }

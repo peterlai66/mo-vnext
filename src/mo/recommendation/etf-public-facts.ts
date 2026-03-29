@@ -73,6 +73,12 @@ export function etfObserveOnlyRankedCandidatesFootnoteZh(): string {
 	return "雖已有可排名候選，但整體策略分數仍未達進場門檻。";
 }
 
+/** 候選代號顯示用（與 delta explain leader 格式一致） */
+export function stripEtfTickerForDisplay(symbol: string): string {
+	const s = symbol.trim();
+	return s.endsWith(".TW") ? s.slice(0, -3) : s;
+}
+
 // --- Recommendation Confidence v3：決策語氣層（不改 ranking／gate，僅附一句） ---
 
 export type EtfConfidenceLevel =

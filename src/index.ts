@@ -55,6 +55,7 @@ import {
 	type MoLiveSnapshotRow,
 } from "./mo/governance.js";
 import { buildRecommendationPrecheckResult } from "./mo/recommendation-precheck.js";
+import { tryComposeRecommendationAnswerLayerV1 } from "./mo/recommendation-answer-layer-v1.js";
 import {
 	buildRecommendationOutput,
 	type RecommendationExplainableSummary,
@@ -251,6 +252,7 @@ intent 只能是：report、recommendation、status。
 - "ask_risk"：風險、有什麼風險、注意什麼、會不會有問題；**包含「風險是什麼」這類短問**（在 recommendation 脈絡下）。
 - "ask_action"：下一步、該怎麼做、現在要做什麼、怎麼執行（在仍屬推薦語境時）。
 - "ask_timing"：現在適合進場嗎、時機、何時進出、要等多久、該不該現在動（在仍屬推薦語境時）。
+- "ask_ticker"：單一標的代號短問（例如「00713呢」「00878呢」「那0056呢」），在延續推薦話題時。
 
 【範例：對話脈絡上一則為 recommendation】
 - 使用者：風險是什麼 → intent: recommendation, followUpIntent: ask_risk
@@ -261,6 +263,7 @@ intent 只能是：report、recommendation、status。
 - 使用者：現在適合進場嗎 → intent: recommendation, followUpIntent: ask_timing
 - 使用者：現在適合買嗎 → intent: recommendation, followUpIntent: ask_timing
 - 使用者：這時候適合佈局嗎 → intent: recommendation, followUpIntent: ask_timing
+- 使用者：00713呢 → intent: recommendation, followUpIntent: ask_ticker
 - 使用者：現在狀態如何 → intent: status, followUpIntent: none（明確整體狀態查詢，優先於脈絡）
 - 使用者：市場狀態 → intent: status, followUpIntent: none
 
@@ -271,7 +274,7 @@ intent 只能是：report、recommendation、status。
 輸出格式（必須遵守）：
 {
   "intent": "report | recommendation | status",
-  "followUpIntent": "none | ask_more_candidates | ask_why | ask_risk | ask_action | ask_timing",
+  "followUpIntent": "none | ask_more_candidates | ask_why | ask_ticker | ask_risk | ask_action | ask_timing",
   "context": { "hasPortfolio": true, "riskPreference": "normal" },
   "options": { "mode": "latest" }
 }`;
@@ -386,6 +389,8 @@ function followUpIntentToneHintZh(fu: RecommendationFollowUpIntent): string {
 			return "使用者想確認是否還有其他候選或更多選項。";
 		case "ask_why":
 			return "使用者想了解推薦理由或依據。";
+		case "ask_ticker":
+			return "使用者在追問某一檔標的（代號）相對於排序或第一名的差異。";
 		case "ask_risk":
 			return "使用者想了解風險與限制。";
 		case "ask_action":
@@ -501,6 +506,16 @@ function buildRecommendationFollowUpMoFactsEnglish(
 				timing,
 			].join("\n");
 		}
+		if (fu === "ask_ticker") {
+			return [
+				guard,
+				"ask_ticker facts:",
+				"User asks about one specific ticker in the ranked list: state its rank vs #1 and pairwise differences if present in the Chinese ETF summary; do not paste the entire report.",
+				etfFacts,
+				`recommendationMode: ${pack.recommendationMode}`,
+				`blockedBy: ${pack.blockedBy}`,
+			].join("\n");
+		}
 	}
 	const rec = out.recommendation;
 	const alloc = out.allocation;
@@ -567,6 +582,17 @@ function buildRecommendationFollowUpMoFactsEnglish(
 					`台股 ETF 候選：狀態=${etfCandidateGateLabelZh(out.etfCandidateContext.gate)}。${out.etfCandidateContext.humanSummaryZh} `
 				:	"";
 			return `${etfPrefix}Decision readiness: ${dec.readiness}. Stage: ${dec.stage}. Action from summary: ${out.explainableSummary.action}`;
+		}
+		case "ask_ticker": {
+			const parts: string[] = [
+				"ask_ticker: user asks about one ticker symbol; use ranked rows (symbol, rank, score) and delta vs leader from ETF Chinese summary if present.",
+			];
+			if (rec.candidateCount > 0) {
+				for (const c of rec.candidates) {
+					parts.push(`row: ${c.symbol} rank=${String(c.rank)} score=${String(c.score)}`);
+				}
+			}
+			return parts.join(" ");
 		}
 		default: {
 			const _e: never = fu;
@@ -8430,8 +8456,23 @@ async function getReplyText(
 									primaryReason: linePack.primaryReason,
 								});
 							}
+							const answerLayerZh =
+								moInput.followUpIntent === "none"
+									? null
+									: tryComposeRecommendationAnswerLayerV1({
+											followUpIntent: moInput.followUpIntent,
+											userMessage: text,
+											recOut: recommendationOutput,
+											pack: {
+												recommendationMode: linePack.recommendationMode,
+												blockedBy: linePack.blockedBy,
+												semanticCandidateOnly: linePack.semanticCandidateOnly,
+											},
+										});
 							if (moInput.followUpIntent === "none") {
 								replyText = composeRecommendationLineReplyFromPack(linePack);
+							} else if (answerLayerZh !== null) {
+								replyText = answerLayerZh;
 							} else {
 								console.log("[ai] rendering start");
 								const zhRender = await renderRecommendationExplainableSummaryZh(
